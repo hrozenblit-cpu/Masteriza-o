@@ -1,0 +1,6 @@
+{
+  "name": "AuraTune Studio - Masterização, Azimute de Fitas 1/4\" e Restauração Hi-Res",
+  "description": "Console profissional de masterização analógica, calibração de azimute de fitas de rolo 1/4\", preservação até 192kHz/24-bit e otimização sonora com True-Peak para áudio e vídeo.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
