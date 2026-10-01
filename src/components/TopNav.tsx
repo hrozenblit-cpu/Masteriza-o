@@ -1,8 +1,8 @@
-import { Sparkles, Sliders, Layers, FileText, Download, Activity, Gauge, Disc, Bookmark, FolderDown } from 'lucide-react';
+import { Sparkles, Sliders, Layers, FileText, Download, Activity, Gauge, Disc, Bookmark, FolderDown, ShieldCheck, Waves } from 'lucide-react';
 
 interface TopNavProps {
-  activeTab: 'azimuth' | 'mastering' | 'lufs' | 'stems' | 'analyzer';
-  setActiveTab: (tab: 'azimuth' | 'mastering' | 'lufs' | 'stems' | 'analyzer') => void;
+  activeTab: 'azimuth' | 'dropouts' | 'denoise' | 'mastering' | 'lufs' | 'stems' | 'analyzer';
+  setActiveTab: (tab: 'azimuth' | 'dropouts' | 'denoise' | 'mastering' | 'lufs' | 'stems' | 'analyzer') => void;
   onOpenReport: () => void;
   onOpenPresets: () => void;
   onOpenBatch: () => void;
@@ -63,6 +63,32 @@ export function TopNav({
         >
           <Disc className="w-3.5 h-3.5 text-amber-400" />
           Azimute Tape 1/4"
+        </button>
+
+        <button
+          onClick={() => setActiveTab('dropouts')}
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-all whitespace-nowrap ${
+            activeTab === 'dropouts'
+              ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/50 shadow-xs ring-1 ring-emerald-500/30'
+              : 'text-slate-400 hover:text-slate-200'
+          }`}
+          title="Detecção e reconstrução de dropouts de fita magnética (ideal para fitas Mono Ampex em Studer A80)"
+        >
+          <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+          Dropouts & Full-Track
+        </button>
+
+        <button
+          onClick={() => setActiveTab('denoise')}
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-all whitespace-nowrap ${
+            activeTab === 'denoise'
+              ? 'bg-purple-500/20 text-purple-300 border border-purple-500/50 shadow-xs ring-1 ring-purple-500/30'
+              : 'text-slate-400 hover:text-slate-200'
+          }`}
+          title="Redutor de Ruído Espectral NoNoise / RX (Hiss, Ronco e Subtração Multi-Banda)"
+        >
+          <Waves className="w-3.5 h-3.5 text-purple-400" />
+          Denoise NoNoise / RX
         </button>
 
         <button

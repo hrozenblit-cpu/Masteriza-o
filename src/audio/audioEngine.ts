@@ -1,6 +1,22 @@
 import { HumanizerSettings, AudioStem, LoudnessMetrics, LimitlessMasterConfig } from '../types/audio';
 import { analyzeBufferLoudness, applyLimitlessMultiStageMastering } from './loudnessEngine';
 import { TapeAzimuthSettings, processBufferWithAzimuthAndBalance } from './tapeAzimuthEngine';
+import {
+  TapeDropoutSettings,
+  TapeDropoutAnalysis,
+  DEFAULT_DROPOUT_SETTINGS,
+  analyzeTapeDropouts,
+  reconstructTapeDropouts
+} from './tapeDropoutEngine';
+import {
+  SpectralDenoiseSettings,
+  DEFAULT_DENOISE_SETTINGS,
+  processBufferWithSpectralDenoise,
+  analyzeTapeNoise,
+  NoiseAnalysisTelemetry,
+  learnNoiseProfileFromBuffer,
+  CRITICAL_BAND_CENTERS_HZ
+} from './spectralDenoiseEngine';
 
 export class AudioEngine {
   private ctx: AudioContext | null = null;
@@ -20,6 +36,14 @@ export class AudioEngine {
     listenInMono: false,
     autoAlignOnLoad: true,
   };
+
+  // Tape Dropout & Cross-Channel Ampex Full-Track Recovery Settings
+  private tapeDropoutSettings: TapeDropoutSettings = { ...DEFAULT_DROPOUT_SETTINGS };
+  private tapeDropoutAnalysis: TapeDropoutAnalysis | null = null;
+
+  // Sonic Solutions NoNoise & iZotope RX Spectral De-noise Settings
+  private tapeDenoiseSettings: SpectralDenoiseSettings = { ...DEFAULT_DENOISE_SETTINGS };
+  private tapeDenoiseTelemetry: NoiseAnalysisTelemetry | null = null;
 
   // Master Stereo Source nodes
   private sourceNode: AudioBufferSourceNode | null = null;
@@ -155,11 +179,11 @@ export class AudioEngine {
     // Hardware DAC Anti-Clip Brickwall Protection Node:
     // High-speed transparent limiter prevents inter-sample overshoots from hitting Windows WASAPI hard ceiling
     this.dacSafetyLimiter = ctx.createDynamicsCompressor();
-    this.dacSafetyLimiter.threshold.setValueAtTime(-0.3, ctx.currentTime); // -0.3 dBFS safety ceiling
-    this.dacSafetyLimiter.knee.setValueAtTime(0, ctx.currentTime);          // Precision brickwall
-    this.dacSafetyLimiter.ratio.setValueAtTime(20, ctx.currentTime);        // Hard limiting ratio
-    this.dacSafetyLimiter.attack.setValueAtTime(0.001, ctx.currentTime);    // 1ms instantaneous attack
-    this.dacSafetyLimiter.release.setValueAtTime(0.04, ctx.currentTime);    // 40ms musical release
+    this.dacSafetyLimiter.threshold.setValueAtTime(-0.5, ctx.currentTime); // -0.5 dBFS safety ceiling
+    this.dacSafetyLimiter.knee.setValueAtTime(4.0, ctx.currentTime);       // Musical soft-knee avoids harsh distortion
+    this.dacSafetyLimiter.ratio.setValueAtTime(12, ctx.currentTime);       // Transparent limiting ratio
+    this.dacSafetyLimiter.attack.setValueAtTime(0.002, ctx.currentTime);   // 2ms smooth attack
+    this.dacSafetyLimiter.release.setValueAtTime(0.05, ctx.currentTime);   // 50ms musical release
 
     this.analyser.connect(this.monitorGain);
     this.monitorGain.connect(this.dacSafetyLimiter);
@@ -225,6 +249,65 @@ export class AudioEngine {
     if (this.rawBuffer) {
       this.scheduleMasterRender();
     }
+  }
+
+  public getTapeDropoutSettings(): TapeDropoutSettings {
+    return { ...this.tapeDropoutSettings };
+  }
+
+  public updateTapeDropoutSettings(newSettings: Partial<TapeDropoutSettings>) {
+    this.tapeDropoutSettings = { ...this.tapeDropoutSettings, ...newSettings };
+    if (this.rawBuffer) {
+      this.scheduleMasterRender();
+    }
+  }
+
+  public getTapeDropoutAnalysis(): TapeDropoutAnalysis | null {
+    return this.tapeDropoutAnalysis;
+  }
+
+  public setTapeDropoutAnalysis(analysis: TapeDropoutAnalysis | null) {
+    this.tapeDropoutAnalysis = analysis;
+  }
+
+  // --- Spectral De-noise (Sonic Solutions NoNoise & iZotope RX Style) ---
+  public getTapeDenoiseSettings(): SpectralDenoiseSettings {
+    return { ...this.tapeDenoiseSettings };
+  }
+
+  public updateTapeDenoiseSettings(newSettings: Partial<SpectralDenoiseSettings>) {
+    this.tapeDenoiseSettings = { ...this.tapeDenoiseSettings, ...newSettings };
+    if (this.rawBuffer) {
+      this.scheduleMasterRender();
+    }
+  }
+
+  public getTapeDenoiseTelemetry(): NoiseAnalysisTelemetry | null {
+    return this.tapeDenoiseTelemetry;
+  }
+
+  public analyzeDenoise(buffer?: AudioBuffer): NoiseAnalysisTelemetry | null {
+    const targetBuffer = buffer || this.rawBuffer;
+    if (!targetBuffer) return null;
+    const telemetry = analyzeTapeNoise(targetBuffer);
+    this.tapeDenoiseTelemetry = telemetry;
+    return telemetry;
+  }
+
+  public learnDenoiseProfile(buffer?: AudioBuffer, explicitStartSec?: number, explicitDurationSec?: number): number[] | null {
+    const targetBuffer = buffer || this.rawBuffer;
+    if (!targetBuffer) return null;
+    const res = learnNoiseProfileFromBuffer(targetBuffer, explicitStartSec, explicitDurationSec);
+    this.tapeDenoiseSettings.learnedNoiseBands = res.profileBands;
+    this.tapeDenoiseSettings.noiseProfileType = 'auto_learned';
+    if (this.tapeDenoiseTelemetry) {
+      this.tapeDenoiseTelemetry.noiseProfileBands = res.profileBands;
+      this.tapeDenoiseTelemetry.quietestSegmentStartSec = res.startSec;
+      this.tapeDenoiseTelemetry.quietestSegmentDurationSec = res.durationSec;
+      this.tapeDenoiseTelemetry.hissNoiseFloorDb = res.hissNoiseFloorDb;
+    }
+    this.scheduleMasterRender();
+    return res.profileBands;
   }
 
   private scheduleMasterRender() {
@@ -372,7 +455,9 @@ export class AudioEngine {
           // safe ignore
         }
       }
-      newGain.gain.setValueAtTime(1.0, ctx.currentTime);
+      // Micro-ramp (6ms) eliminates abrupt waveform step clicks on start/seek
+      newGain.gain.setValueAtTime(0, ctx.currentTime);
+      newGain.gain.linearRampToValueAtTime(1.0, ctx.currentTime + 0.006);
     }
 
     newSrc.connect(newGain);
@@ -453,6 +538,22 @@ export class AudioEngine {
   public pause() {
     if (!this.isPlaying || !this.ctx) return;
     this.pauseOffset = this.getCurrentPlaybackTime();
+    // 8ms smooth micro-fadeout prevents clicks/pops when pausing
+    if (this.sourceGain && this.ctx) {
+      try {
+        const curGain = this.sourceGain.gain.value;
+        this.sourceGain.gain.cancelScheduledValues(this.ctx.currentTime);
+        this.sourceGain.gain.setValueAtTime(curGain, this.ctx.currentTime);
+        this.sourceGain.gain.linearRampToValueAtTime(0, this.ctx.currentTime + 0.008);
+        setTimeout(() => {
+          this.stopNodesOnly();
+          this.isPlaying = false;
+        }, 12);
+        return;
+      } catch {
+        // safe fallback
+      }
+    }
     this.stopNodesOnly();
     this.isPlaying = false;
   }
@@ -465,6 +566,22 @@ export class AudioEngine {
   }
 
   public stop() {
+    if (this.sourceGain && this.ctx && this.isPlaying) {
+      try {
+        const curGain = this.sourceGain.gain.value;
+        this.sourceGain.gain.cancelScheduledValues(this.ctx.currentTime);
+        this.sourceGain.gain.setValueAtTime(curGain, this.ctx.currentTime);
+        this.sourceGain.gain.linearRampToValueAtTime(0, this.ctx.currentTime + 0.008);
+        setTimeout(() => {
+          this.stopNodesOnly();
+          this.pauseOffset = 0;
+          this.isPlaying = false;
+        }, 12);
+        return;
+      } catch {
+        // safe fallback
+      }
+    }
     this.stopNodesOnly();
     this.pauseOffset = 0;
     this.isPlaying = false;
@@ -663,7 +780,8 @@ export class AudioEngine {
     buffer: AudioBuffer,
     settings: HumanizerSettings,
     customAzimuthSettings?: TapeAzimuthSettings,
-    targetSampleRate?: number
+    targetSampleRate?: number,
+    customDenoiseSettings?: SpectralDenoiseSettings
   ): Promise<AudioBuffer> {
     if (!buffer) {
       throw new Error('Nenhum buffer de áudio disponível para renderização.');
@@ -681,6 +799,22 @@ export class AudioEngine {
         azimuthToUse.listenInMono)
     ) {
       sourceBuffer = processBufferWithAzimuthAndBalance(buffer, azimuthToUse);
+    }
+
+    // 0.1 Pre-Mastering Stage: Tape Dropout Detection & Cross-Channel Reconstruction
+    // Especially critical for Full-Track Ampex transferred to Studer A80 2-Track
+    if (this.tapeDropoutSettings.enabled) {
+      const dropAnalysis = this.tapeDropoutAnalysis || analyzeTapeDropouts(sourceBuffer, this.tapeDropoutSettings);
+      if (dropAnalysis.events.length > 0) {
+        const { restoredBuffer } = reconstructTapeDropouts(sourceBuffer, dropAnalysis, this.tapeDropoutSettings);
+        sourceBuffer = restoredBuffer;
+      }
+    }
+
+    // 0.2 Pre-Mastering Stage: Sonic Solutions NoNoise / iZotope RX Spectral De-noise
+    const denoiseToUse = customDenoiseSettings || this.tapeDenoiseSettings;
+    if (denoiseToUse.enabled || denoiseToUse.listenNoiseDeltaOnly) {
+      sourceBuffer = processBufferWithSpectralDenoise(sourceBuffer, denoiseToUse);
     }
 
     const sampleRate = targetSampleRate || sourceBuffer.sampleRate;
@@ -758,29 +892,22 @@ export class AudioEngine {
   }
 
   private createSaturationCurve(amount: number, bypassed: boolean = false): Float32Array {
-    const nSamples = 2048;
+    const nSamples = 4096;
     const curve = new Float32Array(nSamples);
     if (bypassed || amount <= 0) {
       for (let i = 0; i < nSamples; ++i) {
-        curve[i] = (i * 2) / nSamples - 1;
+        curve[i] = (i * 2) / (nSamples - 1) - 1;
       }
       return curve;
     }
 
-    // High-fidelity soft-knee: completely linear for samples below 0.85
-    const threshold = 0.85;
-    const strength = (Math.max(0, Math.min(100, amount)) / 100) * 0.18;
+    // High-fidelity analog tape saturation:
+    // Pure linear for small signals, smooth hyperbolic tape saturation at top end with zero kinks
+    const drive = 1.0 + (Math.max(0, Math.min(100, amount)) / 100) * 0.45;
+    const norm = Math.tanh(drive);
     for (let i = 0; i < nSamples; ++i) {
-      const x = (i * 2) / nSamples - 1;
-      const absX = Math.abs(x);
-      if (absX <= threshold) {
-        curve[i] = x;
-      } else {
-        const sign = x < 0 ? -1 : 1;
-        const excess = (absX - threshold) / (1.0 - threshold);
-        const compressed = threshold + (1.0 - threshold) * (excess - strength * excess * excess * 0.5);
-        curve[i] = sign * Math.min(1.0, compressed);
-      }
+      const x = (i * 2) / (nSamples - 1) - 1;
+      curve[i] = Math.tanh(x * drive) / norm;
     }
     return curve;
   }
@@ -793,9 +920,16 @@ export class AudioEngine {
     settings: HumanizerSettings,
     targetBitDepth: 16 | 24 | 32 = 24,
     customAzimuthSettings?: TapeAzimuthSettings,
-    targetSampleRate?: number
+    targetSampleRate?: number,
+    customDenoiseSettings?: SpectralDenoiseSettings
   ): Promise<Blob> {
-    const renderedBuffer = await this.renderMasteredBuffer(buffer, settings, customAzimuthSettings, targetSampleRate);
+    const renderedBuffer = await this.renderMasteredBuffer(
+      buffer,
+      settings,
+      customAzimuthSettings,
+      targetSampleRate,
+      customDenoiseSettings
+    );
     return audioBufferToWavBlob(renderedBuffer, targetBitDepth, settings.targetCeilingDb ?? -1.0, targetSampleRate);
   }
 
@@ -820,6 +954,74 @@ export class AudioEngine {
       alignedBuffer = await resCtx.startRendering();
     }
     return audioBufferToWavBlob(alignedBuffer, targetBitDepth, 0, targetSampleRate);
+  }
+
+  /**
+   * Exports an archival preservation WAV with Tape Azimuth aligned and Dropouts reconstructed.
+   * Completely bypasses mastering EQ/compressor for pristine archival transfers.
+   */
+  public async exportDropoutRestoredOnlyWav(
+    buffer: AudioBuffer,
+    dropoutSettings: TapeDropoutSettings,
+    azimuthSettings: TapeAzimuthSettings,
+    targetBitDepth: 16 | 24 | 32 = 24,
+    targetSampleRate?: number
+  ): Promise<Blob> {
+    let procBuffer = buffer;
+    if (azimuthSettings.enabled) {
+      procBuffer = processBufferWithAzimuthAndBalance(buffer, azimuthSettings);
+    }
+    if (dropoutSettings.enabled) {
+      const dropAnalysis = this.tapeDropoutAnalysis || analyzeTapeDropouts(procBuffer, dropoutSettings);
+      const { restoredBuffer } = reconstructTapeDropouts(procBuffer, dropAnalysis, dropoutSettings);
+      procBuffer = restoredBuffer;
+    }
+
+    if (targetSampleRate && procBuffer.sampleRate !== targetSampleRate) {
+      const targetFrames = Math.round(procBuffer.duration * targetSampleRate);
+      const resCtx = new OfflineAudioContext(procBuffer.numberOfChannels, targetFrames, targetSampleRate);
+      const src = resCtx.createBufferSource();
+      src.buffer = procBuffer;
+      src.connect(resCtx.destination);
+      src.start(0);
+      procBuffer = await resCtx.startRendering();
+    }
+    return audioBufferToWavBlob(procBuffer, targetBitDepth, 0, targetSampleRate);
+  }
+
+  /**
+   * Exports an archival preservation WAV with Tape Azimuth, Dropouts and Spectral Denoise applied.
+   */
+  public async exportDenoisedOnlyWav(
+    buffer: AudioBuffer,
+    denoiseSettings: SpectralDenoiseSettings,
+    azimuthSettings: TapeAzimuthSettings,
+    targetBitDepth: 16 | 24 | 32 = 24,
+    targetSampleRate?: number
+  ): Promise<Blob> {
+    let procBuffer = buffer;
+    if (azimuthSettings.enabled) {
+      procBuffer = processBufferWithAzimuthAndBalance(buffer, azimuthSettings);
+    }
+    if (this.tapeDropoutSettings.enabled) {
+      const dropAnalysis = this.tapeDropoutAnalysis || analyzeTapeDropouts(procBuffer, this.tapeDropoutSettings);
+      const { restoredBuffer } = reconstructTapeDropouts(procBuffer, dropAnalysis, this.tapeDropoutSettings);
+      procBuffer = restoredBuffer;
+    }
+    if (denoiseSettings.enabled || denoiseSettings.listenNoiseDeltaOnly) {
+      procBuffer = processBufferWithSpectralDenoise(procBuffer, denoiseSettings);
+    }
+
+    if (targetSampleRate && procBuffer.sampleRate !== targetSampleRate) {
+      const targetFrames = Math.round(procBuffer.duration * targetSampleRate);
+      const resCtx = new OfflineAudioContext(procBuffer.numberOfChannels, targetFrames, targetSampleRate);
+      const src = resCtx.createBufferSource();
+      src.buffer = procBuffer;
+      src.connect(resCtx.destination);
+      src.start(0);
+      procBuffer = await resCtx.startRendering();
+    }
+    return audioBufferToWavBlob(procBuffer, targetBitDepth, 0, targetSampleRate);
   }
 }
 

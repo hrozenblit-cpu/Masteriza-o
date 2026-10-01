@@ -23,9 +23,22 @@ import {
   Edit3,
   History,
   FileCode,
+  ShieldCheck,
+  Waves,
 } from 'lucide-react';
 import { detectAudioFileFormat, AudioInputFormat } from '../audio/audioFormatDetector';
-import { analyzeTapeAzimuth, TapeAzimuthSettings } from '../audio/tapeAzimuthEngine';
+import { analyzeTapeAzimuth, TapeAzimuthSettings, processBufferWithAzimuthAndBalance } from '../audio/tapeAzimuthEngine';
+import {
+  analyzeTapeDropouts,
+  reconstructTapeDropouts,
+  TapeDropoutSettings,
+  DEFAULT_DROPOUT_SETTINGS
+} from '../audio/tapeDropoutEngine';
+import {
+  analyzeTapeNoise,
+  learnNoiseProfileFromBuffer,
+  SpectralDenoiseSettings
+} from '../audio/spectralDenoiseEngine';
 import { HumanizerSettings } from '../types/audio';
 import {
   autoSaveManager,
@@ -46,6 +59,7 @@ import {
   parseTrackMetadata,
   buildMasterWavFilename,
   buildAzimuthWavFilename,
+  buildDropoutWavFilename,
   buildRecallFilename
 } from '../audio/trackNamingHelper';
 import { FolderConflictModal } from './FolderConflictModal';
@@ -64,6 +78,12 @@ export interface BatchItem {
   azimuthOffsetSamples?: number;
   azimuthOffsetUs?: number;
   levelDiffDb?: number;
+  dropoutsCount?: number;
+  tapeHealthScore?: number;
+  isAmpexCandidate?: boolean;
+  hissNoiseFloorDb?: number;
+  noiseTypeDetected?: string;
+  hasHumDetected?: boolean;
   status: 'pending' | 'analyzing' | 'ready' | 'processing' | 'done' | 'error';
   progress?: number;
   savedPath?: string;
@@ -75,6 +95,8 @@ export interface BatchItem {
   isCustomized?: boolean;
   customHumanizerSettings?: HumanizerSettings;
   customAzimuthSettings?: TapeAzimuthSettings;
+  customDropoutSettings?: TapeDropoutSettings;
+  customDenoiseSettings?: SpectralDenoiseSettings;
 }
 
 interface BatchProcessingModalProps {
@@ -104,6 +126,8 @@ export function BatchProcessingModal({
   const [currentProcessingIndex, setCurrentProcessingIndex] = useState(-1);
   const [batchExportMode, setBatchExportMode] = useState<'master' | 'azimuth_only' | 'both'>('both');
   const [autoAlignPerTape, setAutoAlignPerTape] = useState(true);
+  const [autoHealDropoutsPerTape, setAutoHealDropoutsPerTape] = useState(true);
+  const [autoDenoisePerTape, setAutoDenoisePerTape] = useState(true);
   const [subfolderName, setSubfolderName] = useState(autoSaveManager.getSubfolderName());
   const [outputDirName, setOutputDirName] = useState<string>(autoSaveManager.getBaseDirName());
   const [dirSelectMsg, setDirSelectMsg] = useState<string | null>(null);
@@ -116,6 +140,7 @@ export function BatchProcessingModal({
   const [conflictData, setConflictData] = useState<FolderCheckResult | null>(null);
   const [isConflictModalOpen, setIsConflictModalOpen] = useState(false);
   const [selectedTrackForRecall, setSelectedTrackForRecall] = useState<string | null>(null);
+  const [isConfirmingClearQueue, setIsConfirmingClearQueue] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const trackRecallInputRef = useRef<HTMLInputElement>(null);
@@ -199,6 +224,8 @@ export function BatchProcessingModal({
         const audioBuffer = await decodeAudioPreservingSampleRate(item.file, ctx);
         const detectedFormat = await detectAudioFileFormat(item.file, audioBuffer);
         const azimuthAnalysis = analyzeTapeAzimuth(audioBuffer);
+        const dropoutAnalysis = analyzeTapeDropouts(audioBuffer);
+        const noiseAnalysis = analyzeTapeNoise(audioBuffer);
 
         setQueue((prev) =>
           prev.map((it) =>
@@ -212,6 +239,12 @@ export function BatchProcessingModal({
                   azimuthOffsetSamples: azimuthAnalysis.azimuthOffsetSamples,
                   azimuthOffsetUs: azimuthAnalysis.azimuthOffsetUs,
                   levelDiffDb: azimuthAnalysis.levelDiffDb,
+                  dropoutsCount: dropoutAnalysis.totalDropouts,
+                  tapeHealthScore: dropoutAnalysis.tapeHealthScore,
+                  isAmpexCandidate: dropoutAnalysis.isAmpexFullTrackCandidate,
+                  hissNoiseFloorDb: noiseAnalysis.hissNoiseFloorDb,
+                  noiseTypeDetected: noiseAnalysis.noiseTypeDetected,
+                  hasHumDetected: noiseAnalysis.hasHumDetected,
                 }
               : it
           )
@@ -277,10 +310,15 @@ export function BatchProcessingModal({
   };
 
   const handleClearQueue = () => {
-    if (confirm('Deseja limpar todos os arquivos da fila?')) {
-      setQueue([]);
-      setRenderedBatchBlobs([]);
+    if (queue.length > 0) {
+      setIsConfirmingClearQueue(true);
     }
+  };
+
+  const handleConfirmClearQueue = () => {
+    setQueue([]);
+    setRenderedBatchBlobs([]);
+    setIsConfirmingClearQueue(false);
   };
 
   const handleUpdateItemMetadata = (
@@ -326,7 +364,8 @@ export function BatchProcessingModal({
         );
         setTimeout(() => setDirSelectMsg(null), 5000);
       } else {
-        alert('Arquivo de recall inválido ou não reconhecido. Certifique-se de escolher um arquivo .aurapreset ou .json gerado pelo AuraTune.');
+        setDirSelectError('Arquivo de recall inválido ou não reconhecido. Certifique-se de escolher um arquivo .aurapreset ou .json gerado pelo AuraTune.');
+        setTimeout(() => setDirSelectError(null), 6000);
       }
       e.target.value = '';
       setSelectedTrackForRecall(null);
@@ -400,7 +439,7 @@ export function BatchProcessingModal({
         const targetSampleRate = item.format?.sampleRate || buffer.sampleRate;
         const cleanBaseName = `${item.title.replace(/\.[^/.]+$/, '').replace(/\s+/g, '_')}${fileSuffix}`;
 
-        // Tape Azimuth Calibration per track (use customized or base)
+        // Step 1: Tape Azimuth Calibration per track (use customized or base)
         let trackAzimuth = item.customAzimuthSettings ? { ...item.customAzimuthSettings } : { ...tapeAzimuthSettings };
         if (autoAlignPerTape) {
           const autoAnalysis = analyzeTapeAzimuth(buffer);
@@ -412,40 +451,98 @@ export function BatchProcessingModal({
           };
         }
 
+        // Step 2: Dropout Reconstruction settings
+        const trackDropoutSettings: TapeDropoutSettings = item.customDropoutSettings || {
+          ...DEFAULT_DROPOUT_SETTINGS,
+          enabled: autoHealDropoutsPerTape,
+          mode: 'ampex_fulltrack_cross',
+        };
+
+        // Align azimuth and optionally heal dropouts for workingBuffer
+        let workingBuffer = buffer;
+        if (autoHealDropoutsPerTape && trackDropoutSettings.enabled) {
+          let alignedBuffer = buffer;
+          if (trackAzimuth.enabled) {
+            alignedBuffer = processBufferWithAzimuthAndBalance(buffer, trackAzimuth);
+          }
+          const dropAnalysis = analyzeTapeDropouts(alignedBuffer, trackDropoutSettings);
+          if (dropAnalysis.events.length > 0) {
+            const { restoredBuffer } = reconstructTapeDropouts(alignedBuffer, dropAnalysis, trackDropoutSettings);
+            workingBuffer = restoredBuffer;
+          } else {
+            workingBuffer = alignedBuffer;
+          }
+        }
+
         // Humanizer & Masterizer settings per track (use customized or base)
         const trackHumanizer = item.customHumanizerSettings || humanizerSettings;
 
+        // Step 3: Spectral Denoise per track (Sonic Solutions NoNoise & iZotope RX Style)
+        const baseDenoise = item.customDenoiseSettings || audioEngine.getTapeDenoiseSettings();
+        let trackDenoiseSettings: SpectralDenoiseSettings = { ...baseDenoise };
+        if (autoDenoisePerTape) {
+          // Dynamically capture the individual noise fingerprint of THIS specific tape from its silent pause / lead-in
+          const learned = learnNoiseProfileFromBuffer(workingBuffer);
+          trackDenoiseSettings = {
+            ...trackDenoiseSettings,
+            enabled: true,
+            noiseProfileType: 'auto_learned',
+            learnedNoiseBands: learned.profileBands,
+          };
+        }
+
         let lastSavedPath = '';
 
-        // Mode 1: Export Azimuth Corrected Archival Preservation WAV (strict sample rate preservation)
+        // Mode 1: Export Preservation WAV (strict sample rate preservation)
         if (batchExportMode === 'azimuth_only' || batchExportMode === 'both') {
           setQueue((prev) =>
             prev.map((it, idx) => (idx === i ? { ...it, progress: 45 } : it))
           );
-          const azimuthBlob = await audioEngine.exportAzimuthCorrectedOnlyWav(
-            buffer,
-            trackAzimuth,
-            targetBitDepth,
-            targetSampleRate
-          );
-          const azimuthFileName = buildAzimuthWavFilename({
-            trackNumber: item.trackNumber || String(i + 1).padStart(2, '0'),
-            songTitle: item.songTitle || item.title.replace(/\.[^/.]+$/, ''),
-            artist: item.artist,
-            sampleRate: targetSampleRate,
-            bitDepth: targetBitDepth,
-            suffix: fileSuffix,
-          });
-          batchBlobs.push({ filename: azimuthFileName, blob: azimuthBlob });
+          let preservationBlob: Blob;
+          let preservationFileName: string;
+
+          if (autoHealDropoutsPerTape && trackDropoutSettings.enabled) {
+            preservationBlob = await audioEngine.exportDropoutRestoredOnlyWav(
+              buffer,
+              trackDropoutSettings,
+              trackAzimuth,
+              targetBitDepth,
+              targetSampleRate
+            );
+            preservationFileName = buildDropoutWavFilename({
+              trackNumber: item.trackNumber || String(i + 1).padStart(2, '0'),
+              songTitle: item.songTitle || item.title.replace(/\.[^/.]+$/, ''),
+              artist: item.artist,
+              sampleRate: targetSampleRate,
+              bitDepth: targetBitDepth,
+              suffix: fileSuffix,
+            });
+          } else {
+            preservationBlob = await audioEngine.exportAzimuthCorrectedOnlyWav(
+              buffer,
+              trackAzimuth,
+              targetBitDepth,
+              targetSampleRate
+            );
+            preservationFileName = buildAzimuthWavFilename({
+              trackNumber: item.trackNumber || String(i + 1).padStart(2, '0'),
+              songTitle: item.songTitle || item.title.replace(/\.[^/.]+$/, ''),
+              artist: item.artist,
+              sampleRate: targetSampleRate,
+              bitDepth: targetBitDepth,
+              suffix: fileSuffix,
+            });
+          }
+          batchBlobs.push({ filename: preservationFileName, blob: preservationBlob });
 
           if (directDiskActive) {
-            const saveRes = await autoSaveManager.saveProcessedFile(azimuthBlob, azimuthFileName);
+            const saveRes = await autoSaveManager.saveProcessedFile(preservationBlob, preservationFileName);
             lastSavedPath = saveRes.targetPath;
           } else if (!autoZipWhenDirectBlocked) {
-            autoSaveManager.triggerBrowserDownload(azimuthBlob, azimuthFileName);
-            lastSavedPath = `Downloads/${azimuthFileName}`;
+            autoSaveManager.triggerBrowserDownload(preservationBlob, preservationFileName);
+            lastSavedPath = `Downloads/${preservationFileName}`;
           } else {
-            lastSavedPath = `${targetSubfolder}/${azimuthFileName} (Pacote ZIP)`;
+            lastSavedPath = `${targetSubfolder}/${preservationFileName} (Pacote ZIP)`;
           }
         }
 
@@ -455,11 +552,15 @@ export function BatchProcessingModal({
             prev.map((it, idx) => (idx === i ? { ...it, progress: 75 } : it))
           );
           const masterBlob = await audioEngine.exportProcessedAudioWav(
-            buffer,
+            workingBuffer,
             trackHumanizer,
             targetBitDepth,
-            trackAzimuth,
-            targetSampleRate
+            // If already aligned in workingBuffer, bypass redundant second azimuth pass
+            (autoHealDropoutsPerTape && trackDropoutSettings.enabled)
+              ? { ...trackAzimuth, enabled: false }
+              : trackAzimuth,
+            targetSampleRate,
+            trackDenoiseSettings
           );
           const masterFileName = buildMasterWavFilename({
             trackNumber: item.trackNumber || String(i + 1).padStart(2, '0'),
@@ -725,12 +826,38 @@ export function BatchProcessingModal({
                 <label className="flex items-center gap-2 cursor-pointer text-xs text-slate-300">
                   <input
                     type="checkbox"
+                    checked={autoHealDropoutsPerTape}
+                    onChange={(e) => setAutoHealDropoutsPerTape(e.target.checked)}
+                    className="rounded border-slate-700 text-emerald-500 focus:ring-emerald-500/40 bg-slate-900"
+                  />
+                  <span className="text-[11px] text-emerald-300 font-semibold flex items-center gap-1">
+                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                    Auto-reconstruir dropouts (após azimute)
+                  </span>
+                </label>
+
+                <label className="flex items-center gap-2 cursor-pointer text-xs text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={autoDenoisePerTape}
+                    onChange={(e) => setAutoDenoisePerTape(e.target.checked)}
+                    className="rounded border-slate-700 text-purple-500 focus:ring-purple-500/40 bg-slate-900"
+                  />
+                  <span className="text-[11px] text-purple-300 font-semibold flex items-center gap-1">
+                    <Waves className="w-3.5 h-3.5 text-purple-400" />
+                    Aprender perfil de ruído por fita (Denoise NoNoise / RX)
+                  </span>
+                </label>
+
+                <label className="flex items-center gap-2 cursor-pointer text-xs text-slate-300">
+                  <input
+                    type="checkbox"
                     checked={autoZipWhenDirectBlocked}
                     onChange={(e) => setAutoZipWhenDirectBlocked(e.target.checked)}
                     className="rounded border-slate-700 text-cyan-500 focus:ring-cyan-500/40 bg-slate-900"
                   />
                   <span className="text-[11px] text-cyan-300 font-semibold">
-                    Gerar .ZIP com subpasta se gravação direta estiver bloqueada
+                    Gerar .ZIP se gravação direta estiver bloqueada
                   </span>
                 </label>
 
@@ -923,6 +1050,19 @@ export function BatchProcessingModal({
                                 {item.azimuthOffsetUs.toFixed(1)} µs
                               </span>
                             )}
+                            {item.dropoutsCount !== undefined && (
+                              <span className="text-emerald-300 flex items-center gap-1 bg-emerald-950/40 px-1.5 py-0.5 rounded border border-emerald-800/40">
+                                <ShieldCheck className="w-2.5 h-2.5 text-emerald-400" />
+                                Dropouts: {item.dropoutsCount > 0 ? `${item.dropoutsCount} (${item.tapeHealthScore}% saúde)` : 'Fita íntegra'}
+                              </span>
+                            )}
+                            {item.hissNoiseFloorDb !== undefined && (
+                              <span className="text-purple-300 flex items-center gap-1 bg-purple-950/40 px-1.5 py-0.5 rounded border border-purple-800/40">
+                                <Waves className="w-2.5 h-2.5 text-purple-400" />
+                                Ruído: {item.hissNoiseFloorDb.toFixed(1)} dBFS
+                                {item.hasHumDetected ? ' (Ronco AC)' : ''}
+                              </span>
+                            )}
                             {item.savedPath && (
                               <span className="text-emerald-400 truncate max-w-[200px]">
                                 ➔ {item.savedPath}
@@ -1087,6 +1227,43 @@ export function BatchProcessingModal({
           onChange={handleTrackRecallUpload}
           className="hidden"
         />
+
+        {/* Clear Queue In-App Confirmation Modal */}
+        {isConfirmingClearQueue && (
+          <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80 backdrop-blur-xs animate-in fade-in">
+            <div className="bg-[#0f172a] border border-rose-500/50 rounded-xl p-5 max-w-sm w-full shadow-2xl space-y-4 animate-in zoom-in-95">
+              <div className="flex items-start gap-3">
+                <div className="p-2.5 rounded-lg bg-rose-500/20 text-rose-400 shrink-0">
+                  <Trash2 className="w-5 h-5 text-rose-400" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white">Limpar Fila de Lote?</h3>
+                  <p className="text-xs text-slate-300 mt-1 leading-relaxed">
+                    Deseja realmente remover todas as <strong className="text-rose-300">{queue.length} faixas</strong> da fila de processamento?
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setIsConfirmingClearQueue(false)}
+                  className="px-3.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 transition-colors cursor-pointer"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmClearQueue}
+                  className="px-4 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-xs font-bold text-white transition-colors cursor-pointer flex items-center gap-1.5 shadow-md shadow-rose-950"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Sim, Limpar Tudo</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Smart Folder Conflict Resolution Modal */}
         <FolderConflictModal

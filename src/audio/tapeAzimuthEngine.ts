@@ -299,8 +299,26 @@ export function analyzeTapeAzimuth(audioBuffer: AudioBuffer): TapeAzimuthAnalysi
 }
 
 /**
+ * 4-Point Cubic Hermite sub-sample interpolation
+ * C1 continuous: creates a perfectly smooth sub-sample curve with zero corner kinks and zero clicks.
+ */
+function hermiteInterpolate(p0: number, p1: number, p2: number, p3: number, frac: number): number {
+  const c0 = p1;
+  const c1 = 0.5 * (p2 - p0);
+  const c2 = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
+  const c3 = 0.5 * (p3 - p0) + 1.5 * (p1 - p2);
+  return ((c3 * frac + c2) * frac + c1) * frac + c0;
+}
+
+function getClampedSample(data: Float32Array, idx: number, len: number): number {
+  if (idx < 0) return data[0];
+  if (idx >= len) return data[len - 1];
+  return data[idx];
+}
+
+/**
  * Creates an AudioBuffer with pristine Azimuth Delay and Channel Balance alignment.
- * Uses high-precision fractional linear/catmull-rom interpolation for sub-sample accuracy.
+ * Uses high-precision 4-point cubic Hermite interpolation for sub-sample accuracy.
  */
 export function processBufferWithAzimuthAndBalance(
   sourceBuffer: AudioBuffer,
@@ -334,9 +352,8 @@ export function processBufferWithAzimuthAndBalance(
   const signR = settings.invertPhaseR ? -1 : 1;
 
   // Fractional delay:
-  // If azimuthDelaySamples > 0: Left leads, so we need to delay Left, OR advance Right.
-  // In time domain, delay on channel R means we sample channel R at (i - delay).
-  // If delay is positive, channel R is sampled earlier (i - delay); if negative, channel L is delayed.
+  // If azimuthDelaySamples > 0: Left leads, so we delay Left.
+  // If azimuthDelaySamples < 0: Right leads, so we delay Right.
   const delay = settings.azimuthDelaySamples;
 
   for (let i = 0; i < totalLength; i++) {
@@ -344,30 +361,27 @@ export function processBufferWithAzimuthAndBalance(
     let sampleR = 0;
 
     if (delay >= 0) {
-      // Delay applied to channel L (or Right is read unchanged)
-      // When azimuth offset is positive (L leads R), delaying L aligns it with R
+      // Delay applied to channel L (Right is read directly)
       const readIdxL = i - delay;
-      if (readIdxL >= 0 && readIdxL < totalLength - 1) {
-        const intIdx = Math.floor(readIdxL);
-        const frac = readIdxL - intIdx;
-        sampleL = (1 - frac) * srcL[intIdx] + frac * srcL[intIdx + 1];
-      } else if (readIdxL >= 0 && readIdxL < totalLength) {
-        sampleL = srcL[Math.floor(readIdxL)];
-      }
-
+      const intIdx = Math.floor(readIdxL);
+      const frac = readIdxL - intIdx;
+      const p0 = getClampedSample(srcL, intIdx - 1, totalLength);
+      const p1 = getClampedSample(srcL, intIdx, totalLength);
+      const p2 = getClampedSample(srcL, intIdx + 1, totalLength);
+      const p3 = getClampedSample(srcL, intIdx + 2, totalLength);
+      sampleL = hermiteInterpolate(p0, p1, p2, p3, frac);
       sampleR = srcR[i];
     } else {
-      // Delay applied to channel R
+      // Delay applied to channel R (Left is read directly)
       const absDelay = -delay;
       const readIdxR = i - absDelay;
-      if (readIdxR >= 0 && readIdxR < totalLength - 1) {
-        const intIdx = Math.floor(readIdxR);
-        const frac = readIdxR - intIdx;
-        sampleR = (1 - frac) * srcR[intIdx] + frac * srcR[intIdx + 1];
-      } else if (readIdxR >= 0 && readIdxR < totalLength) {
-        sampleR = srcR[Math.floor(readIdxR)];
-      }
-
+      const intIdx = Math.floor(readIdxR);
+      const frac = readIdxR - intIdx;
+      const p0 = getClampedSample(srcR, intIdx - 1, totalLength);
+      const p1 = getClampedSample(srcR, intIdx, totalLength);
+      const p2 = getClampedSample(srcR, intIdx + 1, totalLength);
+      const p3 = getClampedSample(srcR, intIdx + 2, totalLength);
+      sampleR = hermiteInterpolate(p0, p1, p2, p3, frac);
       sampleL = srcL[i];
     }
 

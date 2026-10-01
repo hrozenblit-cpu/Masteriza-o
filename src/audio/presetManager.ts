@@ -272,9 +272,13 @@ export function saveUserPreset(
   return newPreset;
 }
 
-export function deleteUserPreset(id: string): void {
+export function deleteUserPreset(id: string, name?: string): void {
   const currentList = getSavedUserPresets();
-  const updated = currentList.filter(p => p.id !== id);
+  const updated = currentList.filter(p => {
+    if (p.id === id) return false;
+    if (name && p.name.trim().toLowerCase() === name.trim().toLowerCase()) return false;
+    return true;
+  });
   localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
 }
 

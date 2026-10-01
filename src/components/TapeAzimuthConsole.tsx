@@ -13,6 +13,7 @@ interface TapeAzimuthConsoleProps {
   currentTrackTitle: string;
   outputBitDepth?: number;
   outputSampleRate?: number;
+  onNavigateToDropouts?: () => void;
   onNavigateToMastering?: () => void;
   onSelectOutputDirectory?: () => void;
   outputDirectoryName?: string;
@@ -29,6 +30,7 @@ export function TapeAzimuthConsole({
   currentTrackTitle,
   outputBitDepth = 24,
   outputSampleRate = 44100,
+  onNavigateToDropouts,
   onNavigateToMastering,
   onSelectOutputDirectory,
   outputDirectoryName,

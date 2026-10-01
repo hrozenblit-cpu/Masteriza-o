@@ -167,6 +167,24 @@ export function buildAzimuthWavFilename(
 }
 
 /**
+ * Builds standard Dropout-Restored Archival Preservation WAV export name:
+ * [número da faixa]_[Nome da Musica] - [Nome do cantor se houver] - AT_DropoutRestaurado_[taxa em Khz_Bit].wav
+ */
+export function buildDropoutWavFilename(
+  params: Omit<MasterExportParams, 'targetLufs'>
+): string {
+  const num = String(params.trackNumber || '01').padStart(2, '0');
+  const title = sanitizeFilenamePart(params.songTitle || 'Faixa');
+  const artist = params.artist ? sanitizeFilenamePart(params.artist) : '';
+  const rateKhz = formatSampleRateKhz(params.sampleRate);
+  const bit = `${params.bitDepth || 24}bit`;
+  const suffix = params.suffix || '';
+
+  const artistPart = artist ? ` - ${artist}` : '';
+  return `${num}_${title}${artistPart} - AT_DropoutRestaurado_${rateKhz}_${bit}${suffix}.wav`;
+}
+
+/**
  * Builds standard Recall Preset (.aurapreset) export name:
  * [número da faixa]_[Nome da Musica] - [Nome do cantor se houver] - AT_[taxa em Khz_Bit]_[Lufs]_Recall.aurapreset
  */

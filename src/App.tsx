@@ -10,6 +10,7 @@ import { ForensicReportModal } from './components/ForensicReportModal';
 import { AudioPlayerBar } from './components/AudioPlayerBar';
 import { LufsLimitlessConsole } from './components/LufsLimitlessConsole';
 import { TapeAzimuthConsole } from './components/TapeAzimuthConsole';
+import { TapeDropoutConsole } from './components/TapeDropoutConsole';
 import { PresetManagerModal } from './components/PresetManagerModal';
 import { BatchProcessingModal, BatchItem } from './components/BatchProcessingModal';
 import { BatchAuditionBar } from './components/BatchAuditionBar';
@@ -21,6 +22,13 @@ import { detectAudioFileFormat, AudioInputFormat } from './audio/audioFormatDete
 import { decodeAudioPreservingSampleRate } from './audio/nativeAudioDecoder';
 import { analyzeBufferLoudness } from './audio/loudnessEngine';
 import { analyzeTapeAzimuth, TapeAzimuthAnalysis, TapeAzimuthSettings } from './audio/tapeAzimuthEngine';
+import {
+  analyzeTapeDropouts,
+  reconstructTapeDropouts,
+  TapeDropoutAnalysis,
+  TapeDropoutSettings,
+  DEFAULT_DROPOUT_SETTINGS
+} from './audio/tapeDropoutEngine';
 import { UserPreset, getAllPresets } from './audio/presetManager';
 import { autoSaveManager } from './audio/autoSaveManager';
 import {
@@ -32,14 +40,17 @@ import {
   parseTrackMetadata,
   buildMasterWavFilename,
   buildAzimuthWavFilename,
+  buildDropoutWavFilename,
   buildRecallFilename
 } from './audio/trackNamingHelper';
 import { ForensicAnalysisResult, HumanizerSettings, AudioStem, LoudnessMetrics } from './types/audio';
-import { Sparkles, Layers, Cpu, ArrowRight, Activity, CheckCircle2, Gauge, Disc, Bookmark, FolderDown, History } from 'lucide-react';
+import { TapeDenoiseConsole } from './components/TapeDenoiseConsole';
+import { SpectralDenoiseSettings, DEFAULT_DENOISE_SETTINGS, NoiseAnalysisTelemetry } from './audio/spectralDenoiseEngine';
+import { Sparkles, Layers, Cpu, ArrowRight, Activity, CheckCircle2, Gauge, Disc, Bookmark, FolderDown, History, ShieldCheck, Waves, AlertTriangle, X } from 'lucide-react';
 
 export default function App() {
   // Navigation
-  const [activeTab, setActiveTab] = useState<'azimuth' | 'mastering' | 'lufs' | 'stems' | 'analyzer'>('azimuth');
+  const [activeTab, setActiveTab] = useState<'azimuth' | 'dropouts' | 'denoise' | 'mastering' | 'lufs' | 'stems' | 'analyzer'>('azimuth');
   const [isReportOpen, setIsReportOpen] = useState(false);
   const [isPresetModalOpen, setIsPresetModalOpen] = useState(false);
   const [isBatchModalOpen, setIsBatchModalOpen] = useState(false);
@@ -63,7 +74,11 @@ export default function App() {
   const [isCompareOriginal, setIsCompareOriginal] = useState(false); // false = Mastered, true = Raw AI
   const [isExporting, setIsExporting] = useState(false);
   const [isExportingAzimuth, setIsExportingAzimuth] = useState(false);
+  const [isExportingDropout, setIsExportingDropout] = useState(false);
+  const [isExportingDenoised, setIsExportingDenoised] = useState(false);
+  const [isRestoringDropout, setIsRestoringDropout] = useState(false);
   const [exportNotice, setExportNotice] = useState<string | null>(null);
+  const [appErrorNotice, setAppErrorNotice] = useState<string | null>(null);
 
   // 1/4" Tape Azimuth & Channel Balance State
   const [tapeAzimuthAnalysis, setTapeAzimuthAnalysis] = useState<TapeAzimuthAnalysis | null>(null);
@@ -76,6 +91,14 @@ export default function App() {
     listenInMono: false,
     autoAlignOnLoad: true,
   });
+
+  // Tape Dropout & Cross-Channel Ampex Full-Track Restoration State
+  const [tapeDropoutAnalysis, setTapeDropoutAnalysis] = useState<TapeDropoutAnalysis | null>(null);
+  const [tapeDropoutSettings, setTapeDropoutSettings] = useState<TapeDropoutSettings>(DEFAULT_DROPOUT_SETTINGS);
+
+  // Spectral Denoise (Sonic Solutions NoNoise & iZotope RX Style)
+  const [tapeDenoiseTelemetry, setTapeDenoiseTelemetry] = useState<NoiseAnalysisTelemetry | null>(null);
+  const [tapeDenoiseSettings, setTapeDenoiseSettings] = useState<SpectralDenoiseSettings>(DEFAULT_DENOISE_SETTINGS);
 
   // Current Track & Buffer State (Pure User Audio - Zero Artificial Beep Synths)
   const [currentTrackTitle, setCurrentTrackTitle] = useState('Nenhum arquivo carregado');
@@ -163,6 +186,15 @@ export default function App() {
       const azimuth = analyzeTapeAzimuth(audioBuffer);
       setTapeAzimuthAnalysis(azimuth);
 
+      // 1/4" Tape Dropout Analysis (Ampex Full-Track Mono digitized on Studer A80 2-Track)
+      const dropouts = analyzeTapeDropouts(audioBuffer, tapeDropoutSettings);
+      setTapeDropoutAnalysis(dropouts);
+      audioEngine.setTapeDropoutAnalysis(dropouts);
+
+      // 1/4" Tape Noise Profile Analysis (Sonic Solutions NoNoise & iZotope RX Spectral De-noise)
+      const denoiseAnalysis = audioEngine.analyzeDenoise(audioBuffer);
+      setTapeDenoiseTelemetry(denoiseAnalysis);
+
       if (tapeAzimuthSettings.autoAlignOnLoad && (Math.abs(azimuth.azimuthOffsetSamples) > 0.05 || Math.abs(azimuth.levelDiffDb) > 0.2)) {
         const autoAzimuth: TapeAzimuthSettings = {
           ...tapeAzimuthSettings,
@@ -206,13 +238,18 @@ export default function App() {
         }));
       }
 
+      const dropoutNotice = dropouts.totalDropouts > 0
+        ? ` | Dropouts: ${dropouts.totalDropouts} (${dropouts.isAmpexFullTrackCandidate ? 'Ampex Full-Track detectada' : `${dropouts.tapeHealthScore}% saúde`})`
+        : ' | Fita sem dropouts';
+
       setExportNotice(
-        `Áudio carregado: ${detectedFormat.sampleRate.toLocaleString()} Hz · ${detectedFormat.bitDepth}-bit (${detectedFormat.codec}). Azimute: ${azimuth.azimuthOffsetUs > 0 ? '+' : ''}${azimuth.azimuthOffsetUs.toFixed(1)} µs | Balanço: ${azimuth.levelDiffDb > 0 ? '+' : ''}${azimuth.levelDiffDb.toFixed(1)} dB.`
+        `Áudio carregado: ${detectedFormat.sampleRate.toLocaleString()} Hz · ${detectedFormat.bitDepth}-bit (${detectedFormat.codec}). Azimute: ${azimuth.azimuthOffsetUs > 0 ? '+' : ''}${azimuth.azimuthOffsetUs.toFixed(1)} µs | Balanço: ${azimuth.levelDiffDb > 0 ? '+' : ''}${azimuth.levelDiffDb.toFixed(1)} dB${dropoutNotice}.`
       );
       setTimeout(() => setExportNotice(null), 7000);
       setIsAnalyzing(false);
     } catch {
-      alert('Erro ao carregar ou decodificar arquivo. Por favor tente outro formato (WAV, MP3, FLAC, M4A, MP4/MPG4, MOV).');
+      setAppErrorNotice('Erro ao carregar ou decodificar arquivo. Por favor tente outro formato (WAV, MP3, FLAC, M4A, MP4/MPG4, MOV).');
+      setTimeout(() => setAppErrorNotice(null), 7000);
       setIsAnalyzing(false);
     }
   };
@@ -494,6 +531,162 @@ export default function App() {
     }
   };
 
+  // Tape Dropout Handlers
+  const handleUpdateDropoutSettings = (newSettings: Partial<TapeDropoutSettings>) => {
+    setTapeDropoutSettings((prev) => {
+      const updated = { ...prev, ...newSettings };
+      audioEngine.updateTapeDropoutSettings(updated);
+      return updated;
+    });
+    if (masterBufferRef.current && (newSettings.sensitivity || newSettings.minDurationMs || newSettings.maxDurationMs)) {
+      const reanalyzed = analyzeTapeDropouts(masterBufferRef.current, { ...tapeDropoutSettings, ...newSettings });
+      setTapeDropoutAnalysis(reanalyzed);
+      audioEngine.setTapeDropoutAnalysis(reanalyzed);
+    }
+  };
+
+  const handleReconstructDropouts = async () => {
+    if (!masterBufferRef.current) return;
+    setIsRestoringDropout(true);
+    try {
+      const currentAnalysis = tapeDropoutAnalysis || analyzeTapeDropouts(masterBufferRef.current, tapeDropoutSettings);
+      const { restoredBuffer, repairedEventsCount } = reconstructTapeDropouts(
+        masterBufferRef.current,
+        currentAnalysis,
+        tapeDropoutSettings
+      );
+      masterBufferRef.current = restoredBuffer;
+      await audioEngine.loadRawBuffer(restoredBuffer);
+      const updatedAnalysis = analyzeTapeDropouts(restoredBuffer, tapeDropoutSettings);
+      setTapeDropoutAnalysis(updatedAnalysis);
+      audioEngine.setTapeDropoutAnalysis(updatedAnalysis);
+
+      setExportNotice(
+        `✓ ${repairedEventsCount} dropouts de fita reconstruídos com áudio analógico autêntico! Saúde da fita atualizada: ${updatedAnalysis.tapeHealthScore}%.`
+      );
+      setTimeout(() => setExportNotice(null), 6000);
+    } catch (err) {
+      console.error(err);
+      setAppErrorNotice('Erro ao reconstruir dropouts da fita.');
+      setTimeout(() => setAppErrorNotice(null), 6000);
+    } finally {
+      setIsRestoringDropout(false);
+    }
+  };
+
+  const handleExportDropoutRestoredWav = async () => {
+    if (!masterBufferRef.current) return;
+    setIsExportingDropout(true);
+    try {
+      const targetSampleRate = audioFormat?.sampleRate || masterBufferRef.current.sampleRate;
+      const targetBitDepth = audioFormat?.bitDepth || 24;
+
+      const wavBlob = await audioEngine.exportDropoutRestoredOnlyWav(
+        masterBufferRef.current,
+        tapeDropoutSettings,
+        tapeAzimuthSettings,
+        targetBitDepth,
+        targetSampleRate
+      );
+
+      const filename = buildDropoutWavFilename({
+        trackNumber,
+        songTitle: songTitle || currentTrackTitle.replace(/\.[^/.]+$/, ''),
+        artist: artistName,
+        sampleRate: targetSampleRate,
+        bitDepth: targetBitDepth,
+      });
+
+      const saveRes = await autoSaveManager.saveProcessedFile(wavBlob, filename);
+
+      setExportNotice(
+        `✓ Arquivo preservado gravado com sucesso: ${saveRes.targetPath} (${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit, dropouts reparados)!`
+      );
+      setTimeout(() => setExportNotice(null), 8000);
+    } catch (err) {
+      console.error(err);
+      setAppErrorNotice('Erro ao exportar arquivo de preservação com dropouts reconstruídos.');
+      setTimeout(() => setAppErrorNotice(null), 6000);
+    } finally {
+      setIsExportingDropout(false);
+    }
+  };
+
+  // Spectral Denoise Handlers (Sonic Solutions NoNoise & iZotope RX Style)
+  const handleUpdateDenoiseSettings = (newSettings: Partial<SpectralDenoiseSettings>) => {
+    setTapeDenoiseSettings((prev) => {
+      const updated = { ...prev, ...newSettings };
+      return updated;
+    });
+    audioEngine.updateTapeDenoiseSettings(newSettings);
+  };
+
+  const handleLearnNoiseProfile = () => {
+    if (!masterBufferRef.current) return;
+    const learnedBands = audioEngine.learnDenoiseProfile(masterBufferRef.current);
+    if (learnedBands) {
+      setTapeDenoiseSettings((prev) => ({
+        ...prev,
+        noiseProfileType: 'auto_learned',
+        learnedNoiseBands: learnedBands,
+      }));
+      setTapeDenoiseTelemetry(audioEngine.getTapeDenoiseTelemetry());
+      setExportNotice('✓ Perfil de ruído da fita capturado com sucesso a partir da pausa analógica!');
+      setTimeout(() => setExportNotice(null), 5000);
+    }
+  };
+
+  const handleLearnNoiseProfileAtPlayhead = () => {
+    if (!masterBufferRef.current) return;
+    const startSec = Math.max(0, playbackTime - 0.2);
+    const learnedBands = audioEngine.learnDenoiseProfile(masterBufferRef.current, startSec, 0.4);
+    if (learnedBands) {
+      setTapeDenoiseSettings((prev) => ({
+        ...prev,
+        noiseProfileType: 'auto_learned',
+        learnedNoiseBands: learnedBands,
+      }));
+      setTapeDenoiseTelemetry(audioEngine.getTapeDenoiseTelemetry());
+      setExportNotice(`✓ Perfil de ruído capturado exatamente na posição do cursor (${startSec.toFixed(1)}s)!`);
+      setTimeout(() => setExportNotice(null), 5000);
+    }
+  };
+
+  const handleApplyDenoise = () => {
+    handleUpdateDenoiseSettings({ enabled: true });
+    setExportNotice('⚡ Redutor de ruído espectral NoNoise / RX ativado na cadeia de masterização!');
+    setTimeout(() => setExportNotice(null), 4000);
+  };
+
+  const handleExportDenoisedWav = async () => {
+    if (!masterBufferRef.current) return;
+    setIsExportingDenoised(true);
+    try {
+      const targetSampleRate = audioFormat?.sampleRate || masterBufferRef.current.sampleRate;
+      const targetBitDepth = audioFormat?.bitDepth || 24;
+      const wavBlob = await audioEngine.exportDenoisedOnlyWav(
+        masterBufferRef.current,
+        tapeDenoiseSettings,
+        tapeAzimuthSettings,
+        targetBitDepth,
+        targetSampleRate
+      );
+      const cleanSong = songTitle || currentTrackTitle.replace(/\.[^/.]+$/, '');
+      const filename = `${trackNumber}_${cleanSong}${artistName ? ` - ${artistName}` : ''} - AT_Denoised_${targetSampleRate}Hz_${targetBitDepth}bit.wav`;
+      const saveRes = await autoSaveManager.saveProcessedFile(wavBlob, filename);
+      setExportNotice(
+        `✓ Arquivo com Denoise gravado com sucesso: ${saveRes.targetPath} (${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit)!`
+      );
+      setTimeout(() => setExportNotice(null), 8000);
+    } catch (err) {
+      console.error(err);
+      setAppErrorNotice('Erro ao exportar arquivo com denoise.');
+      setTimeout(() => setAppErrorNotice(null), 6000);
+    } finally {
+      setIsExportingDenoised(false);
+    }
+  };
+
   // Playback Loop for UI Cursor update
   useEffect(() => {
     let intervalId: NodeJS.Timeout;
@@ -536,6 +729,17 @@ export default function App() {
       } else if (masterBufferRef.current) {
         audioEngine.playBuffer(masterBufferRef.current, time);
       }
+    }
+  };
+
+  const handlePlayFrom = (time: number) => {
+    setPlaybackTime(time);
+    if (isStemMode && stems.length > 0) {
+      audioEngine.playStems(stems, time);
+      setIsPlaying(true);
+    } else if (masterBufferRef.current) {
+      audioEngine.playBuffer(masterBufferRef.current, time);
+      setIsPlaying(true);
     }
   };
 
@@ -722,6 +926,23 @@ export default function App() {
         </div>
       )}
 
+      {/* Error notification toast */}
+      {appErrorNotice && (
+        <div className="fixed top-16 right-4 z-50 p-3 rounded-lg bg-rose-950/95 border border-rose-500/60 text-xs font-mono text-rose-200 shadow-2xl flex items-center justify-between gap-3 animate-in fade-in max-w-md">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+            <span>{appErrorNotice}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setAppErrorNotice(null)}
+            className="text-rose-400 hover:text-white p-1 cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* Batch Audition & Track Navigation Bar */}
       {editingBatchIndex !== null && batchQueue[editingBatchIndex] && (
         <BatchAuditionBar
@@ -815,6 +1036,42 @@ export default function App() {
               <span>Azimute 1/4"</span>
             </button>
 
+            <button
+              onClick={() => setActiveTab('dropouts')}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+                activeTab === 'dropouts'
+                  ? 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/60'
+                  : 'bg-[#111726] text-slate-300 hover:text-white border border-slate-700'
+              }`}
+              title="Detecção e correção de dropouts de fita analógica (Ampex Mono Full-Track em Studer A80)"
+            >
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Dropouts & Ampex</span>
+              {tapeDropoutAnalysis && tapeDropoutAnalysis.totalDropouts > 0 && (
+                <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-emerald-500/30 text-emerald-300 font-bold">
+                  {tapeDropoutAnalysis.totalDropouts}
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={() => setActiveTab('denoise')}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+                activeTab === 'denoise'
+                  ? 'bg-purple-500/25 text-purple-300 border border-purple-500/60'
+                  : 'bg-[#111726] text-slate-300 hover:text-white border border-slate-700'
+              }`}
+              title="Redutor de Ruído Espectral NoNoise / RX (Hiss, Ronco e Subtração Multi-Banda)"
+            >
+              <Waves className="w-3.5 h-3.5 text-purple-400" />
+              <span>Denoise NoNoise / RX</span>
+              {tapeDenoiseTelemetry && (
+                <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-purple-500/30 text-purple-300 font-bold">
+                  {tapeDenoiseTelemetry.hissNoiseFloorDb.toFixed(0)}dB
+                </span>
+              )}
+            </button>
+
             <span className="text-slate-500 text-[11px]">|</span>
 
             <button
@@ -902,12 +1159,42 @@ export default function App() {
                 </span>
               </div>
 
-              <div className="p-2.5 rounded-lg bg-[#111726] border border-slate-800 flex flex-col">
-                <span className="text-[10px] font-mono text-slate-400">Fase Estéreo</span>
-                <span className="text-sm font-mono font-bold text-cyan-400 mt-0.5">
-                  +{analysisResult?.metrics.phaseCorrelationIndex ? analysisResult.metrics.phaseCorrelationIndex.toFixed(2) : '0.85'}
+              {/* Tape Dropouts & Oxide Health Indicator */}
+              <div
+                onClick={() => setActiveTab('dropouts')}
+                className="p-2.5 rounded-lg bg-[#111726] border border-emerald-500/30 hover:border-emerald-400 flex flex-col cursor-pointer transition-colors"
+                title="Clique para ir à aba de restauração e diagnóstico de dropouts de fita"
+              >
+                <span className="text-[10px] font-mono text-emerald-400 font-bold uppercase flex items-center gap-1">
+                  <ShieldCheck className="w-2.5 h-2.5" />
+                  Dropouts
                 </span>
-                <span className="text-[9px] text-slate-400 mt-0.5">Mono-compatível & Amplo</span>
+                <span className="text-sm font-mono font-bold text-emerald-300 mt-0.5">
+                  {tapeDropoutAnalysis ? `${tapeDropoutAnalysis.tapeHealthScore}% Íntegra` : '100%'}
+                </span>
+                <span className="text-[9px] text-slate-400 mt-0.5 truncate">
+                  {tapeDropoutAnalysis && tapeDropoutAnalysis.totalDropouts > 0
+                    ? `${tapeDropoutAnalysis.totalDropouts} falhas`
+                    : 'Fita sem falhas'}
+                </span>
+              </div>
+
+              {/* Spectral Denoise Indicator */}
+              <div
+                onClick={() => setActiveTab('denoise')}
+                className="p-2.5 rounded-lg bg-[#111726] border border-purple-500/30 hover:border-purple-400 flex flex-col cursor-pointer transition-colors"
+                title="Clique para abrir o redutor de ruído espectral NoNoise / RX"
+              >
+                <span className="text-[10px] font-mono text-purple-400 font-bold uppercase flex items-center gap-1">
+                  <Waves className="w-2.5 h-2.5" />
+                  Denoise NoNoise
+                </span>
+                <span className="text-sm font-mono font-bold text-purple-300 mt-0.5">
+                  {tapeDenoiseTelemetry ? `${tapeDenoiseTelemetry.hissNoiseFloorDb.toFixed(1)} dBFS` : '-64.0 dBFS'}
+                </span>
+                <span className="text-[9px] text-slate-400 mt-0.5 truncate">
+                  {tapeDenoiseSettings.enabled ? `✓ Ativo (-${tapeDenoiseSettings.reductionDb}dB)` : 'Subtração Bark'}
+                </span>
               </div>
             </div>
 
@@ -953,6 +1240,51 @@ export default function App() {
             onNavigateToMastering={() => setActiveTab('mastering')}
             onSelectOutputDirectory={() => setIsFolderModalOpen(true)}
             outputDirectoryName={outputDirName}
+          />
+        )}
+
+        {/* Tab 0.1: Tape Dropout Detection & Cross-Channel Reconstruction Workstation */}
+        {activeTab === 'dropouts' && (
+          <TapeDropoutConsole
+            analysis={tapeDropoutAnalysis}
+            settings={tapeDropoutSettings}
+            onUpdateSettings={handleUpdateDropoutSettings}
+            onReconstruct={handleReconstructDropouts}
+            onSeek={handleSeek}
+            onPlayFrom={handlePlayFrom}
+            onTogglePlay={handlePlayPause}
+            isCompareOriginal={isCompareOriginal}
+            onToggleCompareOriginal={handleToggleAB}
+            playbackTime={playbackTime}
+            duration={duration}
+            isPlaying={isPlaying}
+            hasAudioLoaded={!!masterBufferRef.current}
+            currentTrackTitle={currentTrackTitle}
+            onExportRestoredWav={handleExportDropoutRestoredWav}
+            isRestoring={isRestoringDropout}
+          />
+        )}
+
+        {/* Tab 0.2: Spectral Denoise (Sonic Solutions NoNoise & iZotope RX Style) */}
+        {activeTab === 'denoise' && (
+          <TapeDenoiseConsole
+            telemetry={tapeDenoiseTelemetry}
+            settings={tapeDenoiseSettings}
+            onUpdateSettings={handleUpdateDenoiseSettings}
+            onLearnNoiseProfile={handleLearnNoiseProfile}
+            onLearnNoiseProfileAtPlayhead={handleLearnNoiseProfileAtPlayhead}
+            onApplyDenoise={handleApplyDenoise}
+            onTogglePlay={handlePlayPause}
+            onPlayFrom={handlePlayFrom}
+            isCompareOriginal={isCompareOriginal}
+            onToggleCompareOriginal={handleToggleAB}
+            playbackTime={playbackTime}
+            duration={duration}
+            isPlaying={isPlaying}
+            hasAudioLoaded={!!masterBufferRef.current}
+            currentTrackTitle={currentTrackTitle}
+            onExportDenoisedWav={handleExportDenoisedWav}
+            isProcessing={isExportingDenoised}
           />
         )}
 
