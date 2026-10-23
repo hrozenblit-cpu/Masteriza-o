@@ -109,6 +109,19 @@ export interface HumanizerSettings {
   lowEndWeight?: number;        // 0 - 100% (bass anchor decoupling)
   transientSpeed?: 'smooth' | 'transparent' | 'punchy' | 'aggressive';
   autoMatchLoudness?: boolean;  // automatic make-up gain + density optimization for target LUFS
+
+  // 8. Processador Inteligente de Agudos Orban Optimod (HF Limiter & Dynamic High Shelf EQ)
+  orbanHfEnabled?: boolean;
+  orbanHfBypass?: boolean;
+  orbanHfUserOverrideLock?: boolean; // Trava de bypass manual definida pelo usuário (prioridade sobre presets/perfis)
+  orbanHfMode?: 'broadcast_optimod' | 'tape_restore' | 'smooth_silk' | 'modern_air';
+  orbanHfAmount?: number;            // 0 - 100% (intensidade do controle dinâmico)
+  orbanHfAutoBrillianceDb?: number;  // -12 a +12 dB (High Shelf dinâmico: 0 dB = Flat, <0 dB = atenuação/taming, >0 dB = restauração)
+  orbanHfHighShelfGainDb?: number;   // -12 a +12 dB (alias explícito de ganho High Shelf)
+  orbanHfThresholdDb?: number;       // -18 a 0 dB (teto de proteção do HF Limiter contra estridência)
+  orbanHfCrossoverHz?: number;       // 3500 - 10000 Hz (crossover da banda de agudos)
+  orbanHfSpeed?: 'smooth' | 'medium' | 'fast'; // velocidade de atuação dos agudos
+  orbanHfHarmonicAir?: number;       // 0 - 100% (exciter harmônico controlado de ar acústico > 10 kHz)
 }
 
 export type { LoudnessMetrics, LimitlessMasterConfig } from '../audio/loudnessEngine';

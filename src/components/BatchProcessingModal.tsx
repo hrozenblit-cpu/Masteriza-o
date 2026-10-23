@@ -25,6 +25,7 @@ import {
   FileCode,
   ShieldCheck,
   Waves,
+  Radio,
 } from 'lucide-react';
 import { detectAudioFileFormat, AudioInputFormat } from '../audio/audioFormatDetector';
 import { analyzeTapeAzimuth, TapeAzimuthSettings, processBufferWithAzimuthAndBalance } from '../audio/tapeAzimuthEngine';
@@ -32,19 +33,26 @@ import {
   analyzeTapeDropouts,
   reconstructTapeDropouts,
   TapeDropoutSettings,
+  TapeDropoutMode,
   DEFAULT_DROPOUT_SETTINGS
 } from '../audio/tapeDropoutEngine';
 import {
   analyzeTapeNoise,
   learnNoiseProfileFromBuffer,
-  SpectralDenoiseSettings
+  SpectralDenoiseSettings,
+  DEFAULT_DENOISE_SETTINGS
 } from '../audio/spectralDenoiseEngine';
+import { analyzeBufferTreble } from '../audio/orbanTrebleEngine';
+import { analyzeBufferLoudness } from '../audio/loudnessEngine';
+import { analyzeAudioForensics } from '../audio/analyzer';
 import { HumanizerSettings } from '../types/audio';
 import {
   autoSaveManager,
   isInsideIframe,
   FolderCheckResult,
-  FolderConflictAction
+  FolderConflictAction,
+  SUBFOLDER_RECOVERED,
+  SUBFOLDER_MASTERED
 } from '../audio/autoSaveManager';
 import { audioEngine } from '../audio/audioEngine';
 import { getAllPresets, UserPreset } from '../audio/presetManager';
@@ -57,6 +65,7 @@ import {
 } from '../audio/presetRecallManager';
 import {
   parseTrackMetadata,
+  stripAudioFileExtension,
   buildMasterWavFilename,
   buildAzimuthWavFilename,
   buildDropoutWavFilename,
@@ -75,6 +84,11 @@ export interface BatchItem {
   sizeBytes: number;
   duration?: number;
   format?: AudioInputFormat;
+  initialLufs?: number;
+  overallAiProbability?: number;
+  dominantPlatformName?: string;
+  isVintageAnalogTape?: boolean;
+  isDualMono?: boolean;
   azimuthOffsetSamples?: number;
   azimuthOffsetUs?: number;
   levelDiffDb?: number;
@@ -84,6 +98,10 @@ export interface BatchItem {
   hissNoiseFloorDb?: number;
   noiseTypeDetected?: string;
   hasHumDetected?: boolean;
+  trebleBalanceDb?: number;
+  isDarkTape?: boolean;
+  isHarshRecording?: boolean;
+  recommendedOrbanMode?: string;
   status: 'pending' | 'analyzing' | 'ready' | 'processing' | 'done' | 'error';
   progress?: number;
   savedPath?: string;
@@ -104,11 +122,13 @@ interface BatchProcessingModalProps {
   onClose: () => void;
   humanizerSettings: HumanizerSettings;
   tapeAzimuthSettings: TapeAzimuthSettings;
+  tapeDropoutSettings?: TapeDropoutSettings;
   currentGlobalPresetName?: string;
   queue: BatchItem[];
   setQueue: React.Dispatch<React.SetStateAction<BatchItem[]>>;
-  onEditTrackInMastering: (index: number) => void;
+  onEditTrackInMastering: (index: number, directItem?: BatchItem) => void;
   activeEditingIndex?: number | null;
+  exportBitDepth?: 16 | 24 | 32;
 }
 
 export function BatchProcessingModal({
@@ -116,27 +136,32 @@ export function BatchProcessingModal({
   onClose,
   humanizerSettings,
   tapeAzimuthSettings,
+  tapeDropoutSettings = DEFAULT_DROPOUT_SETTINGS,
   currentGlobalPresetName,
   queue,
   setQueue,
   onEditTrackInMastering,
   activeEditingIndex,
+  exportBitDepth = 24,
 }: BatchProcessingModalProps) {
   const [isProcessingBatch, setIsProcessingBatch] = useState(false);
   const [currentProcessingIndex, setCurrentProcessingIndex] = useState(-1);
   const [batchExportMode, setBatchExportMode] = useState<'master' | 'azimuth_only' | 'both'>('both');
+  const [batchBitDepth, setBatchBitDepth] = useState<16 | 24 | 32>(exportBitDepth || 24);
   const [autoAlignPerTape, setAutoAlignPerTape] = useState(true);
   const [autoHealDropoutsPerTape, setAutoHealDropoutsPerTape] = useState(true);
   const [autoDenoisePerTape, setAutoDenoisePerTape] = useState(true);
+  const [autoOrbanPerTape, setAutoOrbanPerTape] = useState(true);
   const [subfolderName, setSubfolderName] = useState(autoSaveManager.getSubfolderName());
   const [outputDirName, setOutputDirName] = useState<string>(autoSaveManager.getBaseDirName());
   const [dirSelectMsg, setDirSelectMsg] = useState<string | null>(null);
   const [dirSelectError, setDirSelectError] = useState<string | null>(null);
   const [isIframeBlocked, setIsIframeBlocked] = useState(false);
-  const [renderedBatchBlobs, setRenderedBatchBlobs] = useState<Array<{ filename: string; blob: Blob }>>([]);
+  const [renderedBatchBlobs, setRenderedBatchBlobs] = useState<Array<{ filename: string; blob: Blob; subfolder?: string }>>([]);
   const [isPackagingZip, setIsPackagingZip] = useState(false);
   const [autoZipWhenDirectBlocked, setAutoZipWhenDirectBlocked] = useState(true);
   const [saveRecallPresets, setSaveRecallPresets] = useState(true);
+  const [separateSubfolders, setSeparateSubfolders] = useState(true);
   const [conflictData, setConflictData] = useState<FolderCheckResult | null>(null);
   const [isConflictModalOpen, setIsConflictModalOpen] = useState(false);
   const [selectedTrackForRecall, setSelectedTrackForRecall] = useState<string | null>(null);
@@ -171,6 +196,24 @@ export function BatchProcessingModal({
             }
           : it
       )
+    );
+  };
+
+  const handleTrackDropoutModeChange = (itemId: string, newMode: TapeDropoutMode) => {
+    setQueue((prev) =>
+      prev.map((it) => {
+        if (it.id !== itemId) return it;
+        const currentSettings = it.customDropoutSettings || tapeDropoutSettings || DEFAULT_DROPOUT_SETTINGS;
+        return {
+          ...it,
+          customDropoutSettings: {
+            ...currentSettings,
+            mode: newMode,
+            enabled: true,
+          },
+          isCustomized: true,
+        };
+      })
     );
   };
 
@@ -223,9 +266,94 @@ export function BatchProcessingModal({
 
         const audioBuffer = await decodeAudioPreservingSampleRate(item.file, ctx);
         const detectedFormat = await detectAudioFileFormat(item.file, audioBuffer);
+        const loudnessAnalysis = analyzeBufferLoudness(audioBuffer);
+        const forensicAnalysis = await analyzeAudioForensics(audioBuffer, item.title);
         const azimuthAnalysis = analyzeTapeAzimuth(audioBuffer);
-        const dropoutAnalysis = analyzeTapeDropouts(audioBuffer);
+        const dropoutAnalysis = analyzeTapeDropouts(audioBuffer, tapeDropoutSettings);
         const noiseAnalysis = analyzeTapeNoise(audioBuffer);
+        const trebleAnalysis = analyzeBufferTreble(audioBuffer);
+
+        // Intelligent Material Detection (Exact Parity with Individual Mode)
+        const hasDropouts = (dropoutAnalysis.totalDropouts ?? 0) > 0;
+        const hasAzimuthError = Math.abs(azimuthAnalysis.azimuthOffsetSamples) >= 0.1 || Math.abs(azimuthAnalysis.levelDiffDb) >= 0.35;
+        const hasTapeHiss = Boolean(
+          noiseAnalysis.hasNoiseDetected ||
+          (noiseAnalysis.hissNoiseFloorDb ?? -90) > -75.0 ||
+          noiseAnalysis.hasHumDetected
+        );
+        const isCleanModern = !hasDropouts && !hasTapeHiss && !hasAzimuthError && dropoutAnalysis.tapeHealthScore === 100;
+
+        const isDualMono =
+          azimuthAnalysis.channelConfiguration === 'dual_mono' ||
+          (dropoutAnalysis.isAmpexFullTrackCandidate && azimuthAnalysis.sideToMidDb <= -26.0);
+
+        const isWanderOrDefect =
+          isDualMono &&
+          (dropoutAnalysis.isSevereWanderDetected ||
+            dropoutAnalysis.channelComparison?.isSevereWanderDetected ||
+            hasDropouts);
+
+        const safeDropoutMode: TapeDropoutMode = isDualMono && !isCleanModern
+          ? (tapeDropoutSettings.mode === 'mono_wander_graft' || isWanderOrDefect
+              ? 'mono_wander_graft'
+              : 'ampex_fulltrack_cross')
+          : 'stereo_independent';
+
+        // Auto-tune Masterizer based on forensic cutoff & Treble telemetry with User Override Lock
+        const audioNeedsTreble = Boolean(
+          trebleAnalysis.needsProcessing ||
+          trebleAnalysis.isDarkTape ||
+          trebleAnalysis.isHarshRecording ||
+          Math.abs(trebleAnalysis.recommendedBrillianceDb) >= 0.5
+        );
+        const userExplicitlyDisabled = Boolean(
+          humanizerSettings.orbanHfUserOverrideLock &&
+          (humanizerSettings.orbanHfBypass || !humanizerSettings.orbanHfEnabled)
+        );
+        const userExplicitlyEnabled = Boolean(
+          humanizerSettings.orbanHfUserOverrideLock &&
+          !humanizerSettings.orbanHfBypass &&
+          humanizerSettings.orbanHfEnabled
+        );
+        const shouldEnableOrban = userExplicitlyEnabled
+          ? true
+          : userExplicitlyDisabled
+          ? false
+          : audioNeedsTreble;
+
+        let itemHumanizer: HumanizerSettings = {
+          ...humanizerSettings,
+          orbanHfEnabled: shouldEnableOrban,
+          orbanHfBypass: !shouldEnableOrban,
+          orbanHfUserOverrideLock: humanizerSettings.orbanHfUserOverrideLock ?? false,
+          orbanHfMode: trebleAnalysis.recommendedMode,
+          orbanHfAmount: trebleAnalysis.isDarkTape ? 65 : 50,
+          orbanHfAutoBrillianceDb: trebleAnalysis.recommendedBrillianceDb,
+          orbanHfHighShelfGainDb: trebleAnalysis.recommendedBrillianceDb,
+          orbanHfThresholdDb: trebleAnalysis.recommendedThresholdDb,
+          orbanHfCrossoverHz: trebleAnalysis.recommendedCrossoverHz,
+          orbanHfSpeed: trebleAnalysis.recommendedSpeed,
+        };
+
+        if (forensicAnalysis.metrics.nyquistCutoffHz <= 16500) {
+          itemHumanizer = {
+            ...itemHumanizer,
+            deHarshIntensity: 75,
+            notchFrequencyHz: 3400,
+            airCutoffHz: 16000,
+            airExciterGain: 80,
+            stereoCorrelationFix: 75,
+          };
+        } else if (forensicAnalysis.dominantPlatform.platform === 'udio') {
+          itemHumanizer = {
+            ...itemHumanizer,
+            deHarshIntensity: 80,
+            notchFrequencyHz: 4200,
+            airCutoffHz: 17000,
+            airExciterGain: 50,
+            stereoCorrelationFix: 80,
+          };
+        }
 
         setQueue((prev) =>
           prev.map((it) =>
@@ -236,6 +364,11 @@ export function BatchProcessingModal({
                   format: detectedFormat,
                   duration: audioBuffer.duration,
                   audioBuffer,
+                  initialLufs: loudnessAnalysis.integratedLufs,
+                  overallAiProbability: forensicAnalysis.overallAiProbability,
+                  dominantPlatformName: forensicAnalysis.dominantPlatform.name,
+                  isVintageAnalogTape: forensicAnalysis.dominantPlatform.platform === 'human_analog',
+                  isDualMono,
                   azimuthOffsetSamples: azimuthAnalysis.azimuthOffsetSamples,
                   azimuthOffsetUs: azimuthAnalysis.azimuthOffsetUs,
                   levelDiffDb: azimuthAnalysis.levelDiffDb,
@@ -245,6 +378,25 @@ export function BatchProcessingModal({
                   hissNoiseFloorDb: noiseAnalysis.hissNoiseFloorDb,
                   noiseTypeDetected: noiseAnalysis.noiseTypeDetected,
                   hasHumDetected: noiseAnalysis.hasHumDetected,
+                  trebleBalanceDb: trebleAnalysis.spectralBalanceRatioDb,
+                  isDarkTape: trebleAnalysis.isDarkTape,
+                  isHarshRecording: trebleAnalysis.isHarshRecording,
+                  recommendedOrbanMode: trebleAnalysis.recommendedMode,
+                  customDenoiseSettings: {
+                    ...DEFAULT_DENOISE_SETTINGS,
+                    enabled: hasTapeHiss && !isCleanModern,
+                    noiseProfileType: noiseAnalysis.recommendedNoiseProfileType,
+                    humNotchFilter: noiseAnalysis.recommendedHumNotch,
+                    reductionDb: noiseAnalysis.recommendedReductionDb,
+                    learnedNoiseBands: noiseAnalysis.noiseProfileBands,
+                  },
+                  customDropoutSettings: {
+                    ...tapeDropoutSettings,
+                    enabled: autoHealDropoutsPerTape && (dropoutAnalysis.totalDropouts > 0 || safeDropoutMode === 'mono_wander_graft'),
+                    mode: safeDropoutMode,
+                    restoreHighFreqLoss: true,
+                  },
+                  customHumanizerSettings: itemHumanizer,
                 }
               : it
           )
@@ -416,7 +568,7 @@ export function BatchProcessingModal({
     });
 
     const ctx = audioEngine.getAudioContext();
-    const batchBlobs: Array<{ filename: string; blob: Blob }> = [];
+    const batchBlobs: Array<{ filename: string; blob: Blob; subfolder?: string }> = [];
     const directDiskActive = autoSaveManager.hasSelectedDirectory();
 
     for (let i = 0; i < queue.length; i++) {
@@ -435,59 +587,164 @@ export function BatchProcessingModal({
           item.audioBuffer = buffer;
         }
 
-        const targetBitDepth = item.format?.bitDepth || 24;
+        const targetBitDepth = batchBitDepth || item.format?.bitDepth || 24;
         const targetSampleRate = item.format?.sampleRate || buffer.sampleRate;
-        const cleanBaseName = `${item.title.replace(/\.[^/.]+$/, '').replace(/\s+/g, '_')}${fileSuffix}`;
+        const cleanBaseName = `${stripAudioFileExtension(item.title).replace(/\s+/g, '_')}${fileSuffix}`;
 
         // Step 1: Tape Azimuth Calibration per track (use customized or base)
+        const autoAzimuthAnalysis = analyzeTapeAzimuth(buffer);
         let trackAzimuth = item.customAzimuthSettings ? { ...item.customAzimuthSettings } : { ...tapeAzimuthSettings };
         if (autoAlignPerTape) {
-          const autoAnalysis = analyzeTapeAzimuth(buffer);
+          const isGhost = autoAzimuthAnalysis.isGhostChannelDetected;
           trackAzimuth = {
             ...trackAzimuth,
             enabled: true,
-            azimuthDelaySamples: autoAnalysis.azimuthOffsetSamples,
-            balanceDb: -autoAnalysis.levelDiffDb,
+            azimuthDelaySamples: isGhost ? 0 : autoAzimuthAnalysis.azimuthOffsetSamples,
+            balanceDb: isGhost ? 0.0 : Math.max(-4.5, Math.min(4.5, -autoAzimuthAnalysis.levelDiffDb)),
+            activeChannel: autoAzimuthAnalysis.activeSignalChannel || 'both',
+            ghostChannelHandling: isGhost ? 'clone_active' : 'passthrough',
           };
         }
 
-        // Step 2: Dropout Reconstruction settings
+        // Step 1.5: Forensic Analysis for auto-tuning profile (AI vs 60s vintage analog)
+        const forensicAnalysis = await analyzeAudioForensics(buffer, item.title);
+
+        // Step 2: Intelligent Material Detection: Real Stereo vs Mono in 2 Channels
+        const hasDropouts = (item.dropoutsCount !== undefined && item.dropoutsCount > 0);
+        const hasAzimuthError =
+          Math.abs(autoAzimuthAnalysis.azimuthOffsetSamples) >= 0.1 ||
+          Math.abs(autoAzimuthAnalysis.levelDiffDb) >= 0.35;
+        const isCleanModern = !hasDropouts && !hasAzimuthError && (item.tapeHealthScore ?? 100) === 100;
+
+        const isDualMono =
+          item.isDualMono !== undefined
+            ? item.isDualMono
+            : (autoAzimuthAnalysis.channelConfiguration === 'dual_mono' ||
+               (item.isAmpexCandidate && autoAzimuthAnalysis.sideToMidDb <= -26.0));
+
+        const itemDropoutMode = item.customDropoutSettings?.mode;
+        const isWanderOrDefect = isDualMono && hasDropouts;
+
+        const safeDropoutMode: TapeDropoutMode = itemDropoutMode
+          ? itemDropoutMode
+          : isDualMono && !isCleanModern
+          ? (tapeDropoutSettings.mode === 'mono_wander_graft' || isWanderOrDefect
+              ? 'mono_wander_graft'
+              : 'ampex_fulltrack_cross')
+          : (tapeDropoutSettings.mode || 'stereo_independent');
+
         const trackDropoutSettings: TapeDropoutSettings = item.customDropoutSettings || {
-          ...DEFAULT_DROPOUT_SETTINGS,
-          enabled: autoHealDropoutsPerTape,
-          mode: 'ampex_fulltrack_cross',
+          ...tapeDropoutSettings,
+          enabled: autoHealDropoutsPerTape && hasDropouts && !isCleanModern,
+          mode: isCleanModern ? 'stereo_independent' : safeDropoutMode,
         };
 
         // Align azimuth and optionally heal dropouts for workingBuffer
         let workingBuffer = buffer;
+        let initialDropoutAnalysis = null;
         if (autoHealDropoutsPerTape && trackDropoutSettings.enabled) {
           let alignedBuffer = buffer;
           if (trackAzimuth.enabled) {
             alignedBuffer = processBufferWithAzimuthAndBalance(buffer, trackAzimuth);
           }
           const dropAnalysis = analyzeTapeDropouts(alignedBuffer, trackDropoutSettings);
-          if (dropAnalysis.events.length > 0) {
+          if (dropAnalysis && (dropAnalysis.events.length > 0 || trackDropoutSettings.mode === 'mono_wander_graft')) {
             const { restoredBuffer } = reconstructTapeDropouts(alignedBuffer, dropAnalysis, trackDropoutSettings);
             workingBuffer = restoredBuffer;
+            initialDropoutAnalysis = {
+              ...dropAnalysis,
+              events: dropAnalysis.events.map((e) => ({ ...e, reconstructed: true })),
+            };
           } else {
             workingBuffer = alignedBuffer;
           }
         }
+        audioEngine.setTapeDropoutAnalysis(initialDropoutAnalysis);
 
         // Humanizer & Masterizer settings per track (use customized or base)
-        const trackHumanizer = item.customHumanizerSettings || humanizerSettings;
+        let trackHumanizer: HumanizerSettings = { ...(item.customHumanizerSettings || humanizerSettings) };
+
+        // Step 2.5: Auto-equalize treble via Precision Treble Engine per tape if enabled
+        if (autoOrbanPerTape) {
+          const trebleTel = audioEngine.getOrbanTrebleTelemetry(workingBuffer);
+          if (trebleTel) {
+            const audioNeedsTreble = Boolean(
+              trebleTel.needsProcessing ||
+              trebleTel.isDarkTape ||
+              trebleTel.isHarshRecording ||
+              Math.abs(trebleTel.recommendedBrillianceDb) >= 0.5
+            );
+            const userExplicitlyDisabled = Boolean(
+              (trackHumanizer.orbanHfUserOverrideLock && (trackHumanizer.orbanHfBypass || !trackHumanizer.orbanHfEnabled)) ||
+              (humanizerSettings.orbanHfUserOverrideLock && (humanizerSettings.orbanHfBypass || !humanizerSettings.orbanHfEnabled))
+            );
+            const userExplicitlyEnabled = Boolean(
+              (trackHumanizer.orbanHfUserOverrideLock && !trackHumanizer.orbanHfBypass && trackHumanizer.orbanHfEnabled) ||
+              (humanizerSettings.orbanHfUserOverrideLock && !humanizerSettings.orbanHfBypass && humanizerSettings.orbanHfEnabled)
+            );
+            const shouldEnableOrban = userExplicitlyEnabled
+              ? true
+              : userExplicitlyDisabled
+              ? false
+              : audioNeedsTreble;
+
+            trackHumanizer = {
+              ...trackHumanizer,
+              orbanHfEnabled: shouldEnableOrban,
+              orbanHfBypass: !shouldEnableOrban,
+              orbanHfUserOverrideLock: trackHumanizer.orbanHfUserOverrideLock ?? false,
+              orbanHfMode: trebleTel.recommendedMode,
+              orbanHfAmount: trebleTel.isDarkTape ? 65 : 50,
+              orbanHfAutoBrillianceDb: trebleTel.recommendedBrillianceDb,
+              orbanHfHighShelfGainDb: trebleTel.recommendedBrillianceDb,
+              orbanHfThresholdDb: trebleTel.recommendedThresholdDb,
+              orbanHfCrossoverHz: trebleTel.recommendedCrossoverHz,
+              orbanHfSpeed: trebleTel.recommendedSpeed,
+            };
+          }
+        }
+
+        // Auto-tune de-harsh and air exciter based on forensic cutoff (identical to individual mode)
+        if (!item.isCustomized) {
+          if (forensicAnalysis.metrics.nyquistCutoffHz <= 16500) {
+            trackHumanizer = {
+              ...trackHumanizer,
+              deHarshIntensity: 75,
+              notchFrequencyHz: 3400,
+              airCutoffHz: 16000,
+              airExciterGain: 80,
+              stereoCorrelationFix: 75,
+            };
+          } else if (forensicAnalysis.dominantPlatform.platform === 'udio') {
+            trackHumanizer = {
+              ...trackHumanizer,
+              deHarshIntensity: 80,
+              notchFrequencyHz: 4200,
+              airCutoffHz: 17000,
+              airExciterGain: 50,
+              stereoCorrelationFix: 80,
+            };
+          }
+        }
 
         // Step 3: Spectral Denoise per track (Sonic Solutions NoNoise & iZotope RX Style)
-        const baseDenoise = item.customDenoiseSettings || audioEngine.getTapeDenoiseSettings();
-        let trackDenoiseSettings: SpectralDenoiseSettings = { ...baseDenoise };
-        if (autoDenoisePerTape) {
-          // Dynamically capture the individual noise fingerprint of THIS specific tape from its silent pause / lead-in
-          const learned = learnNoiseProfileFromBuffer(workingBuffer);
+        let trackDenoiseSettings: SpectralDenoiseSettings = item.customDenoiseSettings
+          ? { ...item.customDenoiseSettings }
+          : { ...audioEngine.getTapeDenoiseSettings() };
+        if (autoDenoisePerTape && !item.customDenoiseSettings) {
+          const noiseTel = analyzeTapeNoise(workingBuffer);
+          const hasNoise = Boolean(
+            noiseTel.hasNoiseDetected ||
+            (noiseTel.hissNoiseFloorDb ?? -90) > -75.0 ||
+            noiseTel.hasHumDetected
+          );
           trackDenoiseSettings = {
             ...trackDenoiseSettings,
-            enabled: true,
-            noiseProfileType: 'auto_learned',
-            learnedNoiseBands: learned.profileBands,
+            enabled: hasNoise,
+            noiseProfileType: noiseTel.recommendedNoiseProfileType,
+            humNotchFilter: noiseTel.recommendedHumNotch,
+            reductionDb: noiseTel.recommendedReductionDb,
+            learnedNoiseBands: noiseTel.noiseProfileBands,
           };
         }
 
@@ -510,8 +767,8 @@ export function BatchProcessingModal({
               targetSampleRate
             );
             preservationFileName = buildDropoutWavFilename({
-              trackNumber: item.trackNumber || String(i + 1).padStart(2, '0'),
-              songTitle: item.songTitle || item.title.replace(/\.[^/.]+$/, ''),
+              trackNumber: item.trackNumber,
+              songTitle: item.songTitle || stripAudioFileExtension(item.title),
               artist: item.artist,
               sampleRate: targetSampleRate,
               bitDepth: targetBitDepth,
@@ -525,24 +782,33 @@ export function BatchProcessingModal({
               targetSampleRate
             );
             preservationFileName = buildAzimuthWavFilename({
-              trackNumber: item.trackNumber || String(i + 1).padStart(2, '0'),
-              songTitle: item.songTitle || item.title.replace(/\.[^/.]+$/, ''),
+              trackNumber: item.trackNumber,
+              songTitle: item.songTitle || stripAudioFileExtension(item.title),
               artist: item.artist,
               sampleRate: targetSampleRate,
               bitDepth: targetBitDepth,
               suffix: fileSuffix,
             });
           }
-          batchBlobs.push({ filename: preservationFileName, blob: preservationBlob });
+          const subfolderRec = separateSubfolders ? SUBFOLDER_RECOVERED : undefined;
+          batchBlobs.push({ filename: preservationFileName, blob: preservationBlob, subfolder: subfolderRec });
 
           if (directDiskActive) {
-            const saveRes = await autoSaveManager.saveProcessedFile(preservationBlob, preservationFileName);
-            lastSavedPath = saveRes.targetPath;
+            const saveRes = await autoSaveManager.saveProcessedFile(preservationBlob, preservationFileName, {
+              subfolder: subfolderRec,
+              parentSubfolder: targetSubfolder,
+              disableDownloadFallback: true,
+            });
+            if (saveRes.savedToDiskDirectly) {
+              lastSavedPath = saveRes.targetPath;
+            } else {
+              lastSavedPath = `${targetSubfolder}/${subfolderRec ? `${subfolderRec}/` : ''}${preservationFileName} (Pacote ZIP)`;
+            }
           } else if (!autoZipWhenDirectBlocked) {
             autoSaveManager.triggerBrowserDownload(preservationBlob, preservationFileName);
-            lastSavedPath = `Downloads/${preservationFileName}`;
+            lastSavedPath = `Downloads/${subfolderRec ? `${subfolderRec}/` : ''}${preservationFileName}`;
           } else {
-            lastSavedPath = `${targetSubfolder}/${preservationFileName} (Pacote ZIP)`;
+            lastSavedPath = `${targetSubfolder}/${subfolderRec ? `${subfolderRec}/` : ''}${preservationFileName} (Pacote ZIP)`;
           }
         }
 
@@ -552,35 +818,42 @@ export function BatchProcessingModal({
             prev.map((it, idx) => (idx === i ? { ...it, progress: 75 } : it))
           );
           const masterBlob = await audioEngine.exportProcessedAudioWav(
-            workingBuffer,
+            buffer,
             trackHumanizer,
             targetBitDepth,
-            // If already aligned in workingBuffer, bypass redundant second azimuth pass
-            (autoHealDropoutsPerTape && trackDropoutSettings.enabled)
-              ? { ...trackAzimuth, enabled: false }
-              : trackAzimuth,
+            trackAzimuth,
             targetSampleRate,
-            trackDenoiseSettings
+            trackDenoiseSettings,
+            trackDropoutSettings
           );
           const masterFileName = buildMasterWavFilename({
-            trackNumber: item.trackNumber || String(i + 1).padStart(2, '0'),
-            songTitle: item.songTitle || item.title.replace(/\.[^/.]+$/, ''),
+            trackNumber: item.trackNumber,
+            songTitle: item.songTitle || stripAudioFileExtension(item.title),
             artist: item.artist,
             sampleRate: targetSampleRate,
             bitDepth: targetBitDepth,
             targetLufs: trackHumanizer.targetLufs ?? -14,
             suffix: fileSuffix,
           });
-          batchBlobs.push({ filename: masterFileName, blob: masterBlob });
+          const subfolderMast = separateSubfolders ? SUBFOLDER_MASTERED : undefined;
+          batchBlobs.push({ filename: masterFileName, blob: masterBlob, subfolder: subfolderMast });
 
           if (directDiskActive) {
-            const saveRes = await autoSaveManager.saveProcessedFile(masterBlob, masterFileName);
-            lastSavedPath = saveRes.targetPath;
+            const saveRes = await autoSaveManager.saveProcessedFile(masterBlob, masterFileName, {
+              subfolder: subfolderMast,
+              parentSubfolder: targetSubfolder,
+              disableDownloadFallback: true,
+            });
+            if (saveRes.savedToDiskDirectly) {
+              lastSavedPath = saveRes.targetPath;
+            } else {
+              lastSavedPath = `${targetSubfolder}/${subfolderMast ? `${subfolderMast}/` : ''}${masterFileName} (Pacote ZIP)`;
+            }
           } else if (!autoZipWhenDirectBlocked) {
             autoSaveManager.triggerBrowserDownload(masterBlob, masterFileName);
-            lastSavedPath = `Downloads/${masterFileName}`;
+            lastSavedPath = `Downloads/${subfolderMast ? `${subfolderMast}/` : ''}${masterFileName}`;
           } else {
-            lastSavedPath = `${targetSubfolder}/${masterFileName} (Pacote ZIP)`;
+            lastSavedPath = `${targetSubfolder}/${subfolderMast ? `${subfolderMast}/` : ''}${masterFileName} (Pacote ZIP)`;
           }
         }
 
@@ -597,18 +870,27 @@ export function BatchProcessingModal({
           );
           const recallBlob = recallToBlob(trackRecall);
           const recallFileName = buildRecallFilename({
-            trackNumber: item.trackNumber || String(i + 1).padStart(2, '0'),
-            songTitle: item.songTitle || item.title.replace(/\.[^/.]+$/, ''),
+            trackNumber: item.trackNumber,
+            songTitle: item.songTitle || stripAudioFileExtension(item.title),
             artist: item.artist,
             sampleRate: targetSampleRate,
             bitDepth: targetBitDepth,
             targetLufs: trackHumanizer.targetLufs ?? -14,
             suffix: fileSuffix,
           });
-          batchBlobs.push({ filename: recallFileName, blob: recallBlob });
+          const subfolderMast = separateSubfolders ? SUBFOLDER_MASTERED : undefined;
+          batchBlobs.push({ filename: recallFileName, blob: recallBlob, subfolder: subfolderMast });
 
           if (directDiskActive) {
-            await autoSaveManager.saveProcessedFile(recallBlob, recallFileName);
+            await autoSaveManager.saveProcessedFile(recallBlob, recallFileName, {
+              subfolder: subfolderMast,
+              parentSubfolder: targetSubfolder,
+              disableDownloadFallback: true,
+            });
+          } else if (!autoZipWhenDirectBlocked) {
+            setTimeout(() => {
+              autoSaveManager.triggerBrowserDownload(recallBlob, recallFileName);
+            }, 300);
           }
         }
 
@@ -643,10 +925,15 @@ export function BatchProcessingModal({
       );
       const sessionRecallBlob = recallToBlob(sessionRecall);
       const sessionRecallFileName = `${targetSubfolder}_Sessao_Recall.aurapreset`;
-      batchBlobs.push({ filename: sessionRecallFileName, blob: sessionRecallBlob });
+      const subfolderMast = separateSubfolders ? SUBFOLDER_MASTERED : undefined;
+      batchBlobs.push({ filename: sessionRecallFileName, blob: sessionRecallBlob, subfolder: subfolderMast });
 
       if (directDiskActive) {
-        await autoSaveManager.saveProcessedFile(sessionRecallBlob, sessionRecallFileName);
+        await autoSaveManager.saveProcessedFile(sessionRecallBlob, sessionRecallFileName, {
+          subfolder: subfolderMast,
+          parentSubfolder: targetSubfolder,
+          disableDownloadFallback: true,
+        });
       }
     }
 
@@ -655,30 +942,28 @@ export function BatchProcessingModal({
     // Save output files / ZIP package
     if (batchBlobs.length > 0) {
       if (directDiskActive) {
-        // Individual WAVs and Presets were saved directly into subfolder on disk. Also write the ZIP archive to chosen directory!
-        try {
-          const zipBlob = await autoSaveManager.createZipPackage(batchBlobs, targetSubfolder);
-          await autoSaveManager.saveZipFile(zipBlob, `${targetSubfolder}.zip`);
-          setDirSelectMsg(
-            `✓ Lote finalizado! Todos os ${batchBlobs.length} arquivos (WAVs e presets de recall .aurapreset) foram gravados na pasta "${outputDirName}/${targetSubfolder}/" e o pacote "${targetSubfolder}.zip" foi gerado.`
-          );
-        } catch {
-          setDirSelectMsg(
-            `✓ Processamento em lote finalizado! Todos os arquivos foram gravados diretamente no seu computador em: "${outputDirName}/${targetSubfolder}/"`
-          );
-        }
+        // Individual WAVs and Presets were saved directly into subfolder on disk!
+        const subNotice = separateSubfolders
+          ? ` com as subpastas automáticas "${SUBFOLDER_RECOVERED}" (áudios intermediários restaurados) e "${SUBFOLDER_MASTERED}" (áudio final masterizado + presets .aurapreset)`
+          : '';
+        setDirSelectMsg(
+          `✓ Lote finalizado com sucesso! Todos os ${batchBlobs.length} arquivos foram gravados diretamente na pasta "${outputDirName}/${targetSubfolder}/"${subNotice} no seu computador.`
+        );
       } else if (autoZipWhenDirectBlocked) {
         setIsPackagingZip(true);
         try {
           const zipBlob = await autoSaveManager.createZipPackage(batchBlobs, targetSubfolder);
           const zipRes = await autoSaveManager.saveZipFile(zipBlob, `${targetSubfolder}.zip`);
+          const subNotice = separateSubfolders
+            ? ` estruturado com as subpastas "${SUBFOLDER_RECOVERED}" e "${SUBFOLDER_MASTERED}".`
+            : ' organizado na subpasta.';
           if (zipRes.savedToDiskDirectly) {
             setDirSelectMsg(
-              `✓ Processamento concluído! O arquivo "${zipRes.targetPath}" contendo a subpasta com ${batchBlobs.length} itens (áudios e presets) foi salvo diretamente na pasta escolhida no seu computador.`
+              `✓ Processamento concluído! O arquivo "${zipRes.targetPath}" contendo todos os ${batchBlobs.length} itens foi salvo diretamente na pasta escolhida no seu computador${subNotice}`
             );
           } else {
             setDirSelectMsg(
-              `✓ Processamento concluído! Arquivo "${targetSubfolder}.zip" gerado com todos os ${batchBlobs.length} áudios e presets organizados na subpasta.`
+              `✓ Processamento concluído! Pacote "${targetSubfolder}.zip" gerado com todos os ${batchBlobs.length} áudios e presets${subNotice}`
             );
           }
         } catch (zipErr) {
@@ -706,7 +991,8 @@ export function BatchProcessingModal({
             </div>
             <div>
               <h2 className="text-base font-bold text-white flex items-center gap-2">
-                Processamento em Lote & Auto-Salvamento em Pasta
+                <span>Processamento em Lote & Auto-Salvamento em Pasta</span>
+                <span className="text-[10px] font-extrabold px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">v2.0</span>
               </h2>
               <p className="text-xs text-slate-400">
                 Digitalize e processe múltiplas fitas 1/4" em fila com calibração automática de azimute e salvamento direto na pasta de sua escolha.
@@ -782,9 +1068,9 @@ export function BatchProcessingModal({
 
             <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 pt-2 border-t border-slate-800/80">
               {/* Subfolder Name */}
-              <div className="sm:col-span-5 flex flex-col gap-1">
+              <div className="sm:col-span-4 flex flex-col gap-1">
                 <label className="text-[11px] font-mono text-slate-400">
-                  Nome da Subpasta Criada:
+                  Nome da Subpasta Principal:
                 </label>
                 <input
                   type="text"
@@ -793,24 +1079,64 @@ export function BatchProcessingModal({
                   placeholder="Ex: Tapes_Processados_AuraTune"
                   className="px-3 py-1.5 rounded-lg bg-[#090e1a] border border-slate-700 text-xs text-white focus:outline-none focus:border-cyan-400 font-mono"
                 />
+                {separateSubfolders && (
+                  <div className="flex flex-wrap items-center gap-1 text-[10px] font-mono mt-1">
+                    <span className="text-slate-500">Pastas:</span>
+                    <span className="px-1.5 py-0.5 rounded bg-emerald-950/70 border border-emerald-500/40 text-emerald-300 font-bold" title="Áudios intermediários restaurados (dropouts, azimute, sem master)">
+                      📁 [Recuperados]
+                    </span>
+                    <span className="px-1.5 py-0.5 rounded bg-cyan-950/70 border border-cyan-500/40 text-cyan-300 font-bold" title="Áudio final masterizado + presets de recall (.aurapreset)">
+                      📁 [-LUFS]
+                    </span>
+                  </div>
+                )}
               </div>
 
               {/* Export Mode */}
-              <div className="sm:col-span-4 flex flex-col gap-1">
+              <div className="sm:col-span-3 flex flex-col gap-1">
                 <label className="text-[11px] font-mono text-slate-400">Arquivos Gerados:</label>
                 <select
                   value={batchExportMode}
                   onChange={(e) => setBatchExportMode(e.target.value as 'master' | 'azimuth_only' | 'both')}
-                  className="px-3 py-1.5 rounded-lg bg-[#090e1a] border border-slate-700 text-xs text-white focus:outline-none focus:border-cyan-400 font-mono"
+                  className="px-2.5 py-1.5 rounded-lg bg-[#090e1a] border border-slate-700 text-xs text-white focus:outline-none focus:border-cyan-400 font-mono"
                 >
-                  <option value="both">Ambos (Azimute Puro + Master Final)</option>
-                  <option value="azimuth_only">Apenas Azimute Corrigido (Preservação)</option>
-                  <option value="master">Apenas Masterização Final Completa</option>
+                  <option value="both">Ambos (Azimute + Master)</option>
+                  <option value="azimuth_only">Apenas Azimute</option>
+                  <option value="master">Apenas Master Final</option>
+                </select>
+              </div>
+
+              {/* Bit Depth Resolution */}
+              <div className="sm:col-span-2 flex flex-col gap-1">
+                <label className="text-[11px] font-mono text-slate-400">Resolução:</label>
+                <select
+                  value={batchBitDepth}
+                  onChange={(e) => setBatchBitDepth(Number(e.target.value) as 16 | 24 | 32)}
+                  disabled={isProcessingBatch}
+                  className="px-2 py-1.5 rounded-lg bg-[#090e1a] border border-slate-700 text-xs text-amber-300 font-bold focus:outline-none focus:border-amber-400 font-mono"
+                  title="Resolução de saída em bits: 24-bit Studio Master ou 16-bit compatível com Windows XP, CD e reprodutores universais"
+                >
+                  <option value={24}>24-bit (Master)</option>
+                  <option value={16}>16-bit (Win XP / CD)</option>
+                  <option value={32}>32-bit Float</option>
                 </select>
               </div>
 
               {/* Auto-Align per tape switch & Auto-ZIP fallback */}
               <div className="sm:col-span-3 flex flex-col justify-center gap-2 pt-1">
+                <label className="flex items-center gap-2 cursor-pointer text-xs text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={separateSubfolders}
+                    onChange={(e) => setSeparateSubfolders(e.target.checked)}
+                    className="rounded border-slate-700 text-emerald-500 focus:ring-emerald-500/40 bg-slate-900"
+                  />
+                  <span className="text-[11px] text-emerald-300 font-semibold flex items-center gap-1">
+                    <FolderDown className="w-3.5 h-3.5 text-emerald-400" />
+                    Subpastas: [Recuperados] e [-LUFS]
+                  </span>
+                </label>
+
                 <label className="flex items-center gap-2 cursor-pointer text-xs text-slate-300">
                   <input
                     type="checkbox"
@@ -852,6 +1178,19 @@ export function BatchProcessingModal({
                 <label className="flex items-center gap-2 cursor-pointer text-xs text-slate-300">
                   <input
                     type="checkbox"
+                    checked={autoOrbanPerTape}
+                    onChange={(e) => setAutoOrbanPerTape(e.target.checked)}
+                    className="rounded border-slate-700 text-sky-500 focus:ring-sky-500/40 bg-slate-900"
+                  />
+                  <span className="text-[11px] text-sky-300 font-semibold flex items-center gap-1">
+                    <Radio className="w-3.5 h-3.5 text-sky-400" />
+                    Auto-equalizar agudos Orban por fita (Auto-Brilliance EQ & HF Limiter)
+                  </span>
+                </label>
+
+                <label className="flex items-center gap-2 cursor-pointer text-xs text-slate-300">
+                  <input
+                    type="checkbox"
                     checked={autoZipWhenDirectBlocked}
                     onChange={(e) => setAutoZipWhenDirectBlocked(e.target.checked)}
                     className="rounded border-slate-700 text-cyan-500 focus:ring-cyan-500/40 bg-slate-900"
@@ -870,7 +1209,7 @@ export function BatchProcessingModal({
                   />
                   <span className="text-[11px] text-amber-300 font-semibold flex items-center gap-1">
                     <Bookmark className="w-3 h-3 text-amber-400" />
-                    Salvar presets de recall (.aurapreset) na mesma pasta
+                    Salvar presets de recall (.aurapreset) em [-LUFS]
                   </span>
                 </label>
               </div>
@@ -955,8 +1294,8 @@ export function BatchProcessingModal({
                 {queue.map((item, index) => {
                   const isCurrent = currentProcessingIndex === index;
                   const itemPreviewName = buildMasterWavFilename({
-                    trackNumber: item.trackNumber || String(index + 1).padStart(2, '0'),
-                    songTitle: item.songTitle || item.title.replace(/\.[^/.]+$/, ''),
+                    trackNumber: item.trackNumber,
+                    songTitle: item.songTitle || stripAudioFileExtension(item.title),
                     artist: item.artist,
                     sampleRate: item.format?.sampleRate || 44100,
                     bitDepth: item.format?.bitDepth || 24,
@@ -1043,6 +1382,31 @@ export function BatchProcessingModal({
                                 {item.format.sampleRate.toLocaleString()} Hz · {item.format.bitDepth}-bit
                               </span>
                             )}
+                            {item.initialLufs !== undefined && (
+                              <span className="text-amber-300 font-bold">
+                                {item.initialLufs.toFixed(1)} LUFS
+                              </span>
+                            )}
+                            {item.dominantPlatformName && (
+                              <span
+                                className={`px-1.5 py-0.5 rounded border ${
+                                  item.isVintageAnalogTape || (item.overallAiProbability ?? 0) <= 25
+                                    ? 'text-emerald-300 bg-emerald-950/50 border-emerald-500/40'
+                                    : 'text-amber-300 bg-amber-950/50 border-amber-600/30'
+                                }`}
+                              >
+                                {item.isVintageAnalogTape
+                                  ? 'Gravação Analógica Legítima'
+                                  : (item.overallAiProbability ?? 0) > 40
+                                  ? `${item.dominantPlatformName} (${item.overallAiProbability?.toFixed(0)}% IA)`
+                                  : item.dominantPlatformName}
+                              </span>
+                            )}
+                            {item.isDualMono && (
+                              <span className="text-cyan-300 bg-cyan-950/40 px-1.5 py-0.5 rounded border border-cyan-800/40">
+                                Dual-Mono / Ampex
+                              </span>
+                            )}
                             {item.azimuthOffsetSamples !== undefined && item.azimuthOffsetUs !== undefined && (
                               <span className="text-amber-300 flex items-center gap-1">
                                 <Disc className="w-2.5 h-2.5" />
@@ -1050,17 +1414,69 @@ export function BatchProcessingModal({
                                 {item.azimuthOffsetUs.toFixed(1)} µs
                               </span>
                             )}
-                            {item.dropoutsCount !== undefined && (
-                              <span className="text-emerald-300 flex items-center gap-1 bg-emerald-950/40 px-1.5 py-0.5 rounded border border-emerald-800/40">
-                                <ShieldCheck className="w-2.5 h-2.5 text-emerald-400" />
-                                Dropouts: {item.dropoutsCount > 0 ? `${item.dropoutsCount} (${item.tapeHealthScore}% saúde)` : 'Fita íntegra'}
-                              </span>
-                            )}
+                            {item.dropoutsCount !== undefined && (() => {
+                              const mode = item.customDropoutSettings?.mode;
+                              const isMonoGraft = mode === 'mono_wander_graft';
+                              const isAmpex = mode === 'ampex_fulltrack_cross';
+                              const isDual = item.isDualMono || item.isAmpexCandidate;
+                              const modeLabel = isMonoGraft
+                                ? 'Estabilizador Mono & Enxerto'
+                                : isAmpex
+                                ? 'Ampex Cross'
+                                : mode === 'mono_optimized_sum'
+                                ? 'Soma Mono'
+                                : mode === 'stereo_independent'
+                                ? 'Estéreo Indep.'
+                                : isDual
+                                ? 'Estabilizador Mono & Enxerto'
+                                : `${item.tapeHealthScore}% saúde`;
+
+                              return (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (isDual) {
+                                      const nextMode = isMonoGraft ? 'ampex_fulltrack_cross' : 'mono_wander_graft';
+                                      handleTrackDropoutModeChange(item.id, nextMode);
+                                    }
+                                  }}
+                                  disabled={isProcessingBatch}
+                                  className={`flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-mono font-semibold transition-all cursor-pointer ${
+                                    isMonoGraft
+                                      ? 'text-purple-300 bg-purple-950/60 border-purple-700/60 hover:bg-purple-900/60'
+                                      : isAmpex
+                                      ? 'text-cyan-300 bg-cyan-950/60 border-cyan-700/60 hover:bg-cyan-900/60'
+                                      : 'text-emerald-300 bg-emerald-950/40 border-emerald-800/40 hover:bg-emerald-900/40'
+                                  }`}
+                                  title={
+                                    isDual
+                                      ? `Modo de Dropout: ${modeLabel}. Clique para alternar entre Estabilizador Mono & Enxerto e Ampex Cross.`
+                                      : `Modo de Dropout: ${modeLabel}`
+                                  }
+                                >
+                                  {isMonoGraft ? (
+                                    <Sparkles className="w-2.5 h-2.5 text-purple-400" />
+                                  ) : (
+                                    <ShieldCheck className="w-2.5 h-2.5 text-emerald-400" />
+                                  )}
+                                  <span>
+                                    Dropouts: {item.dropoutsCount > 0 ? `${item.dropoutsCount} (${modeLabel})` : 'Fita íntegra'}
+                                  </span>
+                                </button>
+                              );
+                            })()}
                             {item.hissNoiseFloorDb !== undefined && (
                               <span className="text-purple-300 flex items-center gap-1 bg-purple-950/40 px-1.5 py-0.5 rounded border border-purple-800/40">
                                 <Waves className="w-2.5 h-2.5 text-purple-400" />
                                 Ruído: {item.hissNoiseFloorDb.toFixed(1)} dBFS
                                 {item.hasHumDetected ? ' (Ronco AC)' : ''}
+                              </span>
+                            )}
+                            {item.trebleBalanceDb !== undefined && (
+                              <span className="text-sky-300 flex items-center gap-1 bg-sky-950/40 px-1.5 py-0.5 rounded border border-sky-800/40">
+                                <Radio className="w-2.5 h-2.5 text-sky-400" />
+                                Orban: {item.trebleBalanceDb} dB {item.isDarkTape ? '(Fita Abafada ➔ Auto-Brilliance)' : item.isHarshRecording ? '(Limiter HF)' : '(Equilibrado)'}
                               </span>
                             )}
                             {item.savedPath && (
@@ -1117,7 +1533,7 @@ export function BatchProcessingModal({
                         <button
                           type="button"
                           onClick={() => {
-                            onEditTrackInMastering(index);
+                            onEditTrackInMastering(index, item);
                             onClose();
                           }}
                           className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/40 text-cyan-300 text-xs font-semibold transition-all cursor-pointer shadow-xs"

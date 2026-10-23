@@ -28,6 +28,17 @@ export interface TapeAzimuthAnalysis {
   absolutePolarityState: 'normal' | 'inverted_both_180' | 'neutral';
   waveformSkewness: number;     // 3rd central moment (Waveform asymmetry)
   peakAsymmetryRatio: number;   // Positive vs Negative transient peaks ratio
+  // Channel Material Detection (Mono in 2 Channels vs Real Stereo)
+  channelConfiguration: 'stereo' | 'dual_mono' | 'single_mono';
+  channelConfigLabel: string;
+  channelConfigDetail: string;
+  sideToMidDb: number;
+  isModernRecording?: boolean;
+  // Ghost / Dead Channel Detection (Hiss / Crosstalk Isolation)
+  isGhostChannelDetected: boolean;
+  ghostChannel: 'none' | 'left_dead' | 'right_dead';
+  activeSignalChannel: 'both' | 'L' | 'R';
+  ghostNoiseLevelDb?: number;
 }
 
 export interface TapeAzimuthSettings {
@@ -38,6 +49,9 @@ export interface TapeAzimuthSettings {
   invertPhaseR: boolean;       // Polarity invert Right
   listenInMono: boolean;        // Preview in mono to verify comb-filter elimination
   autoAlignOnLoad?: boolean;   // Auto-align when a new tape file is loaded
+  ghostChannelHandling?: 'clone_active' | 'passthrough';
+  activeChannel?: 'both' | 'L' | 'R';
+  channelModeOverride?: 'auto' | 'force_dual_mono' | 'force_mono_left' | 'force_mono_right' | 'force_stereo';
 }
 
 /**
@@ -69,18 +83,27 @@ export function analyzeTapeAzimuth(audioBuffer: AudioBuffer): TapeAzimuthAnalysi
       absolutePolarityState: 'normal',
       waveformSkewness: 0,
       peakAsymmetryRatio: 1.0,
+      channelConfiguration: 'single_mono',
+      channelConfigLabel: 'Mono (1 Canal)',
+      channelConfigDetail: 'Áudio mono de pista única.',
+      sideToMidDb: -96,
+      isGhostChannelDetected: false,
+      ghostChannel: 'none',
+      activeSignalChannel: 'both',
     };
   }
 
   const channelL = audioBuffer.getChannelData(0);
   const channelR = audioBuffer.getChannelData(1);
 
-  // 1. Calculate RMS, Peak, and 3rd Central Moment (Skewness / Waveform Asymmetry)
+  // 1. Calculate RMS, Peak, Side/Mid Ratio, and 3rd Central Moment (Skewness / Waveform Asymmetry)
   let sumSqL = 0;
   let sumSqR = 0;
   let maxPeakL = 0;
   let maxPeakR = 0;
   let sumCross = 0;
+  let sumSqMid = 0;
+  let sumSqSide = 0;
 
   let sumCubeL = 0;
   let sumCubeR = 0;
@@ -101,6 +124,10 @@ export function analyzeTapeAzimuth(audioBuffer: AudioBuffer): TapeAzimuthAnalysi
     sumCubeR += r * r * r;
 
     const mid = (l + r) * 0.5;
+    const side = (l - r) * 0.5;
+    sumSqMid += mid * mid;
+    sumSqSide += side * side;
+
     if (mid > 0.04) {
       posPeakSum += mid;
     } else if (mid < -0.04) {
@@ -114,12 +141,35 @@ export function analyzeTapeAzimuth(audioBuffer: AudioBuffer): TapeAzimuthAnalysi
     count++;
   }
 
+  // 1-pole low-pass filter (~400 Hz) to measure fundamental musical body (bass/kick/vocals)
+  // Tape hiss and head crosstalk have virtually zero energy below 400 Hz (< -65 dBFS),
+  // whereas authentic musical audio has strong fundamental energy (-15 to -35 dBFS).
+  const lpCoeff = 1.0 - Math.exp((-2.0 * Math.PI * 400.0 * stride) / sampleRate);
+  let lpL = 0;
+  let lpR = 0;
+  let sumSqLowL = 0;
+  let sumSqLowR = 0;
+  for (let i = 0; i < totalLength; i += stride) {
+    const l = channelL[i];
+    const r = channelR[i];
+    lpL += lpCoeff * (l - lpL);
+    lpR += lpCoeff * (r - lpR);
+    sumSqLowL += lpL * lpL;
+    sumSqLowR += lpR * lpR;
+  }
+
   const rmsL = Math.sqrt(sumSqL / Math.max(1, count));
   const rmsR = Math.sqrt(sumSqR / Math.max(1, count));
   const rmsDbL = rmsL > 1e-6 ? 20 * Math.log10(rmsL) : -96;
   const rmsDbR = rmsR > 1e-6 ? 20 * Math.log10(rmsR) : -96;
   const peakDbL = maxPeakL > 1e-6 ? 20 * Math.log10(maxPeakL) : -96;
   const peakDbR = maxPeakR > 1e-6 ? 20 * Math.log10(maxPeakR) : -96;
+
+  const rmsLowL = Math.sqrt(sumSqLowL / Math.max(1, count));
+  const rmsLowR = Math.sqrt(sumSqLowR / Math.max(1, count));
+  const rmsLowDbL = rmsLowL > 1e-6 ? 20 * Math.log10(rmsLowL) : -96;
+  const rmsLowDbR = rmsLowR > 1e-6 ? 20 * Math.log10(rmsLowR) : -96;
+  const lowDiffDb = Math.round((rmsLowDbL - rmsLowDbR) * 10) / 10;
 
   const levelDiffDb = Math.round((rmsDbL - rmsDbR) * 10) / 10;
   const peakDiffDb = Math.round((peakDbL - peakDbR) * 10) / 10;
@@ -259,14 +309,140 @@ export function analyzeTapeAzimuth(audioBuffer: AudioBuffer): TapeAzimuthAnalysi
 
   const phaseCorrAfter = Math.min(1.0, Math.max(phaseCorr, phaseCorr + (monoSumGainAfterDb > 0.3 ? 0.08 : 0.02)));
 
+  // Calculate Side vs Mid energy ratio
+  const midEnergy = sumSqMid / Math.max(1, count);
+  const sideEnergy = sumSqSide / Math.max(1, count);
+  const sideToMidRatio = sideEnergy / Math.max(1e-9, midEnergy);
+  const sideToMidDb = sideToMidRatio > 1e-9 ? Math.round(10 * Math.log10(sideToMidRatio) * 10) / 10 : -96;
+
+  // 1. Ghost / Dead Channel Detection (Tape Hiss / Crosstalk vs. Authentic Stereo Balance):
+  // When an audio file contains useful program audio on only ONE channel while the other channel
+  // contains only tape hiss / noise floor / preamp self-noise or minimal crosstalk leakage:
+  // - Real physical stereo balance between Left and Right in any commercial track never exceeds ±4.5 to ±6.0 dB.
+  // - If |levelDiffDb| >= 7.0 dB, it is physically impossible to be a balanced stereo mix; one channel is
+  //   either idle, dead, or containing only background noise / crosstalk.
+  // - A quieter channel with RMS <= -32.0 dBFS and level difference >= 5.5 dB is confirmed tape hiss/preamp noise.
+  // - Tape hiss and crosstalk have virtually zero low-frequency musical energy (< 400 Hz).
+  //   If low-frequency energy is absent (lowDiffDb >= 10.0 dB), the channel has no musical instrument body.
+  // - In any of these conditions, classifying the track as "estéreo desbalanceado" and injecting gain (up to +40 dB)
+  //   catastrophically amplifies tape hiss and unwanted noise.
+  // - The engine MUST detect this as an originally mono recording with a phantom/dead channel, reject blind gain,
+  //   and duplicate the clean active channel to both outputs.
+  const maxRmsDb = Math.max(rmsDbL, rmsDbR);
+  const hasActiveAudio = maxRmsDb > -65.0;
+
+  const isLeftGhost =
+    hasActiveAudio &&
+    (
+      // Disparity >= 7.0 dB where Right is active and Left is quiet
+      levelDiffDb <= -7.0 ||
+      // Moderate disparity (>= 5.5 dB) with Left near noise floor (<= -32 dBFS)
+      (levelDiffDb <= -5.5 && rmsDbL <= -32.0) ||
+      // Left channel is near digital/analog silence (<= -50 dBFS) while Right has audio
+      (rmsDbL <= -50.0 && rmsDbR > -50.0 && levelDiffDb <= -4.0) ||
+      // Left channel lacks low-frequency musical body (bass/fundamentals below 400 Hz)
+      (lowDiffDb <= -10.0 && rmsLowDbL <= -44.0 && rmsLowDbR > -36.0) ||
+      // Left channel peak is extremely low compared to Right
+      (peakDiffDb <= -12.0 && peakDbL <= -32.0)
+    );
+
+  const isRightGhost =
+    hasActiveAudio &&
+    (
+      // Disparity >= 7.0 dB where Left is active and Right is quiet (e.g. +40 dB disparity)
+      levelDiffDb >= 7.0 ||
+      // Moderate disparity (>= 5.5 dB) with Right near noise floor (<= -32 dBFS)
+      (levelDiffDb >= 5.5 && rmsDbR <= -32.0) ||
+      // Right channel is near digital/analog silence (<= -50 dBFS) while Left has audio
+      (rmsDbR <= -50.0 && rmsDbL > -50.0 && levelDiffDb >= 4.0) ||
+      // Right channel lacks low-frequency musical body (bass/fundamentals below 400 Hz)
+      (lowDiffDb >= 10.0 && rmsLowDbR <= -44.0 && rmsLowDbL > -36.0) ||
+      // Right channel peak is extremely low compared to Left
+      (peakDiffDb >= 12.0 && peakDbR <= -32.0)
+    );
+
+  const isGhostChannelDetected = isLeftGhost || isRightGhost;
+  const ghostChannel: 'none' | 'left_dead' | 'right_dead' = isLeftGhost ? 'left_dead' : isRightGhost ? 'right_dead' : 'none';
+  const activeSignalChannel: 'both' | 'L' | 'R' = isLeftGhost ? 'R' : isRightGhost ? 'L' : 'both';
+  const ghostNoiseLevelDb = isLeftGhost ? rmsDbL : isRightGhost ? rmsDbR : undefined;
+
+  // Determine if audio is genuine mono two-track or authentic stereo:
+  // Mono Two-Track (e.g. mono tape digitized on 2-track deck, or Ampex full-track):
+  // Even with severe tape dropouts (oxide flaking in one channel) and azimuth delay,
+  // Side energy remains low compared to Mid (S/M <= -17.5 dB), and correlation is positive (>= 0.65).
+  // In true stereo mixes (with panned instruments, stereo reverbs, stereo chorus), Side energy is substantial (S/M >= -15.5 dB, typically -8 dB to -14 dB).
+  const isDualMono =
+    !isGhostChannelDetected &&
+    (sideToMidDb <= -21.0 ||
+      (sideToMidDb <= -17.0 && (phaseCorrAfter >= 0.65 || phaseCorr >= 0.60)) ||
+      (phaseCorrAfter >= 0.88 && sideToMidDb <= -15.0));
+
+  const isModernStereoRecording =
+    !isDualMono &&
+    !isGhostChannelDetected &&
+    Math.abs(roundedSamples) <= 0.08 &&
+    Math.abs(levelDiffDb) <= 0.35 &&
+    phaseCorr >= 0.40;
+
+  const isModernMonoRecording =
+    isDualMono &&
+    !isGhostChannelDetected &&
+    Math.abs(roundedSamples) <= 0.08 &&
+    Math.abs(levelDiffDb) <= 0.25;
+
+  const isModernRecording = isModernStereoRecording || isModernMonoRecording;
+
+  let channelConfiguration: 'stereo' | 'dual_mono' | 'single_mono' = 'stereo';
+  let channelConfigLabel = '';
+  let channelConfigDetail = '';
+
+  if (isGhostChannelDetected) {
+    channelConfiguration = 'single_mono';
+    channelConfigLabel = isRightGhost
+      ? 'Gravação Originalmente Mono (Canal D Morto / Hiss)'
+      : 'Gravação Originalmente Mono (Canal E Morto / Hiss)';
+    channelConfigDetail = isRightGhost
+      ? `Gravação originalmente gravada em mono com áudio útil presente exclusivamente no Canal Esquerdo (${rmsDbL.toFixed(1)} dBFS). O Canal Direito contém apenas ruído de fita (hiss) ou vazamento residual (${rmsDbR.toFixed(1)} dBFS, diferença de +${levelDiffDb.toFixed(1)} dB). O sistema reconheceu a natureza mono da gravação, rejeitou a injeção cega de +${levelDiffDb.toFixed(1)} dB no chiado e centrou o Canal E em ambas as saídas em mono limpo.`
+      : `Gravação originalmente gravada em mono com áudio útil presente exclusivamente no Canal Direito (${rmsDbR.toFixed(1)} dBFS). O Canal Esquerdo contém apenas ruído de fita (hiss) ou vazamento residual (${rmsDbL.toFixed(1)} dBFS, diferença de ${levelDiffDb.toFixed(1)} dB). O sistema reconheceu a natureza mono da gravação, rejeitou a injeção cega de +${Math.abs(levelDiffDb).toFixed(1)} dB no chiado e centrou o Canal D em ambas as saídas em mono limpo.`;
+  } else if (isDualMono) {
+    channelConfiguration = 'dual_mono';
+    channelConfigLabel = isModernMonoRecording
+      ? 'Gravação Atual Mono (Dual-Mono Digital)'
+      : 'Mono em 2 Trilhas (Fita 1/4" Two-Track / Ampex)';
+    channelConfigDetail = isModernMonoRecording
+      ? `Gravação digital em 2 canais idênticos (Correlação 100%, S/M ${sideToMidDb} dB). Sem danos de fita: pronta para masterização direta.`
+      : `Material Mono em 2 Trilhas (Two-Track / Ampex) detectado (Correlação ${Math.round(phaseCorrAfter * 100)}%, S/M ${sideToMidDb} dB). Reconstrução cruzada e alinhamento anti-flanger recomendados para reparar falhas de óxido.`;
+  } else {
+    channelConfiguration = 'stereo';
+    channelConfigLabel = isModernStereoRecording
+      ? 'Gravação Atual Estéreo (Mixagem L/R)'
+      : 'Estéreo Real (Mixagem L/R)';
+    channelConfigDetail = isModernStereoRecording
+      ? `Gravação contemporânea em estéreo autêntico (S/M ${sideToMidDb} dB, Correlação ${(phaseCorr * 100).toFixed(0)}%). Fase e relógio digital alinhados: pronta para masterização direta sem reparos mecânicos.`
+      : `Mixagem estéreo com separação L/R detectada (S/M ${sideToMidDb} dB, Correlação ${Math.round(phaseCorr * 100)}%). Restauração independente preservando a abertura acústica.`;
+  }
+
   // Studio Recommendation text
   let recommendation = '';
-  if (relativePhaseState === 'inverted_lr_180') {
+  if (isGhostChannelDetected) {
+    const liveCh = isRightGhost ? 'Esquerdo (E)' : 'Direito (D)';
+    const deadCh = isRightGhost ? 'Direito (D)' : 'Esquerdo (E)';
+    const deadLevel = (isRightGhost ? rmsDbR : rmsDbL).toFixed(1);
+    const liveLevel = (isRightGhost ? rmsDbL : rmsDbR).toFixed(1);
+    const absDiff = Math.abs(levelDiffDb).toFixed(1);
+    recommendation = `⚠️ GRAVAÇÃO ORIGINALMENTE MONO (CANAL FANTASMA DETECTADO): Sinal útil presente exclusivamente no Canal ${liveCh} (${liveLevel} dBFS). O Canal ${deadCh} contém somente ruído de fita (hiss) ou vazamento residual (${deadLevel} dBFS). O sistema rejeitou a injeção cega de ganho (+${absDiff} dB) no canal com ruído e configurou a duplicação do Canal ${liveCh} para ambas as saídas em Mono limpo e perfeitamente centrado.`;
+  } else if (relativePhaseState === 'inverted_lr_180') {
     recommendation = '⚠️ ALERTA DE ANTI-FASE: Os canais L e R estão em oposição de 180° entre si (cancelamento total em mono). Inverta a polaridade de um canal (L ou R) para corrigir a fiação!';
   } else if (absolutePolarityState === 'inverted_both_180') {
     recommendation = `⚠️ POLARIDADE ABSOLUTA INVERTIDA: Detectada inversão de 180° nos dois canais (picos de rarefação predominantes, assimetria ${avgSkewness}). Recomendado inverter ambos os canais (L e R).`;
+  } else if (isModernStereoRecording) {
+    recommendation = 'Gravação Atual Estéreo detectada com azimute e balanço ideais. Módulos de restauração mecânica de fita dispensados; áudio pronto para masterização direta.';
+  } else if (isModernMonoRecording) {
+    recommendation = 'Gravação Atual Mono detectada com canais perfeitamente simétricos. Dispensado reparo de fita; pronta para masterização direta.';
+  } else if (isDualMono) {
+    recommendation = `Fita Mono em 2 Canais detectada (${channelConfigLabel}). Alinhamento de azimute compensado e restauração cruzada recomendada se houver falhas de óxido.`;
   } else if (Math.abs(roundedSamples) <= 0.15 && Math.abs(levelDiffDb) <= 0.5) {
-    recommendation = 'Azimute e balanço de canais ideais. Alinhamento de cabeçote perfeitamente conservado.';
+    recommendation = 'Azimute e balanço de canais ideais. Alinhamento perfeitamente conservado.';
   } else if (Math.abs(roundedSamples) > 0.15 && Math.abs(levelDiffDb) <= 0.5) {
     recommendation = `Desvio de azimute detectado (${roundedUs > 0 ? '+' : ''}${roundedUs} µs / ${roundedSamples} amostras). Canal ${leadingChannel} adiantado. Alinhamento recomendado antes da masterização.`;
   } else if (Math.abs(roundedSamples) <= 0.15 && Math.abs(levelDiffDb) > 0.5) {
@@ -295,6 +471,15 @@ export function analyzeTapeAzimuth(audioBuffer: AudioBuffer): TapeAzimuthAnalysi
     absolutePolarityState,
     waveformSkewness: avgSkewness,
     peakAsymmetryRatio,
+    channelConfiguration,
+    channelConfigLabel,
+    channelConfigDetail,
+    sideToMidDb,
+    isModernRecording,
+    isGhostChannelDetected,
+    ghostChannel,
+    activeSignalChannel,
+    ghostNoiseLevelDb,
   };
 }
 
@@ -328,8 +513,18 @@ export function processBufferWithAzimuthAndBalance(
   const sampleRate = sourceBuffer.sampleRate;
   const totalLength = sourceBuffer.length;
 
-  const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-  const outputBuffer = audioCtx.createBuffer(numChannels, totalLength, sampleRate);
+  let outputBuffer: AudioBuffer;
+  if (typeof AudioBuffer !== 'undefined') {
+    try {
+      outputBuffer = new AudioBuffer({ numberOfChannels: numChannels, length: totalLength, sampleRate });
+    } catch {
+      const offline = new OfflineAudioContext(numChannels, 1, sampleRate);
+      outputBuffer = offline.createBuffer(numChannels, totalLength, sampleRate);
+    }
+  } else {
+    const offline = new OfflineAudioContext(numChannels, 1, sampleRate);
+    outputBuffer = offline.createBuffer(numChannels, totalLength, sampleRate);
+  }
 
   if (numChannels < 2) {
     // Mono track - copy as is
@@ -342,10 +537,45 @@ export function processBufferWithAzimuthAndBalance(
   const dstL = outputBuffer.getChannelData(0);
   const dstR = outputBuffer.getChannelData(1);
 
-  // Balance calculation (in dB)
-  // balanceDb > 0 boosts L and reduces R; balanceDb < 0 boosts R and reduces L
-  const balL = Math.pow(10, (settings.balanceDb / 2) / 20);
-  const balR = Math.pow(10, (-settings.balanceDb / 2) / 20);
+  // 1. Forced Channel Mode / Ghost / Dead Channel Recovery:
+  if (settings.channelModeOverride === 'force_mono_left') {
+    const sign = settings.invertPhaseL ? -1 : 1;
+    for (let i = 0; i < totalLength; i++) {
+      const sample = srcL[i] * sign;
+      dstL[i] = sample;
+      dstR[i] = sample;
+    }
+    return outputBuffer;
+  }
+
+  if (settings.channelModeOverride === 'force_mono_right') {
+    const sign = settings.invertPhaseR ? -1 : 1;
+    for (let i = 0; i < totalLength; i++) {
+      const sample = srcR[i] * sign;
+      dstL[i] = sample;
+      dstR[i] = sample;
+    }
+    return outputBuffer;
+  }
+
+  // Ghost channel handling
+  if (settings.ghostChannelHandling !== 'passthrough' && (settings.activeChannel === 'L' || settings.activeChannel === 'R')) {
+    const activeSrc = settings.activeChannel === 'L' ? srcL : srcR;
+    const sign = (settings.activeChannel === 'L' ? settings.invertPhaseL : settings.invertPhaseR) ? -1 : 1;
+    for (let i = 0; i < totalLength; i++) {
+      const sample = activeSrc[i] * sign;
+      dstL[i] = sample;
+      dstR[i] = sample;
+    }
+    return outputBuffer;
+  }
+
+  // 2. Safe Physical Balance Clamp:
+  // Prevents runaway gain amplification (+40 dB) on noise floor.
+  // Real tape head wear imbalance never exceeds ±4.5 to ±6.0 dB.
+  const safeBalanceDb = Math.max(-6.0, Math.min(6.0, settings.balanceDb || 0));
+  const balL = Math.pow(10, (safeBalanceDb / 2) / 20);
+  const balR = Math.pow(10, (-safeBalanceDb / 2) / 20);
 
   // Polarity / Phase inversion
   const signL = settings.invertPhaseL ? -1 : 1;
@@ -389,8 +619,8 @@ export function processBufferWithAzimuthAndBalance(
     sampleL *= signL * balL;
     sampleR *= signR * balR;
 
-    // Listen in Mono preview mode
-    if (settings.listenInMono) {
+    // Listen in Mono preview mode or Forced Dual-Mono Two-Track mode
+    if (settings.listenInMono || settings.channelModeOverride === 'force_dual_mono') {
       const mono = 0.5 * (sampleL + sampleR);
       dstL[i] = mono;
       dstR[i] = mono;

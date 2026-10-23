@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { ForensicAnalysisResult } from '../types/audio';
 import { X, FileText, Check, Download, ShieldAlert, Cpu, AlertTriangle, Activity } from 'lucide-react';
+import { stripAudioFileExtension } from '../audio/trackNamingHelper';
 
 interface ForensicReportModalProps {
   isOpen: boolean;
@@ -50,7 +51,7 @@ ${report.summaryDiagnosis}
     const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(report, null, 2));
     const downloadAnchor = document.createElement('a');
     downloadAnchor.setAttribute('href', dataStr);
-    downloadAnchor.setAttribute('download', `relatorio_masterizacao_${report.filename.replace(/\.[^/.]+$/, '')}.json`);
+    downloadAnchor.setAttribute('download', `relatorio_masterizacao_${stripAudioFileExtension(report.filename)}.json`);
     document.body.appendChild(downloadAnchor);
     downloadAnchor.click();
     downloadAnchor.remove();
@@ -68,8 +69,9 @@ ${report.summaryDiagnosis}
               <FileText className="w-5 h-5" />
             </div>
             <div>
-              <h2 className="text-base font-bold text-white tracking-tight">
-                Relatório Técnico de Masterização & Análise Espectral
+              <h2 className="text-base font-bold text-white tracking-tight flex items-center gap-2">
+                <span>Relatório Técnico de Masterização & Análise Espectral</span>
+                <span className="text-[10px] font-extrabold px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">v2.0</span>
               </h2>
               <div className="flex items-center gap-2 text-xs text-slate-400 mt-0.5">
                 <span>{report.filename}</span>
@@ -245,7 +247,11 @@ ${report.summaryDiagnosis}
                   {report.metrics.nyquistCutoffHz} Hz
                 </span>
                 <span className="text-[10px] text-slate-400">
-                  {report.metrics.nyquistCutoffHz <= 16500 ? 'Brickwall Típico Suno' : 'Extensão Normal'}
+                  {report.dominantPlatform.platform === 'human_analog'
+                    ? 'Atenuação Natural Analógica'
+                    : report.metrics.nyquistCutoffHz <= 18800
+                    ? 'Brickwall Típico Suno / IA'
+                    : 'Extensão Total'}
                 </span>
               </div>
 

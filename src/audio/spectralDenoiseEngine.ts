@@ -33,14 +33,17 @@ export interface NoiseAnalysisTelemetry {
   recommendedReductionDb: number; // Adaptive recommendation
   noiseTypeDetected: string;
   hasHumDetected: boolean;
+  hasNoiseDetected: boolean;      // Verdadeiro quando ruído de fita ou ronco analógico foi detectado
   quietestSegmentStartSec: number;
   quietestSegmentDurationSec: number;
   noiseProfileBands: number[];    // 64 bands representing noise power from 20 Hz to 22 kHz
+  recommendedNoiseProfileType: SpectralDenoiseSettings['noiseProfileType'];
+  recommendedHumNotch: SpectralDenoiseSettings['humNotchFilter'];
 }
 
 export const DEFAULT_DENOISE_SETTINGS: SpectralDenoiseSettings = {
-  enabled: false,                 // Disabled by default to preserve untouched audio until activated
-  reductionDb: 8.5,               // Musical sweet-spot (removes tape hiss while leaving 100% natural timbre)
+  enabled: true,                 // Active by default so denoise takes immediate effect
+  reductionDb: 9.0,               // Musical sweet-spot (effective tape hiss reduction without musical loss)
   thresholdOffsetDb: 0.0,
   smoothingMs: 35,
   noiseProfileType: 'studio_master_15ips',
@@ -234,29 +237,35 @@ export function getStandardTapeNoiseProfile(type: SpectralDenoiseSettings['noise
     const f = CRITICAL_BAND_CENTERS_HZ[i];
 
     if (type === 'tape_hiss_type1') {
-      // Type I Ferric: Higher baseline hiss (~ -52 dBFS), rising towards 10-18 kHz
-      const hissWeight = f > 2000 ? Math.min(10, 5 * Math.log10(f / 2000)) : 0;
-      bands[i] = -55 + hissWeight;
+      // Type I Ferric (Normal Bias): Prominent oxide hiss (~ -52 dBFS), rising towards 8-16 kHz
+      const hissWeight = f > 2000 ? Math.min(10, 6 * Math.log10(f / 2000)) : 0;
+      bands[i] = -54 + hissWeight;
     } else if (type === 'tape_hiss_type2') {
-      // Type II Chrome: Lower noise floor (~ -58 dBFS) with high frequency rise
-      const hissWeight = f > 3500 ? Math.min(8, 4 * Math.log10(f / 3500)) : 0;
-      bands[i] = -61 + hissWeight;
+      // Type II Chrome (High Bias): Lower baseline (~ -59 dBFS) with high frequency rise
+      const hissWeight = f > 3500 ? Math.min(8, 5 * Math.log10(f / 3500)) : 0;
+      bands[i] = -60 + hissWeight;
     } else if (type === 'hum_60hz') {
+      // Ground-Loop Hum 60 Hz + full tape hiss floor (so selecting hum preset also removes hiss/sopro!)
       let humBoost = 0;
-      if (Math.abs(f - 60) < 18) humBoost = 20;
-      else if (Math.abs(f - 120) < 18) humBoost = 15;
-      else if (Math.abs(f - 180) < 20) humBoost = 10;
-      bands[i] = -65 + humBoost;
+      if (Math.abs(f - 60) < 18) humBoost = 22;
+      else if (Math.abs(f - 120) < 18) humBoost = 16;
+      else if (Math.abs(f - 180) < 20) humBoost = 11;
+      else if (Math.abs(f - 240) < 22) humBoost = 7;
+      const hissWeight = f > 2500 ? Math.min(9, 5 * Math.log10(f / 2500)) : 0;
+      bands[i] = -56 + hissWeight + humBoost;
     } else if (type === 'hum_50hz') {
+      // Ground-Loop Hum 50 Hz + full tape hiss floor
       let humBoost = 0;
-      if (Math.abs(f - 50) < 18) humBoost = 20;
-      else if (Math.abs(f - 100) < 18) humBoost = 15;
-      else if (Math.abs(f - 150) < 20) humBoost = 10;
-      bands[i] = -65 + humBoost;
+      if (Math.abs(f - 50) < 18) humBoost = 22;
+      else if (Math.abs(f - 100) < 18) humBoost = 16;
+      else if (Math.abs(f - 150) < 20) humBoost = 11;
+      else if (Math.abs(f - 200) < 22) humBoost = 7;
+      const hissWeight = f > 2500 ? Math.min(9, 5 * Math.log10(f / 2500)) : 0;
+      bands[i] = -56 + hissWeight + humBoost;
     } else {
-      // Studio Master 15/30 ips: Very low noise floor (~ -66 dBFS)
-      const hissWeight = f > 5000 ? Math.min(6, 3 * Math.log10(f / 5000)) : 0;
-      bands[i] = -67 + hissWeight;
+      // Studio Master 15/30 ips: High speed 1/4" tape (~ -66 dBFS)
+      const hissWeight = f > 5000 ? Math.min(6, 4 * Math.log10(f / 5000)) : 0;
+      bands[i] = -66 + hissWeight;
     }
   }
 
@@ -264,7 +273,14 @@ export function getStandardTapeNoiseProfile(type: SpectralDenoiseSettings['noise
 }
 
 /**
- * Fast search for the quietest segment and FFT noise power measurement
+ * Intelligent search for authentic analog tape noise / ground hum footprint.
+ * Inspects:
+ * 1. The Tail (Outro / Runout): The last 0.5s to 5.0s of the song after music decays.
+ *    In tape/vinyl transfers, this is the prime zone where pure ronco (hum) and sopro (hiss) reside.
+ * 2. The Head (Lead-in): The first 0.05s to 3.0s before musical onset.
+ * 3. Quiet inter-musical steady segments throughout the track.
+ *
+ * Excludes digital timeline zero (< -82 dBFS) and active music (high crest factor / high RMS).
  */
 export function learnNoiseProfileFromBuffer(
   audioBuffer: AudioBuffer,
@@ -279,7 +295,9 @@ export function learnNoiseProfileFromBuffer(
 } {
   const sampleRate = audioBuffer.sampleRate;
   const totalLength = audioBuffer.length;
-  const channelData = audioBuffer.getChannelData(0);
+  const numChannels = audioBuffer.numberOfChannels;
+  const chL = audioBuffer.getChannelData(0);
+  const chR = numChannels > 1 ? audioBuffer.getChannelData(1) : chL;
 
   let searchStart = 0;
   let searchLen = Math.floor(sampleRate * 0.4); // 400ms window
@@ -288,59 +306,121 @@ export function learnNoiseProfileFromBuffer(
     searchStart = Math.max(0, Math.floor(explicitStartSec * sampleRate));
     searchLen = Math.max(1024, Math.floor(explicitDurationSec * sampleRate));
   } else {
-    // Physical Analog Tape Hiss Search:
-    // 1. Digital black rejection: Any segment with RMS < -76 dBFS (< 0.000158) is DIGITAL ZERO
-    //    (empty DAW timeline cut, digital lead-in before tape playback began, or digital silence).
-    // 2. Active music rejection: Any segment with RMS > -34 dBFS (> 0.02) contains active program.
-    // 3. Genuine physical analog tape noise sits in the range: [-76 dBFS, -34 dBFS].
-    const step = Math.floor(sampleRate * 0.1); // 100ms stride
-    let minCandidateRms = 1.0;
-    let bestCandidateStart = -1;
-
-    let absoluteMinRms = 1.0;
-    let absoluteMinStart = 0;
-
-    for (let pos = 0; pos + searchLen <= totalLength; pos += step) {
-      let sumSq = 0;
-      const checkCount = Math.min(searchLen, 4096);
-      for (let j = 0; j < checkCount; j += 2) {
-        const s = channelData[pos + j];
-        sumSq += s * s;
-      }
-      const rms = Math.sqrt(sumSq / (checkCount / 2));
-
-      if (rms < absoluteMinRms && rms > 1e-8) {
-        absoluteMinRms = rms;
-        absoluteMinStart = pos;
-      }
-
-      // Check candidate range for genuine analog tape noise:
-      // ~ -76 dBFS (0.000158) to ~ -34 dBFS (0.02)
-      if (rms >= 0.000158 && rms <= 0.02) {
-        if (rms < minCandidateRms) {
-          minCandidateRms = rms;
-          bestCandidateStart = pos;
-        }
-      }
+    interface Candidate {
+      pos: number;
+      rms: number;
+      crestFactor: number;
+      score: number;
+      isTail: boolean;
+      hasAnalogNoise: boolean;
     }
 
-    if (bestCandidateStart !== -1) {
-      // Found genuine physical analog tape noise segment!
-      searchStart = bestCandidateStart;
+    const candidates: Candidate[] = [];
+
+    const evaluateSegment = (pos: number, isTail: boolean, isHead: boolean): Candidate | null => {
+      const len = Math.min(searchLen, totalLength - pos);
+      if (len < 1024) return null;
+
+      let sumSq = 0;
+      let maxPeak = 0;
+      const stride = Math.max(1, Math.floor(len / 2048));
+      let count = 0;
+
+      for (let j = 0; j < len; j += stride) {
+        const s = (chL[pos + j] + chR[pos + j]) * 0.5;
+        const absVal = Math.abs(s);
+        if (absVal > maxPeak) maxPeak = absVal;
+        sumSq += s * s;
+        count++;
+      }
+
+      const rms = Math.sqrt(sumSq / Math.max(1, count));
+
+      // 1. Digital black rejection: Anything < -96 dBFS (< 0.000015) is digital computer silence
+      // 2. Program rejection: Anything > -24 dBFS (> 0.063) is active loud music
+      if (rms < 0.000015 || rms > 0.063) return null;
+
+      const crestFactor = maxPeak / (rms + 1e-12);
+      // Pure noise has crest factor < 4.2. Music transients / drum hits exceed 5.5
+      if (crestFactor > 5.8) return null;
+
+      const rmsDb = 20 * Math.log10(rms);
+      // Real tape hiss and hum sits between -80 dBFS and -35 dBFS
+      const hasAnalogNoise = rmsDb >= -80 && rmsDb <= -35;
+
+      let score = -rmsDb; // Lower RMS is cleaner background noise
+      if (isTail) score += 20; // High priority to outro / tail where pure runout noise sits!
+      else if (isHead) score += 12; // Lead-in tape pre-roll
+      if (crestFactor < 3.2) score += 8; // Ultra-steady stationary noise
+
+      return { pos, rms, crestFactor, score, isTail, hasAnalogNoise };
+    };
+
+    // Candidate Area 1: The Tail (Last 5.0 seconds down to 0.1s from EOF)
+    const tailStart = Math.max(0, totalLength - Math.floor(sampleRate * 5.5));
+    const tailEnd = Math.max(0, totalLength - searchLen - Math.floor(sampleRate * 0.05));
+    const stepTail = Math.floor(sampleRate * 0.1); // 100ms stride
+
+    for (let pos = tailEnd; pos >= tailStart; pos -= stepTail) {
+      const cand = evaluateSegment(pos, true, false);
+      if (cand) candidates.push(cand);
+    }
+
+    // Candidate Area 2: The Head (First 3.0 seconds)
+    const headEnd = Math.min(totalLength - searchLen, Math.floor(sampleRate * 3.0));
+    const stepHead = Math.floor(sampleRate * 0.1);
+    for (let pos = Math.floor(sampleRate * 0.05); pos < headEnd; pos += stepHead) {
+      const cand = evaluateSegment(pos, false, true);
+      if (cand) candidates.push(cand);
+    }
+
+    // Candidate Area 3: Entire track scan for quiet pauses
+    const stepFull = Math.floor(sampleRate * 0.15); // 150ms stride
+    for (let pos = 0; pos + searchLen <= totalLength; pos += stepFull) {
+      const cand = evaluateSegment(pos, false, false);
+      if (cand) candidates.push(cand);
+    }
+
+    // Pick best candidate: Prefer tail runout if it contains true analog noise floor
+    if (candidates.length > 0) {
+      const tailCandidates = candidates.filter((c) => c.isTail && c.hasAnalogNoise);
+      if (tailCandidates.length > 0) {
+        // Sort tail candidates by stationarity (lower crest factor) and clean noise level
+        tailCandidates.sort((a, b) => b.score - a.score);
+        searchStart = tailCandidates[0].pos;
+      } else {
+        candidates.sort((a, b) => b.score - a.score);
+        searchStart = candidates[0].pos;
+      }
     } else {
-      // Fallback: If no segment falls in the ideal [-76, -34] dBFS window
-      // (e.g. wall-to-wall loud master or 100% digital silence):
-      searchStart = absoluteMinStart;
+      // Robust Fallback: find the lowest non-zero RMS window across the entire track
+      let minNonZeroRms = Infinity;
+      let bestFallbackPos = 0;
+      const hop = Math.floor(sampleRate * 0.25);
+      for (let pos = 0; pos + searchLen <= totalLength; pos += hop) {
+        let sumSq = 0;
+        const stride = Math.max(1, Math.floor(searchLen / 1024));
+        let count = 0;
+        for (let j = 0; j < searchLen; j += stride) {
+          const s = (chL[pos + j] + chR[pos + j]) * 0.5;
+          sumSq += s * s;
+          count++;
+        }
+        const rms = Math.sqrt(sumSq / Math.max(1, count));
+        if (rms > 0.00002 && rms < minNonZeroRms) {
+          minNonZeroRms = rms;
+          bestFallbackPos = pos;
+        }
+      }
+      searchStart = bestFallbackPos;
     }
   }
 
   const actualLen = Math.min(searchLen, totalLength - searchStart);
   const numBands = CRITICAL_BAND_CENTERS_HZ.length;
 
-  // Pre-calculate mapping from each FFT bin k to the nearest critical band index
   const binHz = sampleRate / FFT_SIZE;
   const binToBand = new Uint8Array(FFT_SIZE / 2);
-  const bandBinCounts = new Uint16Array(numBands);
 
   for (let k = 1; k < FFT_SIZE / 2; k++) {
     const f = k * binHz;
@@ -354,65 +434,93 @@ export function learnNoiseProfileFromBuffer(
       }
     }
     binToBand[k] = bestB;
-    bandBinCounts[bestB]++;
   }
 
-  // Accumulate FFT bin power across frames in the noise window
-  const bandPowers = new Float64Array(numBands);
+  // Accumulate FFT bin magnitudes using both stereo channels
+  const binNoiseMags = new Float64Array(FFT_SIZE / 2 + 1);
   let framesCount = 0;
-  let totalHissPower = 0;
-  let totalNoisePower = 0;
+  let totalHissEnergy = 0;
+  let totalNoiseEnergy = 0;
 
   const real = new Float32Array(FFT_SIZE);
   const imag = new Float32Array(FFT_SIZE);
 
-  // Parseval normalization factor for positive frequency bins with Hann window:
-  // For Hann window, sum(w^2) = 0.375 * N.
-  // Power P_k = 2 * |X[k]|^2 / (N * sum(w^2)) = 16 * |X[k]|^2 / (3 * N^2)
-  const parsevalNorm = 16 / (3 * FFT_SIZE * FFT_SIZE);
+  // Normalization factor: For Hann window, RMS bin magnitude = sqrt(0.375 * N) * sigma
+  const normFactor = Math.sqrt(0.375 * FFT_SIZE); // ~19.596
 
   for (let offset = 0; offset + FFT_SIZE <= actualLen; offset += HOP_SIZE) {
     for (let n = 0; n < FFT_SIZE; n++) {
-      real[n] = channelData[searchStart + offset + n] * HANN_1024[n];
+      const s = (chL[searchStart + offset + n] + chR[searchStart + offset + n]) * 0.5;
+      real[n] = s * HANN_1024[n];
       imag[n] = 0;
     }
 
     fastFFT1024(real, imag);
 
-    for (let k = 1; k < FFT_SIZE / 2; k++) {
-      const power = (real[k] * real[k] + imag[k] * imag[k]) * parsevalNorm;
-      const b = binToBand[k];
-      bandPowers[b] += power;
-      totalNoisePower += power;
+    let frameHissPow = 0;
+    let frameTotalPow = 0;
 
+    for (let k = 0; k <= FFT_SIZE / 2; k++) {
+      const mag = Math.sqrt(real[k] * real[k] + imag[k] * imag[k]);
+      binNoiseMags[k] += mag;
+
+      const binRms = mag / normFactor;
+      // Single-sided spectrum power: DC and Nyquist have weight 1; all other bins have weight 2
+      const weight = (k === 0 || k === FFT_SIZE / 2) ? 1.0 : 2.0;
+      const binPow = binRms * binRms * weight;
+      frameTotalPow += binPow;
       if (k * binHz >= 3500) {
-        totalHissPower += power;
+        frameHissPow += binPow;
       }
     }
+    totalNoiseEnergy += frameTotalPow;
+    totalHissEnergy += frameHissPow;
     framesCount++;
   }
 
   const safeFrames = Math.max(1, framesCount);
+  for (let k = 0; k <= FFT_SIZE / 2; k++) {
+    binNoiseMags[k] /= safeFrames;
+  }
+
   const profileBands: number[] = [];
 
   for (let b = 0; b < numBands; b++) {
-    const avgBandPower = bandPowers[b] / safeFrames;
-    const binCount = Math.max(1, bandBinCounts[b]);
-    // Power per bin in this critical band:
-    const avgBinPower = avgBandPower / binCount;
-    // Level in dBFS:
-    let db = avgBinPower > 1e-12 ? 10 * Math.log10(avgBinPower) : -86;
-    db = Math.max(-90, Math.min(-30, db));
+    let bandSum = 0;
+    let cnt = 0;
+    for (let k = 1; k < FFT_SIZE / 2; k++) {
+      if (binToBand[k] === b) {
+        bandSum += binNoiseMags[k];
+        cnt++;
+      }
+    }
+    const avgMag = cnt > 0 ? bandSum / cnt : binNoiseMags[0];
+    const equivalentRms = avgMag / normFactor;
+    let db = equivalentRms > 1e-6 ? 20 * Math.log10(equivalentRms) : -86;
+    db = Math.max(-88, Math.min(-20, db));
     profileBands.push(Math.round(db * 10) / 10);
   }
 
-  const avgHissPower = totalHissPower / safeFrames;
-  const hissNoiseFloorDb =
-    avgHissPower > 1e-12 ? Math.round(10 * Math.log10(avgHissPower) * 10) / 10 : -86.0;
+  // Time-domain validation
+  let tdSumSq = 0;
+  for (let i = 0; i < actualLen; i++) {
+    const s = (chL[searchStart + i] + chR[searchStart + i]) * 0.5;
+    tdSumSq += s * s;
+  }
+  const tdRms = Math.sqrt(tdSumSq / Math.max(1, actualLen));
+  const measuredTimeDomainDb = tdRms > 1e-6 ? 20 * Math.log10(tdRms) : -85.0;
 
-  const avgBroadbandPower = totalNoisePower / safeFrames;
-  const broadbandNoiseFloorDb =
-    avgBroadbandPower > 1e-12 ? Math.round(10 * Math.log10(avgBroadbandPower) * 10) / 10 : -86.0;
+  // Frame-averaged total broadband noise power and high-frequency (>3.5kHz) hiss power
+  const avgBroadbandPower = totalNoiseEnergy / safeFrames;
+  const avgHissPower = totalHissEnergy / safeFrames;
+
+  const broadbandNoiseFloorDb = avgBroadbandPower > 1e-12
+    ? Math.round(10 * Math.log10(avgBroadbandPower) * 10) / 10
+    : Math.round(measuredTimeDomainDb * 10) / 10;
+
+  const hissNoiseFloorDb = avgHissPower > 1e-12
+    ? Math.round(10 * Math.log10(avgHissPower) * 10) / 10
+    : Math.round((broadbandNoiseFloorDb - 3.5) * 10) / 10;
 
   return {
     profileBands,
@@ -434,15 +542,33 @@ export function analyzeTapeNoise(audioBuffer: AudioBuffer): NoiseAnalysisTelemet
   const noiseProfileBands = learned.profileBands;
   const hissNoiseFloorDb = learned.hissNoiseFloorDb;
 
-  // Measure 60Hz and 50Hz hum
+  // Measure 60Hz and 50Hz ground-loop hum and harmonics vs adjacent baseline
   let hum60Db = -96;
   let hum50Db = -96;
+  let hum120Db = -96;
+  let hum100Db = -96;
+  let sub35Db = -96;
+  let mid75Db = -96;
+
   for (let b = 0; b < CRITICAL_BAND_CENTERS_HZ.length; b++) {
-    if (Math.abs(CRITICAL_BAND_CENTERS_HZ[b] - 60) < 18) hum60Db = noiseProfileBands[b];
-    if (Math.abs(CRITICAL_BAND_CENTERS_HZ[b] - 50) < 18) hum50Db = noiseProfileBands[b];
+    const f = CRITICAL_BAND_CENTERS_HZ[b];
+    if (Math.abs(f - 60) < 12) hum60Db = noiseProfileBands[b];
+    if (Math.abs(f - 50) < 12) hum50Db = noiseProfileBands[b];
+    if (Math.abs(f - 120) < 15) hum120Db = noiseProfileBands[b];
+    if (Math.abs(f - 100) < 15) hum100Db = noiseProfileBands[b];
+    if (Math.abs(f - 35) < 12) sub35Db = noiseProfileBands[b];
+    if (Math.abs(f - 75) < 12) mid75Db = noiseProfileBands[b];
   }
   const humLevelDb = Math.max(hum60Db, hum50Db);
-  const hasHumDetected = humLevelDb > -58;
+  const neighborBaseline = Math.max(sub35Db, mid75Db);
+
+  // A genuine AC ground-loop hum is a prominent sinusoidal line tone:
+  // - Sits at an audible level (> -68 dBFS)
+  // - Is at least +5.5 dB above neighboring sub frequencies (35Hz/75Hz), OR
+  // - Accompanied by its 2nd harmonic (120Hz for 60Hz, 100Hz for 50Hz)
+  const isSpike60 = hum60Db > -68 && (hum60Db > neighborBaseline + 5.5 || hum120Db > neighborBaseline + 4.0);
+  const isSpike50 = hum50Db > -68 && (hum50Db > neighborBaseline + 5.5 || hum100Db > neighborBaseline + 4.0);
+  const hasHumDetected = isSpike60 || isSpike50;
 
   // Overall track RMS to estimate SNR
   let sumSq = 0;
@@ -457,28 +583,50 @@ export function analyzeTapeNoise(audioBuffer: AudioBuffer): NoiseAnalysisTelemet
   const trackRmsDb = trackRms > 1e-6 ? 20 * Math.log10(trackRms) : -60;
   const estimatedSnrDb = Math.max(6, Math.round((trackRmsDb - hissNoiseFloorDb) * 10) / 10);
 
-  let recommendedReductionDb = 8.0;
+  let recommendedReductionDb = 8.5;
   let noiseTypeDetected = 'Hiss Suave de Estúdio 15 ips (Studer/Ampex)';
+  let recommendedNoiseProfileType: SpectralDenoiseSettings['noiseProfileType'] = 'auto_learned';
+  let recommendedHumNotch: SpectralDenoiseSettings['humNotchFilter'] = 'none';
 
-  if (hissNoiseFloorDb < -75) {
+  const hasNoiseDetected = hasHumDetected || hissNoiseFloorDb > -75.0;
+
+  if (hasHumDetected) {
+    if (hum60Db > hum50Db) {
+      recommendedNoiseProfileType = 'auto_learned';
+      recommendedHumNotch = '60hz_us_br';
+      recommendedReductionDb = Math.min(14.0, Math.max(9.0, (hum60Db + 70) * 0.25 + 8.5));
+      noiseTypeDetected = `Ronco AC 60 Hz (${hum60Db.toFixed(1)} dBFS) + Hiss de Fita (${hissNoiseFloorDb.toFixed(1)} dBFS)`;
+    } else {
+      recommendedNoiseProfileType = 'auto_learned';
+      recommendedHumNotch = '50hz_eu';
+      recommendedReductionDb = Math.min(14.0, Math.max(9.0, (hum50Db + 70) * 0.25 + 8.5));
+      noiseTypeDetected = `Ronco AC 50 Hz (${hum50Db.toFixed(1)} dBFS) + Hiss de Fita (${hissNoiseFloorDb.toFixed(1)} dBFS)`;
+    }
+  } else if (hissNoiseFloorDb < -75.0) {
     recommendedReductionDb = 0;
-    noiseTypeDetected = 'Áudio Digital Limpo / Sem Chiado de Fita (< -75 dBFS)';
+    recommendedNoiseProfileType = 'studio_master_15ips';
+    recommendedHumNotch = 'none';
+    noiseTypeDetected = `Áudio Digital Limpo / Sem Chiado de Fita (${hissNoiseFloorDb.toFixed(1)} dBFS)`;
   } else if (hissNoiseFloorDb > -48) {
-    recommendedReductionDb = 12.0;
-    noiseTypeDetected = 'Hiss Alto de Fita 1/4" Tipo I (Ferro/Oxide)';
+    recommendedReductionDb = 11.5;
+    recommendedNoiseProfileType = 'tape_hiss_type1';
+    recommendedHumNotch = 'none';
+    noiseTypeDetected = `Hiss Alto de Fita 1/4" Tipo I (${hissNoiseFloorDb.toFixed(1)} dBFS)`;
   } else if (hissNoiseFloorDb > -56) {
-    recommendedReductionDb = 9.0;
-    noiseTypeDetected = 'Hiss Médio de Fita Analógica (Tipo II / 7.5 ips)';
-  } else if (hissNoiseFloorDb > -65) {
-    recommendedReductionDb = 7.5;
-    noiseTypeDetected = 'Hiss Suave de Estúdio 15 ips (Studer/Ampex)';
+    recommendedReductionDb = 9.5;
+    recommendedNoiseProfileType = 'tape_hiss_type2';
+    recommendedHumNotch = 'none';
+    noiseTypeDetected = `Hiss Médio de Fita Analógica (${hissNoiseFloorDb.toFixed(1)} dBFS)`;
+  } else if (hissNoiseFloorDb > -66) {
+    recommendedReductionDb = 8.0;
+    recommendedNoiseProfileType = 'studio_master_15ips';
+    recommendedHumNotch = 'none';
+    noiseTypeDetected = `Hiss Suave de Estúdio 15 ips (${hissNoiseFloorDb.toFixed(1)} dBFS)`;
   } else {
-    recommendedReductionDb = 5.0;
-    noiseTypeDetected = 'Fita Master Audiófila Silenciosa (30 ips / Dolby SR)';
-  }
-
-  if (hasHumDetected && hissNoiseFloorDb >= -75) {
-    noiseTypeDetected += ` + Ronco AC (${hum60Db > hum50Db ? '60 Hz' : '50 Hz'})`;
+    recommendedReductionDb = 6.0;
+    recommendedNoiseProfileType = 'studio_master_15ips';
+    recommendedHumNotch = 'none';
+    noiseTypeDetected = `Fita Master Audiófila Silenciosa (${hissNoiseFloorDb.toFixed(1)} dBFS)`;
   }
 
   return {
@@ -488,9 +636,12 @@ export function analyzeTapeNoise(audioBuffer: AudioBuffer): NoiseAnalysisTelemet
     recommendedReductionDb,
     noiseTypeDetected,
     hasHumDetected,
+    hasNoiseDetected,
     quietestSegmentStartSec: learned.startSec,
     quietestSegmentDurationSec: learned.durationSec,
     noiseProfileBands,
+    recommendedNoiseProfileType,
+    recommendedHumNotch,
   };
 }
 
@@ -501,6 +652,18 @@ export function analyzeTapeNoise(audioBuffer: AudioBuffer): NoiseAnalysisTelemet
  * Overlap-Add with constant-overlap normalization.
  * Runs in ~40-80ms for an entire song.
  */
+function createAudioBufferSafe(numChannels: number, length: number, sampleRate: number): AudioBuffer {
+  if (typeof AudioBuffer !== 'undefined') {
+    try {
+      return new AudioBuffer({ numberOfChannels: numChannels, length, sampleRate });
+    } catch {
+      // fallback
+    }
+  }
+  const offline = new OfflineAudioContext(numChannels, 1, sampleRate);
+  return offline.createBuffer(numChannels, length, sampleRate);
+}
+
 export function processBufferWithSpectralDenoise(
   sourceBuffer: AudioBuffer,
   settings: SpectralDenoiseSettings
@@ -509,8 +672,7 @@ export function processBufferWithSpectralDenoise(
   const sampleRate = sourceBuffer.sampleRate;
   const totalLength = sourceBuffer.length;
 
-  const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-  const outputBuffer = audioCtx.createBuffer(numChannels, totalLength, sampleRate);
+  const outputBuffer = createAudioBufferSafe(numChannels, totalLength, sampleRate);
 
   if (!settings.enabled && !settings.listenNoiseDeltaOnly) {
     for (let c = 0; c < numChannels; c++) {
@@ -525,7 +687,7 @@ export function processBufferWithSpectralDenoise(
     noiseBands = getStandardTapeNoiseProfile(settings.noiseProfileType);
   }
 
-  const reductionLinear = Math.pow(10, -Math.abs(settings.reductionDb) / 20); // e.g. -8.5 dB = 0.375
+  const reductionLinear = Math.pow(10, -Math.abs(settings.reductionDb) / 20); // e.g. -9 dB = 0.3548
   const thresholdLinear = Math.pow(10, (settings.thresholdOffsetDb || 0) / 20);
 
   // Map 512 FFT frequency bins to critical Bark band noise amplitudes
@@ -534,9 +696,8 @@ export function processBufferWithSpectralDenoise(
   const numBands = CRITICAL_BAND_CENTERS_HZ.length;
   const binNoiseLinear = new Float32Array(halfFft + 1);
 
-  // MagFactor converts bin power in dBFS to expected FFT magnitude:
-  // Expected magnitude mag = sqrt(3 * N^2 / 16 * P_k) = sqrt(3) * N / 4 * sqrt(P_k)
-  const magFactor = (Math.sqrt(3) * FFT_SIZE) / 4;
+  // Normalization factor: maps noise profile in dBFS to expected FFT magnitude
+  const normFactor = Math.sqrt(0.375 * FFT_SIZE); // ~19.596
 
   for (let k = 0; k <= halfFft; k++) {
     const f = k * binHz;
@@ -550,14 +711,15 @@ export function processBufferWithSpectralDenoise(
         bestB = b;
       }
     }
-    const bandDb = noiseBands[bestB] ?? -72;
+    const bandDb = noiseBands[bestB] ?? -64;
     // Convert to linear FFT amplitude floor with threshold offset
-    binNoiseLinear[k] = Math.pow(10, bandDb / 20) * thresholdLinear * magFactor;
+    binNoiseLinear[k] = Math.pow(10, bandDb / 20) * normFactor * thresholdLinear;
   }
 
-  // Smoothing coefficient per hop (~35ms release)
+  // Smoothing coefficients per hop (~35ms release, ~8ms attack)
   const hopSec = HOP_SIZE / sampleRate;
-  const smoothCoeff = Math.exp(-hopSec / Math.max(0.005, settings.smoothingMs / 1000));
+  const releaseCoeff = Math.exp(-hopSec / Math.max(0.008, (settings.smoothingMs || 35) / 1000));
+  const attackCoeff = Math.exp(-hopSec / 0.008);
 
   // Hum notch frequencies
   const isHum60 = settings.humNotchFilter === '60hz_us_br';
@@ -575,7 +737,7 @@ export function processBufferWithSpectralDenoise(
     const src = sourceBuffer.getChannelData(c);
     const dst = outputBuffer.getChannelData(c);
 
-    prevGains.fill(1.0);
+    prevGains.fill(reductionLinear);
 
     const synthBuffer = new Float32Array(totalLength + FFT_SIZE);
     const normBuffer = new Float32Array(totalLength + FFT_SIZE);
@@ -592,26 +754,30 @@ export function processBufferWithSpectralDenoise(
       // Fast Radix-2 Forward FFT (in-place)
       fastFFT1024(frameReal, frameImag);
 
-      // Multi-band Spectral Subtraction in Frequency Domain
+      // Multi-band Spectral Subtraction in Frequency Domain (Sonic Solutions NoNoise & RX Style)
       for (let k = 0; k <= halfFft; k++) {
         const r = frameReal[k];
         const im = frameImag[k];
         const mag = Math.sqrt(r * r + im * im);
         const noiseFloor = binNoiseLinear[k];
 
-        // Wiener / Berouti spectral subtraction
-        let targetGain = 1.0;
-        if (mag < noiseFloor * 2.2) {
-          const snrLinear = mag / (noiseFloor + 1e-6);
-          const subFactor = Math.max(0, Math.min(1.0, (snrLinear - 0.4) / 1.5));
-          targetGain = reductionLinear + (1.0 - reductionLinear) * subFactor;
+        // Rayleigh noise peak margin (~1.55x average noise floor to prevent false flutter)
+        const noiseThresh = noiseFloor * 1.55;
+        let targetGain = reductionLinear;
+
+        if (mag > noiseThresh) {
+          // Wiener / Power Spectral Subtraction
+          const diff = (mag * mag) - (noiseThresh * noiseThresh);
+          const rawGain = Math.sqrt(diff / (mag * mag));
+          targetGain = Math.max(reductionLinear, Math.min(1.0, rawGain));
         }
 
-        // Fast attack / smooth release temporal smoothing envelope
-        if (targetGain >= prevGains[k]) {
-          prevGains[k] = targetGain; // Transients pass instantly
+        // Fast attack on musical transients (>0.65) / smooth decay for zero chirping/musical noise
+        if (targetGain > prevGains[k]) {
+          const coeff = targetGain > 0.65 ? attackCoeff : releaseCoeff;
+          prevGains[k] = targetGain + (prevGains[k] - targetGain) * coeff;
         } else {
-          prevGains[k] = targetGain + (prevGains[k] - targetGain) * smoothCoeff;
+          prevGains[k] = targetGain + (prevGains[k] - targetGain) * releaseCoeff;
         }
 
         const g = prevGains[k];
@@ -637,23 +803,27 @@ export function processBufferWithSpectralDenoise(
     }
 
     // Normalization and writing output
+    const tempCleaned = new Float32Array(totalLength);
     for (let i = 0; i < totalLength; i++) {
       const norm = normBuffer[i];
-      const cleaned = norm > 1e-4 ? synthBuffer[i] / norm : src[i];
+      tempCleaned[i] = norm > 1e-4 ? synthBuffer[i] / norm : src[i];
+    }
 
-      if (settings.listenNoiseDeltaOnly) {
-        // Solo subtracted hiss amplified 2.5x for auditory inspection
-        const delta = (src[i] - cleaned) * 2.5;
-        dst[i] = Math.max(-1.0, Math.min(1.0, delta));
-      } else {
-        dst[i] = Math.max(-1.0, Math.min(1.0, cleaned));
+    // Apply high-Q ground loop biquad notch filter to cleaned audio
+    if (humHarmonics.length > 0) {
+      for (const humFreq of humHarmonics) {
+        applyBiquadNotch(tempCleaned, humFreq, sampleRate, 30);
       }
     }
 
-    // Apply high-Q ground loop biquad notch filter
-    if (humHarmonics.length > 0 && !settings.listenNoiseDeltaOnly) {
-      for (const humFreq of humHarmonics) {
-        applyBiquadNotch(dst, humFreq, sampleRate, 30);
+    for (let i = 0; i < totalLength; i++) {
+      const cleaned = tempCleaned[i];
+      if (settings.listenNoiseDeltaOnly) {
+        // Solo subtracted hiss and hum amplified 2.0x for clear auditory inspection
+        const delta = (src[i] - cleaned) * 2.0;
+        dst[i] = Math.max(-1.0, Math.min(1.0, delta));
+      } else {
+        dst[i] = Math.max(-1.0, Math.min(1.0, cleaned));
       }
     }
   }

@@ -5,6 +5,7 @@ import {
   TapeDropoutEvent,
   reconstructTapeDropouts
 } from '../audio/tapeDropoutEngine';
+import { TapeAzimuthAnalysis } from '../audio/tapeAzimuthEngine';
 import {
   Disc,
   Sparkles,
@@ -21,11 +22,16 @@ import {
   Layers,
   HelpCircle,
   Download,
-  Info
+  Info,
+  GitFork,
+  Music,
+  Check,
+  Radio
 } from 'lucide-react';
 
 interface TapeDropoutConsoleProps {
   analysis: TapeDropoutAnalysis | null;
+  azimuthAnalysis?: TapeAzimuthAnalysis | null;
   settings: TapeDropoutSettings;
   onUpdateSettings: (newSettings: Partial<TapeDropoutSettings>) => void;
   onReconstruct: () => void;
@@ -41,10 +47,13 @@ interface TapeDropoutConsoleProps {
   currentTrackTitle: string;
   onExportRestoredWav?: () => void;
   isRestoring?: boolean;
+  isMonoPreview?: boolean;
+  onToggleMonoPreview?: () => void;
 }
 
 export function TapeDropoutConsole({
   analysis,
+  azimuthAnalysis,
   settings,
   onUpdateSettings,
   onReconstruct,
@@ -59,7 +68,9 @@ export function TapeDropoutConsole({
   hasAudioLoaded,
   currentTrackTitle,
   onExportRestoredWav,
-  isRestoring = false
+  isRestoring = false,
+  isMonoPreview = false,
+  onToggleMonoPreview,
 }: TapeDropoutConsoleProps) {
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [filterChannel, setFilterChannel] = useState<'all' | 'L' | 'R' | 'both'>('all');
@@ -240,6 +251,22 @@ export function TapeDropoutConsole({
             <Headphones className="w-3.5 h-3.5 text-purple-400" />
             <span>🎧 MÁSCARA DELTA (Solo Falha)</span>
           </button>
+
+          {onToggleMonoPreview && (
+            <button
+              type="button"
+              onClick={onToggleMonoPreview}
+              className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                isMonoPreview
+                  ? 'bg-amber-500/25 text-amber-300 border border-amber-500/70 ring-1 ring-amber-500/30'
+                  : 'bg-[#101524] text-slate-400 hover:text-slate-200 border border-slate-800'
+              }`}
+              title="Ouvir em Mono para verificar que a reconstrução Ampex Full-Track Cross é 100% livre de flanger"
+            >
+              <Radio className="w-3.5 h-3.5 text-amber-400" />
+              <span>{isMonoPreview ? '✓ MONO ATIVO (Anti-Flanger)' : 'OUVIR EM MONO'}</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -277,10 +304,30 @@ export function TapeDropoutConsole({
               <span className="text-[10px] font-mono text-slate-400 uppercase">
                 Saúde do Óxido
               </span>
-              <span className="text-2xl font-mono font-bold text-emerald-300 mt-0.5">
+              <span
+                className={`text-2xl font-mono font-bold mt-0.5 ${
+                  (analysis?.tapeHealthScore ?? 100) >= 90
+                    ? 'text-emerald-400'
+                    : (analysis?.tapeHealthScore ?? 100) >= 75
+                    ? 'text-cyan-400'
+                    : (analysis?.tapeHealthScore ?? 100) >= 50
+                    ? 'text-amber-400'
+                    : 'text-rose-400'
+                }`}
+              >
                 {analysis?.tapeHealthScore ?? 100}%
               </span>
-              <span className="text-[10px] text-slate-400 font-mono mt-0.5">
+              <span
+                className={`text-[10px] font-mono mt-0.5 ${
+                  (analysis?.tapeHealthScore ?? 100) >= 90
+                    ? 'text-emerald-300'
+                    : (analysis?.tapeHealthScore ?? 100) >= 75
+                    ? 'text-cyan-300'
+                    : (analysis?.tapeHealthScore ?? 100) >= 50
+                    ? 'text-amber-300'
+                    : 'text-rose-300'
+                }`}
+              >
                 {analysis?.estimatedOxideDegradation || 'Excelente'}
               </span>
             </div>
@@ -329,19 +376,53 @@ export function TapeDropoutConsole({
             </p>
           </div>
 
-          {/* Action Button: Auto-Reconstruct All Dropouts */}
-          <button
-            onClick={onReconstruct}
-            disabled={!hasAudioLoaded || isRestoring}
-            className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-slate-950 font-bold text-xs flex items-center justify-center gap-2 transition-all shadow-md shadow-emerald-500/20 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
-          >
-            <Sparkles className="w-4 h-4" />
-            <span>
-              {isRestoring
-                ? 'Reconstruindo Dropouts em Andamento...'
-                : '⚡ Reconstruir & Corrigir Todos os Dropouts da Fita'}
-            </span>
-          </button>
+          {/* Action Button: Auto-Reconstruct All Dropouts & Bypass */}
+          <div className="flex flex-col gap-2">
+            <button
+              onClick={
+                (analysis?.totalDropouts ?? 0) === 0
+                  ? () => onUpdateSettings({ sensitivity: settings.sensitivity === 'medium' ? 'high' : 'ultra', enabled: true })
+                  : onReconstruct
+              }
+              disabled={!hasAudioLoaded || isRestoring}
+              className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-slate-950 font-bold text-xs flex items-center justify-center gap-2 transition-all shadow-md shadow-emerald-500/20 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+            >
+              <Sparkles className="w-4 h-4" />
+              <span>
+                {isRestoring
+                  ? 'Reconstruindo Dropouts em Andamento...'
+                  : (analysis?.totalDropouts ?? 0) === 0
+                  ? '✓ Fita Íntegra (Clique para Re-analisar em Sensibilidade Alta)'
+                  : settings.enabled
+                  ? `✓ ${analysis?.totalDropouts} Dropouts Reconstruídos & Ativos (Re-aplicar)`
+                  : `⚡ Reconstruir & Corrigir ${analysis?.totalDropouts} Dropouts da Fita`}
+              </span>
+            </button>
+
+            {(analysis?.totalDropouts ?? 0) === 0 && hasAudioLoaded && settings.sensitivity !== 'ultra' && (
+              <button
+                type="button"
+                onClick={() => onUpdateSettings({ sensitivity: settings.sensitivity === 'medium' ? 'high' : 'ultra' })}
+                className="w-full py-2 px-3 rounded-lg bg-cyan-950/40 hover:bg-cyan-900/50 border border-cyan-700/50 text-cyan-300 font-mono text-[11px] font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                title="Aumenta a sensibilidade para detectar quedas e oscilações microscópicas de fita"
+              >
+                <Activity className="w-3.5 h-3.5 text-cyan-400" />
+                <span>Re-analisar com Sensibilidade {settings.sensitivity === 'medium' ? 'Alta (7.5 dB)' : 'Ultra (5.5 dB)'}</span>
+              </button>
+            )}
+
+            {settings.enabled && (
+              <button
+                type="button"
+                onClick={() => onUpdateSettings({ enabled: false })}
+                className="w-full py-2 px-3 rounded-lg bg-rose-950/40 hover:bg-rose-900/50 border border-rose-700/50 text-rose-300 font-mono text-[11px] font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                title="Desativa a reconstrução de dropouts e restaura o áudio original instantaneamente sem qualquer alteração"
+              >
+                <RotateCcw className="w-3.5 h-3.5 text-rose-400" />
+                <span>Desativar Dropout (Restaurar Áudio Puro / Bypass)</span>
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Right Column: Engine Parameters & Mode (7 cols) */}
@@ -364,11 +445,156 @@ export function TapeDropoutConsole({
           </div>
 
           {/* Mode Selector */}
-          <div className="space-y-2">
-            <label className="text-xs font-bold text-slate-200 block">
-              Modo de Operação de Fita
-            </label>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          <div className="space-y-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-1.5">
+              <label className="text-xs font-bold text-slate-200 block">
+                Modo de Operação de Fita
+              </label>
+              {analysis && (
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">
+                  Total de Falhas: <strong className="text-emerald-400">{analysis.totalDropouts}</strong>
+                </span>
+              )}
+            </div>
+
+            {/* Intelligent Audio Material Classification Card */}
+            {(() => {
+              const sideToMidDb = azimuthAnalysis?.sideToMidDb ?? 0;
+              const hasDropouts = (analysis?.totalDropouts ?? 0) > 0;
+              const isCleanModern =
+                !hasDropouts &&
+                (analysis?.tapeHealthScore ?? 100) === 100 &&
+                Math.abs(azimuthAnalysis?.azimuthOffsetSamples ?? 0) < 0.1;
+
+              const isAcousticDualMono =
+                azimuthAnalysis?.channelConfiguration === 'dual_mono' ||
+                ((analysis?.isAmpexFullTrackCandidate ?? false) && sideToMidDb <= -26.0) ||
+                sideToMidDb <= -32.0;
+
+              const isTapeDualMono = isAcousticDualMono && !isCleanModern;
+
+              if (isCleanModern) {
+                return (
+                  <div className="p-3 rounded-lg bg-gradient-to-r from-emerald-950/60 to-[#0e172a] border border-emerald-700/60 flex flex-col gap-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-bold text-emerald-200 flex items-center gap-1.5">
+                        <Disc className="w-3.5 h-3.5 text-emerald-400" />
+                        Gravação Atual Identificada (0 Dropouts de Fita)
+                      </span>
+                      <span className="text-[10px] font-mono text-emerald-300 font-bold px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-800">
+                        {isAcousticDualMono ? 'Dual-Mono Digital' : 'Estéreo Contemporâneo'} (S/M: {sideToMidDb} dB)
+                      </span>
+                    </div>
+                    <p className="text-[10.5px] text-slate-300 leading-relaxed">
+                      ✓ Material contemporâneo sem danos de fita ou desprendimento de óxido. O módulo de dropouts opera em <strong className="text-emerald-300">Bypass Transparente</strong> para preservar 100% da imagem acústica e dinâmica da mixagem original.
+                    </p>
+                  </div>
+                );
+              }
+
+              if (isTapeDualMono) {
+                return (
+                  <div className="p-3 rounded-lg bg-gradient-to-r from-cyan-950/60 to-[#0e172a] border border-cyan-700/60 flex flex-col gap-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-bold text-cyan-200 flex items-center gap-1.5">
+                        <Disc className="w-3.5 h-3.5 text-cyan-400" />
+                        Identificação: Mono em 2 Canais (Fita 1/4" Ampex / Studer)
+                      </span>
+                      <span className="text-[10px] font-mono text-cyan-300 font-bold px-1.5 py-0.5 rounded bg-cyan-950/80 border border-cyan-800">
+                        S/M: {azimuthAnalysis?.sideToMidDb ?? -26} dB
+                      </span>
+                    </div>
+                    <p className="text-[10.5px] text-slate-300 leading-relaxed">
+                      ✓ Material mono detectado em dois canais analógicos. <strong className="text-cyan-200">Não defina Estéreo Independente</strong>: os modos <strong className="text-cyan-200">Ampex Full-Track Cross</strong> ou <strong className="text-purple-300">Estabilizador Mono</strong> reconstroem as falhas com o áudio original limpo do canal oposto, sem estalos e com alinhamento de azimute.
+                    </p>
+                    <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-cyan-800/40">
+                      <button
+                        type="button"
+                        onClick={() => onUpdateSettings({ mode: 'ampex_fulltrack_cross' })}
+                        className={`text-[10px] px-2.5 py-1 rounded font-mono font-bold transition-all cursor-pointer ${
+                          settings.mode === 'ampex_fulltrack_cross'
+                            ? 'bg-cyan-500 text-slate-950 shadow'
+                            : 'bg-cyan-950/80 border border-cyan-700/60 text-cyan-300 hover:bg-cyan-900/60'
+                        }`}
+                      >
+                        {settings.mode === 'ampex_fulltrack_cross' ? '✓ Ampex Cross Selecionado' : 'Selecionar Ampex Full-Track Cross'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onUpdateSettings({ mode: 'mono_wander_graft' })}
+                        className={`text-[10px] px-2.5 py-1 rounded font-mono font-bold transition-all cursor-pointer ${
+                          settings.mode === 'mono_wander_graft'
+                            ? 'bg-purple-500 text-slate-950 shadow'
+                            : 'bg-purple-950/60 border border-purple-700/60 text-purple-300 hover:bg-purple-900/60'
+                        }`}
+                      >
+                        {settings.mode === 'mono_wander_graft' ? '✓ Estabilizador Mono Selecionado' : 'Estabilizador Mono & Enxerto'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onUpdateSettings({ mode: 'stereo_independent' })}
+                        className={`text-[10px] px-2 py-0.5 rounded font-mono transition-all cursor-pointer ml-auto ${
+                          settings.mode === 'stereo_independent'
+                            ? 'bg-emerald-500 text-slate-950 font-bold'
+                            : 'text-slate-400 hover:text-slate-200 underline'
+                        }`}
+                      >
+                        Forçar Estéreo Real
+                      </button>
+                    </div>
+                  </div>
+                );
+              }
+
+              return (
+                <div className="p-2.5 rounded-lg bg-emerald-950/30 border border-emerald-800/50 flex flex-col gap-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold text-emerald-300 flex items-center gap-1.5">
+                      <Disc className="w-3.5 h-3.5 text-emerald-400" />
+                      Identificação: Estéreo Real (Mixagem L/R Autêntica)
+                    </span>
+                    <span className="text-[10px] font-mono text-emerald-400 font-semibold">
+                      Separação S/M: {azimuthAnalysis?.sideToMidDb ?? -12} dB
+                    </span>
+                  </div>
+                  <p className="text-[10.5px] text-slate-300 leading-tight">
+                    Mixagem estéreo autêntica com separação L/R. Modo Estéreo Independente ativo com ganho de envelope adaptativo sem cliques, preservando instrumentos e imagem espacial.
+                  </p>
+                  <div className="flex items-center gap-2 pt-1 border-t border-emerald-800/30">
+                    <button
+                      type="button"
+                      onClick={() => onUpdateSettings({ mode: 'ampex_fulltrack_cross' })}
+                      className="text-[10px] px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-400 hover:text-cyan-300 hover:border-cyan-700 transition-all cursor-pointer font-mono"
+                      title="Se esta gravação for uma fita mono transferida em 2 canais, clique para ativar a restauração cruzada"
+                    >
+                      Alternar para Mono em 2 Canais (Ampex Cross)
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <button
+                onClick={() => onUpdateSettings({ mode: 'mono_wander_graft' })}
+                className={`p-3 rounded-lg border text-left flex flex-col gap-1 transition-all cursor-pointer ${
+                  settings.mode === 'mono_wander_graft'
+                    ? 'bg-purple-500/20 border-purple-500 text-purple-200 ring-1 ring-purple-500/40'
+                    : 'bg-[#101524] border-slate-800 text-slate-300 hover:border-slate-700'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+                    Estabilizador Mono & Enxerto
+                  </span>
+                  <span className="text-[9px] px-1.5 py-0.2 rounded bg-purple-900/60 text-purple-300 font-mono font-bold">Auto-Graft Fita</span>
+                </div>
+                <span className="text-[10px] text-slate-400 leading-tight">
+                  Cura a oscilação rápida L/R: elege o canal mais limpo, aproveita o oposto e enxerta trechos idênticos da música.
+                </span>
+              </button>
+
               <button
                 onClick={() => onUpdateSettings({ mode: 'ampex_fulltrack_cross' })}
                 className={`p-3 rounded-lg border text-left flex flex-col gap-1 transition-all cursor-pointer ${
@@ -377,23 +603,12 @@ export function TapeDropoutConsole({
                     : 'bg-[#101524] border-slate-800 text-slate-300 hover:border-slate-700'
                 }`}
               >
-                <span className="text-xs font-bold">Ampex Full-Track (Cruzado)</span>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold">Ampex Full-Track Cross</span>
+                  <span className="text-[9px] px-1.5 py-0.2 rounded bg-cyan-900/60 text-cyan-300 font-mono font-bold">Anti-Flanger Mono</span>
+                </div>
                 <span className="text-[10px] text-slate-400 leading-tight">
-                  Enxerta áudio 100% puro do canal oposto (Studer A80).
-                </span>
-              </button>
-
-              <button
-                onClick={() => onUpdateSettings({ mode: 'mono_optimized_sum' })}
-                className={`p-3 rounded-lg border text-left flex flex-col gap-1 transition-all cursor-pointer ${
-                  settings.mode === 'mono_optimized_sum'
-                    ? 'bg-amber-500/20 border-amber-500 text-amber-200 ring-1 ring-amber-500/40'
-                    : 'bg-[#101524] border-slate-800 text-slate-300 hover:border-slate-700'
-                }`}
-              >
-                <span className="text-xs font-bold">Soma Mono Anti-Dropout</span>
-                <span className="text-[10px] text-slate-400 leading-tight">
-                  Evita o canal com falha e gera master mono limpo.
+                  Enxerta áudio puro do canal oposto com alinhamento de fase de alta precisão e retardo zero. 100% livre de flanger e cancelamento em mono.
                 </span>
               </button>
 
@@ -405,12 +620,126 @@ export function TapeDropoutConsole({
                     : 'bg-[#101524] border-slate-800 text-slate-300 hover:border-slate-700'
                 }`}
               >
-                <span className="text-xs font-bold">Estéreo Independente</span>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold">Estéreo Independente</span>
+                  <span className="text-[9px] px-1.5 py-0.2 rounded bg-emerald-900/60 text-emerald-300 font-mono font-bold">Livre de Estalos</span>
+                </div>
                 <span className="text-[10px] text-slate-400 leading-tight">
-                  Inpainting espectral para fitas estéreo nativas.
+                  Inpainting harmônico e ganho proporcional sem cliques para gravações estéreo nativas.
+                </span>
+              </button>
+
+              <button
+                onClick={() => onUpdateSettings({ mode: 'mono_optimized_sum' })}
+                className={`p-3 rounded-lg border text-left flex flex-col gap-1 transition-all cursor-pointer ${
+                  settings.mode === 'mono_optimized_sum'
+                    ? 'bg-amber-500/20 border-amber-500 text-amber-200 ring-1 ring-amber-500/40'
+                    : 'bg-[#101524] border-slate-800 text-slate-300 hover:border-slate-700'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold">Soma Mono Limpa</span>
+                  <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-900/60 text-amber-300 font-mono font-bold">Master Mono</span>
+                </div>
+                <span className="text-[10px] text-slate-400 leading-tight">
+                  Soma equilibrada com isolamento dinâmico de canal, evitando a falha.
                 </span>
               </button>
             </div>
+
+            {/* Dedicated Mono Stabilizer & Musical Grafting Control Panel */}
+            {(settings.mode === 'mono_wander_graft' || analysis?.channelComparison?.isSevereWanderDetected) && (
+              <div className="p-3.5 rounded-lg bg-gradient-to-r from-[#141226] via-[#10162a] to-[#141226] border border-purple-500/40 flex flex-col gap-3 shadow-md">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b border-purple-500/20">
+                  <div className="flex items-center gap-2">
+                    <GitFork className="w-4 h-4 text-purple-400" />
+                    <span className="text-xs font-bold text-white uppercase tracking-wider">
+                      Resolução de Oscilação Rápida L/R (Canal Mestre & Enxerto)
+                    </span>
+                  </div>
+                  <div className="flex flex-col items-end">
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-purple-950 text-purple-300 border border-purple-500/40 font-bold">
+                      {analysis?.channelComparison?.recommendedPrimary === 'L'
+                        ? '✓ Canal Esquerdo (Trk 1) Eleito'
+                        : '✓ Canal Direito (Trk 2) Eleito'} ({analysis?.channelComparison?.stabilityAdvantagePct ?? 80}% mais limpo e estável)
+                    </span>
+                    {(analysis?.channelComparison?.clicksCountL !== undefined || analysis?.channelComparison?.volumeInstabilityL !== undefined) && (
+                      <span className="text-[9px] font-mono text-purple-300/80 mt-0.5">
+                        Falhas/Estalos: E({analysis?.channelComparison?.dropoutsL ?? 0}+{analysis?.channelComparison?.clicksCountL ?? 0}) vs D({analysis?.channelComparison?.dropoutsR ?? 0}+{analysis?.channelComparison?.clicksCountR ?? 0})
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                  {/* Master Channel Selector */}
+                  <div className="space-y-1.5">
+                    <label className="text-[11px] font-mono text-slate-300 block font-semibold">
+                      Canal Mestre (Duplicado para L e R):
+                    </label>
+                    <div className="grid grid-cols-3 gap-1 text-[10px] font-mono">
+                      <button
+                        type="button"
+                        onClick={() => onUpdateSettings({ primaryChannel: 'auto' })}
+                        className={`py-1.5 px-1 rounded border text-center transition-all cursor-pointer ${
+                          !settings.primaryChannel || settings.primaryChannel === 'auto'
+                            ? 'bg-purple-500/25 border-purple-400 text-purple-200 font-bold'
+                            : 'bg-[#090d16] border-slate-800 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Auto ({analysis?.channelComparison?.recommendedPrimary || 'L'})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onUpdateSettings({ primaryChannel: 'L' })}
+                        className={`py-1.5 px-1 rounded border text-center transition-all cursor-pointer ${
+                          settings.primaryChannel === 'L'
+                            ? 'bg-purple-500/25 border-purple-400 text-purple-200 font-bold'
+                            : 'bg-[#090d16] border-slate-800 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Canal E (Trk 1)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onUpdateSettings({ primaryChannel: 'R' })}
+                        className={`py-1.5 px-1 rounded border text-center transition-all cursor-pointer ${
+                          settings.primaryChannel === 'R'
+                            ? 'bg-purple-500/25 border-purple-400 text-purple-200 font-bold'
+                            : 'bg-[#090d16] border-slate-800 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Canal D (Trk 2)
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Pattern Graft Threshold Slider */}
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <label className="text-[11px] font-mono text-slate-300 font-semibold">
+                        Limiar de Similaridade do Enxerto:
+                      </label>
+                      <span className="text-[11px] font-mono font-bold text-purple-300">
+                        {Math.round((settings.patternMatchThreshold ?? 0.78) * 100)}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.65"
+                      max="0.95"
+                      step="0.01"
+                      value={settings.patternMatchThreshold ?? 0.78}
+                      onChange={(e) => onUpdateSettings({ patternMatchThreshold: parseFloat(e.target.value) })}
+                      className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-purple-400"
+                    />
+                    <span className="text-[9px] text-slate-400 font-mono block leading-tight">
+                      Onde ambos os canais estiverem danificados, busca e enxerta trechos idênticos da música (ex: refrão/compasso).
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Sliders and Options */}
@@ -420,7 +749,13 @@ export function TapeDropoutConsole({
               <label className="text-xs font-bold text-slate-200 flex items-center justify-between">
                 <span>Sensibilidade de Detecção</span>
                 <span className="text-[10px] font-mono text-cyan-300 uppercase font-semibold">
-                  {settings.sensitivity}
+                  {settings.sensitivity === 'low'
+                    ? 'Baixa (14 dB)'
+                    : settings.sensitivity === 'medium'
+                    ? 'Média (10 dB)'
+                    : settings.sensitivity === 'high'
+                    ? 'Alta (7.5 dB)'
+                    : 'Ultra (5.5 dB)'}
                 </span>
               </label>
               <div className="grid grid-cols-4 gap-1 text-[10px] font-mono pt-1">
@@ -438,6 +773,12 @@ export function TapeDropoutConsole({
                   </button>
                 ))}
               </div>
+              <span className="text-[9px] text-slate-400 font-mono block pt-1 leading-tight">
+                {settings.sensitivity === 'medium' && 'Média (10 dB): Padrão ideal para fitas cassete e rolo. Detecta quedas audíveis e perda de agudos (Wallace).'}
+                {settings.sensitivity === 'high' && 'Alta (7.5 dB): Detecção refinada para fitas de estúdio e falhas sutis de contato da cabeça.'}
+                {settings.sensitivity === 'ultra' && 'Ultra (5.5 dB): Detecção cirúrgica de micro-flocos de óxido e dobras microscópicas.'}
+                {settings.sensitivity === 'low' && 'Baixa (14 dB): Apenas interrupções graves e falhas profundas de fita.'}
+              </span>
             </div>
 
             {/* Crossfade Window (ms) */}
@@ -481,10 +822,11 @@ export function TapeDropoutConsole({
               <button
                 onClick={onExportRestoredWav}
                 disabled={!hasAudioLoaded}
-                className="px-3 py-1.5 rounded-lg bg-[#141b2e] hover:bg-[#1a233b] border border-cyan-500/40 text-cyan-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-40"
+                title="Exportar Pré-Master WAV com Azimute e Dropouts corrigidos, 100% sem a masterização final (Preservação Arquivística Flat)"
+                className="px-3 py-1.5 rounded-lg bg-amber-950/40 hover:bg-amber-900/50 border border-amber-600/40 text-amber-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-40"
               >
-                <Download className="w-3.5 h-3.5 text-cyan-400" />
-                <span>Exportar WAV Corrigido</span>
+                <Download className="w-3.5 h-3.5 text-amber-400" />
+                <span>Exportar Pré-Master Corrigido (Sem Master)</span>
               </button>
             )}
           </div>
@@ -623,13 +965,28 @@ export function TapeDropoutConsole({
                   </div>
 
                   <div className="flex items-center gap-3">
-                    <span className="text-[10px] font-mono text-emerald-400 flex items-center gap-1">
-                      <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                      {ev.channel === 'L'
-                        ? 'Copiado de Trk 2'
-                        : ev.channel === 'R'
-                        ? 'Copiado de Trk 1'
-                        : 'Inpainting Hermite'}
+                    <span className="text-[10px] font-mono flex items-center gap-1">
+                      {ev.recoverySource === 'musical_pattern_graft' ? (
+                        <span className="text-purple-300 font-bold flex items-center gap-1 bg-purple-950/70 px-2 py-0.5 rounded border border-purple-500/50">
+                          <Sparkles className="w-3 h-3 text-purple-400" />
+                          Enxerto Musical [{ev.graftSourceTimeFormatted || 'Repetição'}] ({ev.graftSimilarityPct || 85}%)
+                        </span>
+                      ) : ev.recoverySource === 'cross_channel_opposite' ? (
+                        <span className="text-emerald-300 font-bold flex items-center gap-1 bg-emerald-950/70 px-2 py-0.5 rounded border border-emerald-500/40">
+                          <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                          {ev.channel === 'L' ? 'Copiado de Trk 2' : 'Copiado de Trk 1'}
+                        </span>
+                      ) : settings.mode === 'ampex_fulltrack_cross' && analysis?.isAmpexFullTrackCandidate ? (
+                        <span className="text-cyan-300 font-bold flex items-center gap-1 bg-cyan-950/70 px-2 py-0.5 rounded border border-cyan-500/40">
+                          <CheckCircle2 className="w-3 h-3 text-cyan-400" />
+                          {ev.channel === 'L' ? 'Copiado de Trk 2' : ev.channel === 'R' ? 'Copiado de Trk 1' : 'Inpainting Harmônico'}
+                        </span>
+                      ) : (
+                        <span className="text-emerald-400 flex items-center gap-1">
+                          <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                          Ganho Proporcional (+{Math.min(16, Math.round(ev.depthDb * 0.85))} dB) + Wallace HF
+                        </span>
+                      )}
                     </span>
 
                     <button

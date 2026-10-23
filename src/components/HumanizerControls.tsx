@@ -1,5 +1,7 @@
 import { HumanizerSettings, LoudnessMetrics } from '../types/audio';
 import { Sparkles, Sliders, Waves, Wind, Volume2, RotateCcw, ShieldCheck, Flame, Disc, Radio, Mic, Zap, Gauge, ArrowRight, Bookmark } from 'lucide-react';
+import { OrbanTrebleConsole } from './OrbanTrebleConsole';
+import { OrbanTrebleTelemetry } from '../audio/orbanTrebleEngine';
 
 interface HumanizerControlsProps {
   settings: HumanizerSettings;
@@ -10,6 +12,10 @@ interface HumanizerControlsProps {
   onNavigateToAzimuth?: () => void;
   onOpenPresets?: () => void;
   trackLoudness?: LoudnessMetrics | null;
+  orbanTelemetry?: OrbanTrebleTelemetry | null;
+  onAutoCalibrateOrban?: () => void;
+  hasAudioLoaded?: boolean;
+  onSelectPresetName?: (presetName: string) => void;
 }
 
 export function HumanizerControls({
@@ -21,33 +27,47 @@ export function HumanizerControls({
   onNavigateToAzimuth,
   onOpenPresets,
   trackLoudness,
+  orbanTelemetry,
+  onAutoCalibrateOrban,
+  hasAudioLoaded = true,
+  onSelectPresetName,
 }: HumanizerControlsProps) {
 
   const applyPreset = (presetName: string) => {
     switch (presetName) {
       case 'mastering_cristalino':
+        onSelectPresetName?.('Mastering Cristalino');
         onUpdateSettings({
           enabled: true,
           deHarshIntensity: 55,
           notchFrequencyHz: 3400,
           notchBandwidthQ: 2.5,
-          tapeWarmth: 40,
-          tubeHarmonics: 35,
+          tapeWarmth: 35,
+          tubeHarmonics: 30,
           lowMidBody: 1.2,
           transientPunch: 60,
           attackDeSmear: 50,
-          timingJitterMs: 6,
-          flutterWowRate: 20,
-          airExciterGain: 65,
+          timingJitterMs: 0,
+          flutterWowRate: 0,
+          airExciterGain: 40,
           airCutoffHz: 14500,
           stereoCorrelationFix: 70,
           monoBassCutoffHz: 140,
           acousticRoomSpread: 45,
           outputGainDb: 0,
+          orbanHfEnabled: true,
+          orbanHfMode: 'broadcast_optimod',
+          orbanHfAmount: 50,
+          orbanHfAutoBrillianceDb: 0.0, // 0 dB Flat
+          orbanHfHighShelfGainDb: 0.0,
+          orbanHfThresholdDb: -6.0,
+          orbanHfCrossoverHz: 6000,
+          orbanHfSpeed: 'fast',
         });
         break;
 
       case 'punch_analog':
+        onSelectPresetName?.('Punch & Calor Analógico');
         onUpdateSettings({
           enabled: true,
           deHarshIntensity: 45,
@@ -60,16 +80,25 @@ export function HumanizerControls({
           attackDeSmear: 65,
           timingJitterMs: 12,
           flutterWowRate: 35,
-          airExciterGain: 55,
+          airExciterGain: 40,
           airCutoffHz: 15000,
           stereoCorrelationFix: 65,
           monoBassCutoffHz: 150,
           acousticRoomSpread: 40,
           outputGainDb: 0.5,
+          orbanHfEnabled: true,
+          orbanHfMode: 'smooth_silk',
+          orbanHfAmount: 55,
+          orbanHfAutoBrillianceDb: 0.0, // 0 dB Flat
+          orbanHfHighShelfGainDb: 0.0,
+          orbanHfThresholdDb: -6.5,
+          orbanHfCrossoverHz: 5500,
+          orbanHfSpeed: 'medium',
         });
         break;
 
       case 'club_bass':
+        onSelectPresetName?.('Clube & Bass Sub');
         onUpdateSettings({
           enabled: true,
           deHarshIntensity: 50,
@@ -82,16 +111,25 @@ export function HumanizerControls({
           attackDeSmear: 70,
           timingJitterMs: 8,
           flutterWowRate: 20,
-          airExciterGain: 75,
+          airExciterGain: 45,
           airCutoffHz: 15500,
           stereoCorrelationFix: 85,
           monoBassCutoffHz: 160,
           acousticRoomSpread: 50,
           outputGainDb: 0.5,
+          orbanHfEnabled: true,
+          orbanHfMode: 'modern_air',
+          orbanHfAmount: 45,
+          orbanHfAutoBrillianceDb: 0.5,
+          orbanHfHighShelfGainDb: 0.5,
+          orbanHfThresholdDb: -5.0,
+          orbanHfCrossoverHz: 6800,
+          orbanHfSpeed: 'medium',
         });
         break;
 
       case 'vocal_shine':
+        onSelectPresetName?.('Vocal Shine & Ar');
         onUpdateSettings({
           enabled: true,
           deHarshIntensity: 80,
@@ -104,16 +142,25 @@ export function HumanizerControls({
           attackDeSmear: 55,
           timingJitterMs: 8,
           flutterWowRate: 25,
-          airExciterGain: 80,
+          airExciterGain: 40,
           airCutoffHz: 14000,
           stereoCorrelationFix: 75,
           monoBassCutoffHz: 130,
           acousticRoomSpread: 55,
           outputGainDb: 0,
+          orbanHfEnabled: true,
+          orbanHfMode: 'smooth_silk',
+          orbanHfAmount: 65,
+          orbanHfAutoBrillianceDb: -1.0, // Atenua sibilância
+          orbanHfHighShelfGainDb: -1.0,
+          orbanHfThresholdDb: -7.0,
+          orbanHfCrossoverHz: 5800,
+          orbanHfSpeed: 'fast',
         });
         break;
 
       case 'vintage_tape':
+        onSelectPresetName?.('Vintage Tape 1/4"');
         onUpdateSettings({
           enabled: true,
           deHarshIntensity: 40,
@@ -126,16 +173,25 @@ export function HumanizerControls({
           attackDeSmear: 40,
           timingJitterMs: 18,
           flutterWowRate: 55,
-          airExciterGain: 40,
+          airExciterGain: 30,
           airCutoffHz: 14000,
           stereoCorrelationFix: 60,
           monoBassCutoffHz: 130,
           acousticRoomSpread: 35,
           outputGainDb: 0,
+          orbanHfEnabled: true,
+          orbanHfMode: 'tape_restore',
+          orbanHfAmount: 70,
+          orbanHfAutoBrillianceDb: 2.5, // Restauração suave para fita, sem estridência
+          orbanHfHighShelfGainDb: 2.5,
+          orbanHfThresholdDb: -4.5,
+          orbanHfCrossoverHz: 4800,
+          orbanHfSpeed: 'smooth',
         });
         break;
 
       case 'ai_rescue':
+        onSelectPresetName?.('Otimizador Anti-IA');
         onUpdateSettings({
           enabled: true,
           deHarshIntensity: 75,
@@ -148,16 +204,25 @@ export function HumanizerControls({
           attackDeSmear: 65,
           timingJitterMs: 10,
           flutterWowRate: 35,
-          airExciterGain: 70,
+          airExciterGain: 40,
           airCutoffHz: 15000,
           stereoCorrelationFix: 80,
           monoBassCutoffHz: 150,
           acousticRoomSpread: 50,
           outputGainDb: 0,
+          orbanHfEnabled: true,
+          orbanHfMode: 'smooth_silk',
+          orbanHfAmount: 60,
+          orbanHfAutoBrillianceDb: -0.5,
+          orbanHfHighShelfGainDb: -0.5,
+          orbanHfThresholdDb: -6.5,
+          orbanHfCrossoverHz: 5500,
+          orbanHfSpeed: 'fast',
         });
         break;
 
       case 'reset':
+        onSelectPresetName?.('Padrão Restaurado');
         onUpdateSettings({
           enabled: true,
           deHarshIntensity: 50,
@@ -170,12 +235,20 @@ export function HumanizerControls({
           attackDeSmear: 45,
           timingJitterMs: 6,
           flutterWowRate: 20,
-          airExciterGain: 50,
+          airExciterGain: 0,
           airCutoffHz: 15000,
           stereoCorrelationFix: 65,
           monoBassCutoffHz: 140,
           acousticRoomSpread: 40,
           outputGainDb: 0,
+          orbanHfEnabled: true,
+          orbanHfMode: 'smooth_silk',
+          orbanHfAmount: 50,
+          orbanHfAutoBrillianceDb: 0.0,
+          orbanHfHighShelfGainDb: 0.0,
+          orbanHfThresholdDb: -6.5,
+          orbanHfCrossoverHz: 5800,
+          orbanHfSpeed: 'fast',
         });
         break;
     }
@@ -762,6 +835,15 @@ export function HumanizerControls({
             />
           </div>
         </div>
+
+        {/* Processador Inteligente de Agudos Orban Optimod */}
+        <OrbanTrebleConsole
+          settings={settings}
+          onUpdateSettings={onUpdateSettings}
+          telemetry={orbanTelemetry}
+          onAutoCalibrate={onAutoCalibrateOrban}
+          hasAudioLoaded={hasAudioLoaded}
+        />
 
         {/* 7. Proteção de Masterização, Medição de LUFS & DMGAudio Limitless */}
         <div

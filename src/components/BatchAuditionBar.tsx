@@ -48,8 +48,27 @@ export function BatchAuditionBar({
           </div>
 
           <div className="flex items-center gap-2 min-w-0">
-            <span className="text-xs font-bold text-white truncate max-w-[200px] sm:max-w-xs md:max-w-sm" title={currentTrack.title}>
-              {currentTrack.title}
+            <span
+              className="text-xs font-bold text-white truncate max-w-[200px] sm:max-w-xs md:max-w-md"
+              title={
+                currentTrack.songTitle
+                  ? `#${currentTrack.trackNumber || String(currentIndex + 1).padStart(2, '0')} ${currentTrack.songTitle}${currentTrack.artist ? ` - ${currentTrack.artist}` : ''} (Arquivo: ${currentTrack.title})`
+                  : currentTrack.title
+              }
+            >
+              {currentTrack.songTitle ? (
+                <>
+                  <span className="text-amber-300 font-mono mr-1">
+                    #{currentTrack.trackNumber || String(currentIndex + 1).padStart(2, '0')}
+                  </span>
+                  <span>{currentTrack.songTitle}</span>
+                  {currentTrack.artist && (
+                    <span className="text-slate-400 font-normal"> - {currentTrack.artist}</span>
+                  )}
+                </>
+              ) : (
+                currentTrack.title
+              )}
             </span>
           </div>
 

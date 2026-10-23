@@ -368,7 +368,7 @@ export function AudioPlayerBar({
             disabled={isExporting || !hasAudioLoaded}
             title={
               hasAudioLoaded
-                ? `Exportar Master em ${outputSampleRate} Hz / ${outputBitDepth}-bit WAV (Mesma taxa e bits de entrada, sem conversão)`
+                ? `Exportar Master em ${outputSampleRate} Hz / ${outputBitDepth}-bit WAV + Preset de Recall (.aurapreset)`
                 : 'Carregue uma música para exportar o master'
             }
             className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-slate-950 bg-cyan-400 hover:bg-cyan-300 active:scale-98 rounded-lg shadow-sm transition-all disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap cursor-pointer"

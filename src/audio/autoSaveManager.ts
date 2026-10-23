@@ -1,4 +1,14 @@
 import JSZip from 'jszip';
+import { sanitizeFilenamePart, sanitizeSafeAsciiFilename, sanitizeFolderName } from './trackNamingHelper';
+
+export const SUBFOLDER_RECOVERED = '[Recuperados]';
+export const SUBFOLDER_MASTERED = '[-LUFS]';
+
+export interface SaveFileOptions {
+  subfolder?: string;
+  parentSubfolder?: string;
+  disableDownloadFallback?: boolean;
+}
 
 /**
  * Auto-Save & Output Directory Manager
@@ -91,6 +101,9 @@ async function getStoredHandle(key: string): Promise<FileSystemHandle | null> {
 export interface AutoSaveConfig {
   enabled: boolean;
   subfolderName: string;
+  separateSubfolders?: boolean;   // Automatically organize into [Recuperados] and [-LUFS]
+  subfolderRecovered?: string;    // Name of intermediate/restored files folder (default '[Recuperados]')
+  subfolderMastered?: string;     // Name of final mastered files folder (default '[-LUFS]')
   saveAzimuthCorrected: boolean; // Also save the clean azimuth-corrected archival copy
   saveFinalMaster: boolean;      // Save the final mastered file
   autoSaveOnBatchComplete: boolean;
@@ -109,11 +122,15 @@ export interface FolderCheckResult {
 
 export class AutoSaveManager {
   private baseDirHandle: FileSystemDirectoryHandle | null = null;
+  private storedBaseHandle: FileSystemDirectoryHandle | null = null;
   private subDirHandle: FileSystemDirectoryHandle | null = null;
   private baseDirName: string = '';
   private config: AutoSaveConfig = {
-    enabled: false,
+    enabled: true,
     subfolderName: 'Tapes_Processados_AuraTune',
+    separateSubfolders: true,
+    subfolderRecovered: SUBFOLDER_RECOVERED,
+    subfolderMastered: SUBFOLDER_MASTERED,
     saveAzimuthCorrected: true,
     saveFinalMaster: true,
     autoSaveOnBatchComplete: true,
@@ -169,10 +186,108 @@ export class AutoSaveManager {
     return this.baseDirHandle !== null && this.subDirHandle !== null;
   }
 
+  public hasStoredDirectory(): boolean {
+    return this.storedBaseHandle !== null || !!this.baseDirName;
+  }
+
   /**
-   * Checks whether the target subfolder already exists inside the user's selected base directory
-   * and counts any pre-existing files to warn the user before overwriting.
+   * Attempts to restore directory handle from IndexedDB
    */
+  public async tryRestoreDirectory(): Promise<boolean> {
+    try {
+      const handle = (await getStoredHandle('output_dir')) as FileSystemDirectoryHandle | null;
+      if (handle) {
+        this.storedBaseHandle = handle;
+        if (!this.baseDirName) {
+          this.baseDirName = handle.name;
+        }
+        const perm = handle.queryPermission ? await handle.queryPermission({ mode: 'readwrite' }) : 'prompt';
+        if (perm === 'granted') {
+          this.baseDirHandle = handle;
+          this.baseDirName = handle.name;
+          this.subDirHandle = await handle.getDirectoryHandle(this.config.subfolderName, {
+            create: true,
+          });
+          this.config.enabled = true;
+          return true;
+        }
+      }
+    } catch (err) {
+      console.warn('Erro ao restaurar diretório salvo:', err);
+    }
+    return false;
+  }
+
+  /**
+   * Prompts user gesture to reconnect permissions to the previously selected directory
+   */
+  public async reconnectStoredDirectory(): Promise<{ success: boolean; dirName: string; error?: string }> {
+    try {
+      const handle =
+        this.storedBaseHandle || ((await getStoredHandle('output_dir')) as FileSystemDirectoryHandle | null);
+      if (!handle) {
+        return { success: false, dirName: '', error: 'Nenhuma pasta salva anteriormente no histórico.' };
+      }
+      this.storedBaseHandle = handle;
+      const perm = handle.requestPermission ? await handle.requestPermission({ mode: 'readwrite' }) : 'granted';
+      if (perm === 'granted') {
+        this.baseDirHandle = handle;
+        this.baseDirName = handle.name;
+        this.subDirHandle = await handle.getDirectoryHandle(this.config.subfolderName, { create: true });
+        this.config.enabled = true;
+        try {
+          localStorage.setItem('auratune_last_dir_name', handle.name);
+          await storeHandle('output_dir', handle);
+        } catch {
+          // safe ignore
+        }
+        return { success: true, dirName: handle.name };
+      }
+      return { success: false, dirName: handle.name, error: 'Permissão de gravação na pasta não foi concedida.' };
+    } catch (err: unknown) {
+      return {
+        success: false,
+        dirName: '',
+        error: err instanceof Error ? err.message : 'Erro ao reconectar pasta.',
+      };
+    }
+  }
+
+  /**
+   * Ensures active permission on directory handle before writing
+   */
+  public async ensureDirectoryAccess(): Promise<boolean> {
+    if (this.baseDirHandle && this.subDirHandle) {
+      return true;
+    }
+    const handle =
+      this.storedBaseHandle || ((await getStoredHandle('output_dir')) as FileSystemDirectoryHandle | null);
+    if (handle) {
+      this.storedBaseHandle = handle;
+      try {
+        const query = handle.queryPermission ? await handle.queryPermission({ mode: 'readwrite' }) : 'prompt';
+        if (query === 'granted') {
+          this.baseDirHandle = handle;
+          this.baseDirName = handle.name;
+          this.subDirHandle = await handle.getDirectoryHandle(this.config.subfolderName, { create: true });
+          this.config.enabled = true;
+          return true;
+        }
+        // In user gesture context: request permission
+        const perm = handle.requestPermission ? await handle.requestPermission({ mode: 'readwrite' }) : 'prompt';
+        if (perm === 'granted') {
+          this.baseDirHandle = handle;
+          this.baseDirName = handle.name;
+          this.subDirHandle = await handle.getDirectoryHandle(this.config.subfolderName, { create: true });
+          this.config.enabled = true;
+          return true;
+        }
+      } catch {
+        // safe fallback
+      }
+    }
+    return false;
+  }
   public async checkSubfolderConflict(customSubfolder?: string): Promise<FolderCheckResult> {
     const targetSub = customSubfolder || this.config.subfolderName;
     if (!this.baseDirHandle) {
@@ -262,29 +377,6 @@ export class AutoSaveManager {
     return { finalSubfolderName: baseSub, renameSuffix: '' };
   }
 
-  /**
-   * Attempts to restore directory handle from IndexedDB
-   */
-  public async tryRestoreDirectory(): Promise<boolean> {
-    try {
-      const handle = (await getStoredHandle('output_dir')) as FileSystemDirectoryHandle | null;
-      if (handle) {
-        const perm = handle.queryPermission ? await handle.queryPermission({ mode: 'readwrite' }) : 'prompt';
-        if (perm === 'granted') {
-          this.baseDirHandle = handle;
-          this.baseDirName = handle.name;
-          this.subDirHandle = await handle.getDirectoryHandle(this.config.subfolderName, {
-            create: true,
-          });
-          this.config.enabled = true;
-          return true;
-        }
-      }
-    } catch (err) {
-      console.warn('Erro ao restaurar diretório salvo:', err);
-    }
-    return false;
-  }
 
   /**
    * Prompts user to pick the directory (e.g. folder containing the 1/4" tape digitizations)
@@ -362,23 +454,38 @@ export class AutoSaveManager {
   }
 
   /**
-   * Bundles an array of files into a clean ZIP archive with the designated subfolder structure
+   * Bundles an array of files into a clean ZIP archive with the designated subfolder structure.
+   * Supports automatic nested subfolders like [Recuperados] and [-LUFS].
+   * Uses 100% pure ASCII filenames, DOS attributes and platform for seamless Windows XP / FAT32 / modern OS support.
    */
   public async createZipPackage(
-    files: Array<{ filename: string; blob: Blob }>,
+    files: Array<{ filename: string; blob: Blob; subfolder?: string }>,
     customSubfolder?: string
   ): Promise<Blob> {
     const zip = new JSZip();
-    const folderName = customSubfolder || this.config.subfolderName;
-    const folder = zip.folder(folderName) || zip;
+    const rawFolder = customSubfolder !== undefined ? customSubfolder : this.config.subfolderName;
+    const cleanFolderName = rawFolder ? sanitizeFolderName(rawFolder) : '';
+    const rootFolder = cleanFolderName ? (zip.folder(cleanFolderName) || zip) : zip;
 
     for (const file of files) {
-      folder.file(file.filename, file.blob);
+      const cleanFilename = sanitizeSafeAsciiFilename(file.filename);
+      let targetFolder = rootFolder;
+      if (file.subfolder) {
+        const cleanSub = sanitizeFolderName(file.subfolder);
+        if (cleanSub) {
+          targetFolder = rootFolder.folder(cleanSub) || rootFolder;
+        }
+      }
+      targetFolder.file(cleanFilename, file.blob, {
+        date: new Date(),
+        dosPermissions: 0x20, // Standard DOS archive attribute (normal file, readable/writable on Windows XP)
+      });
     }
 
     return await zip.generateAsync({
       type: 'blob',
       compression: 'STORE', // Fast, zero loss, perfect for studio-grade audio
+      platform: 'DOS', // Explicit DOS platform so Windows XP sets DOS file attributes without corrupting
     });
   }
 
@@ -386,14 +493,16 @@ export class AutoSaveManager {
    * Helper to trigger a standard browser download
    */
   public triggerBrowserDownload(blob: Blob, filename: string): void {
+    const cleanFilename = sanitizeSafeAsciiFilename(filename);
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = filename;
+    a.download = cleanFilename;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    // Keep blob URL active for 2 minutes to prevent incomplete downloads on large audio files
+    setTimeout(() => URL.revokeObjectURL(url), 120000);
   }
 
   /**
@@ -404,17 +513,22 @@ export class AutoSaveManager {
     zipBlob: Blob,
     suggestedFilename: string
   ): Promise<{ savedToDiskDirectly: boolean; targetPath: string; error?: string }> {
+    const safeZipName = sanitizeSafeAsciiFilename(suggestedFilename);
+
+    // 0. Ensure directory access is active if a folder was previously chosen
+    await this.ensureDirectoryAccess();
+
     // 1. If base directory handle is connected, save directly into the chosen folder on disk!
-    if (this.baseDirHandle) {
+    if (this.baseDirHandle && this.config.enabled) {
       try {
-        const fileHandle = await this.baseDirHandle.getFileHandle(suggestedFilename, { create: true });
+        const fileHandle = await this.baseDirHandle.getFileHandle(safeZipName, { create: true });
         const writable = await fileHandle.createWritable();
         await writable.write(zipBlob);
         await writable.close();
 
         return {
           savedToDiskDirectly: true,
-          targetPath: `${this.baseDirName}/${suggestedFilename}`,
+          targetPath: `${this.baseDirName}/${safeZipName}`,
         };
       } catch (err) {
         console.warn('Erro ao gravar ZIP na pasta vinculada:', err);
@@ -426,7 +540,7 @@ export class AutoSaveManager {
     if (typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function' && !isInsideIframe()) {
       try {
         const fileHandle = await window.showSaveFilePicker({
-          suggestedName: suggestedFilename,
+          suggestedName: safeZipName,
           types: [
             {
               description: 'Arquivo ZIP com subpasta criada',
@@ -454,11 +568,11 @@ export class AutoSaveManager {
     }
 
     // 3. Fallback: Browser download trigger
-    this.triggerBrowserDownload(zipBlob, suggestedFilename);
+    this.triggerBrowserDownload(zipBlob, safeZipName);
 
     return {
       savedToDiskDirectly: false,
-      targetPath: `Downloads/${suggestedFilename}`,
+      targetPath: `Downloads/${safeZipName}`,
     };
   }
 
@@ -466,39 +580,77 @@ export class AutoSaveManager {
    * Automatically saves a processed WAV blob into the designated subfolder,
    * or prompts the user to choose the folder via showSaveFilePicker, or falls back to download.
    */
+  /**
+   * Automatically saves a processed WAV blob into the designated subfolder (and optional nested subfolders like [Recuperados] and [-LUFS]),
+   * or prompts the user to choose the folder via showSaveFilePicker, or falls back to download.
+   */
   public async saveProcessedFile(
     blob: Blob,
-    suggestedFilename: string
-  ): Promise<{ savedToDiskDirectly: boolean; targetPath: string }> {
-    // 1. If Directory Handle is active, write straight to the subfolder on disk!
-    if (this.subDirHandle && this.config.enabled) {
+    suggestedFilename: string,
+    options?: SaveFileOptions
+  ): Promise<{ savedToDiskDirectly: boolean; targetPath: string; error?: string }> {
+    const safeFilename = sanitizeSafeAsciiFilename(suggestedFilename);
+
+    // 0. Ensure directory access is active if a folder was previously selected
+    await this.ensureDirectoryAccess();
+
+    // 1. If Directory Handle is active, write straight to the designated folder / subfolders on disk!
+    if (this.baseDirHandle && this.config.enabled) {
       try {
-        // Ensure subfolder handle is fresh if subfolder name changed
-        if (this.baseDirHandle) {
-          this.subDirHandle = await this.baseDirHandle.getDirectoryHandle(this.config.subfolderName, {
+        const parentSub = options?.parentSubfolder !== undefined ? options.parentSubfolder : this.config.subfolderName;
+        const cleanParent = parentSub ? sanitizeFolderName(parentSub) : '';
+
+        let targetDirHandle: FileSystemDirectoryHandle = this.baseDirHandle;
+        const pathSegments: string[] = [];
+
+        // Navigate or create parent session folder (e.g., Tapes_Processados_AuraTune)
+        if (cleanParent) {
+          targetDirHandle = await targetDirHandle.getDirectoryHandle(cleanParent, {
             create: true,
           });
+          pathSegments.push(cleanParent);
         }
 
-        const fileHandle = await this.subDirHandle.getFileHandle(suggestedFilename, { create: true });
+        // Navigate or create target category subfolder (e.g., [Recuperados] or [-LUFS])
+        if (options?.subfolder) {
+          const cleanSub = sanitizeFolderName(options.subfolder);
+          if (cleanSub) {
+            targetDirHandle = await targetDirHandle.getDirectoryHandle(cleanSub, {
+              create: true,
+            });
+            pathSegments.push(cleanSub);
+          }
+        }
+
+        const fileHandle = await targetDirHandle.getFileHandle(safeFilename, { create: true });
         const writable = await fileHandle.createWritable();
         await writable.write(blob);
         await writable.close();
 
+        const displaySub = pathSegments.length > 0 ? `${pathSegments.join('/')}/` : '';
         return {
           savedToDiskDirectly: true,
-          targetPath: `${this.baseDirName}/${this.config.subfolderName}/${suggestedFilename}`,
+          targetPath: `${this.baseDirName}/${displaySub}${safeFilename}`,
         };
       } catch (err) {
         console.warn('Erro ao salvar direto no FileSystem, tentando save file picker:', err);
       }
     }
 
+    // If download fallback is disabled (e.g., during batch processing to avoid dumping 30 files into Downloads), abort early
+    if (options?.disableDownloadFallback) {
+      return {
+        savedToDiskDirectly: false,
+        targetPath: '',
+        error: 'Gravacao direta no disco nao disponivel ou cancelada.',
+      };
+    }
+
     // 2. If no directory handle is active, open native OS "Salvar Como" dialog so user can choose the folder!
     if (typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function' && !isInsideIframe()) {
       try {
         const fileHandle = await window.showSaveFilePicker({
-          suggestedName: suggestedFilename,
+          suggestedName: safeFilename,
           types: [
             {
               description: 'Arquivo de Áudio WAV',
@@ -519,17 +671,19 @@ export class AutoSaveManager {
           return {
             savedToDiskDirectly: false,
             targetPath: '',
+            error: 'Salvamento cancelado.',
           };
         }
       }
     }
 
     // 3. Fallback: Browser download trigger
-    this.triggerBrowserDownload(blob, suggestedFilename);
+    this.triggerBrowserDownload(blob, safeFilename);
 
+    const prefix = options?.subfolder ? `${options.subfolder}/` : '';
     return {
       savedToDiskDirectly: false,
-      targetPath: `Downloads/${suggestedFilename}`,
+      targetPath: `Downloads/${prefix}${safeFilename}`,
     };
   }
 
@@ -539,10 +693,11 @@ export class AutoSaveManager {
    */
   public async saveTextFile(
     content: string,
-    suggestedFilename: string
+    suggestedFilename: string,
+    options?: SaveFileOptions
   ): Promise<{ savedToDiskDirectly: boolean; targetPath: string }> {
     const blob = new Blob([content], { type: 'application/json' });
-    return this.saveProcessedFile(blob, suggestedFilename);
+    return this.saveProcessedFile(blob, suggestedFilename, options);
   }
 }
 

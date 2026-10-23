@@ -399,60 +399,45 @@ export function applyLimitlessMultiStageMastering(
   const clipRatio = 0.88 + (1.0 - drive / 100) * 0.10; // 0.88 to 0.98 of ceiling
   const clipThreshold = ceilingLinear * clipRatio;
 
-  // Lookahead window: 2.5ms (e.g. 110 samples at 44.1k, 240 samples at 96k)
-  const lookaheadSamples = Math.max(16, Math.floor(sampleRate * 0.0025));
+  // Lookahead window: 3.0ms (e.g. 132 samples at 44.1k, 288 samples at 96k)
+  const lookaheadSamples = Math.max(16, Math.floor(sampleRate * 0.003));
 
   // Process a buffer with a specific linear gain and transparent lookahead limiter
   function processPass(inBuf: AudioBuffer, gain: number): AudioBuffer {
-    const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-    const outBuf = audioCtx.createBuffer(numChannels, length, sampleRate);
-
-    // 1. Apply Gain + Smooth C2 Polynomial Soft-Knee Crest Shaver
-    const gained = new Array<Float32Array>(numChannels);
-    for (let c = 0; c < numChannels; c++) {
-      const src = inBuf.getChannelData(c);
-      const dst = new Float32Array(length);
-      for (let i = 0; i < length; i++) {
-        let val = src[i] * gain;
-        const absVal = Math.abs(val);
-
-        if (absVal > clipThreshold) {
-          const sign = val < 0 ? -1 : 1;
-          const excess = absVal - clipThreshold;
-          const range = ceilingLinear - clipThreshold;
-          if (range > 1e-5) {
-            // Smooth algebraic polynomial with zero derivative discontinuity
-            const x = excess / range;
-            const soft = range * (x / (1 + x * 0.75));
-            val = sign * Math.min(ceilingLinear, clipThreshold + soft);
-          } else {
-            val = sign * Math.min(ceilingLinear, absVal);
-          }
-        }
-
-        dst[i] = val;
+    let outBuf: AudioBuffer;
+    if (typeof AudioBuffer !== 'undefined') {
+      try {
+        outBuf = new AudioBuffer({ numberOfChannels: numChannels, length, sampleRate });
+      } catch {
+        const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+        outBuf = audioCtx.createBuffer(numChannels, length, sampleRate);
+        try { audioCtx.close(); } catch { /* safe */ }
       }
-      gained[c] = dst;
+    } else {
+      const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+      outBuf = audioCtx.createBuffer(numChannels, length, sampleRate);
+      try { audioCtx.close(); } catch { /* safe */ }
     }
 
-    // 2. High-Precision Stereo-Linked Lookahead Peak Envelope Follower
+    // 1. High-Precision Stereo-Linked Lookahead Peak Envelope Follower
     // Pre-calculates peak demand over lookahead window so gain is ALREADY reduced when the peak arrives!
+    // This completely eliminates distortion on musical attacks: transient peaks remain smooth, pure and unclipped!
     const targetGainReduction = new Float32Array(length);
     for (let i = 0; i < length; i++) {
       targetGainReduction[i] = 1.0;
     }
 
-    // Measure instant peaks across all channels (stereo linking preserves phantom center and stereo image)
+    // Measure instant peaks across all channels on the gained linear audio
     for (let i = 0; i < length; i++) {
       let maxPeak = 0;
       for (let c = 0; c < numChannels; c++) {
-        const a = Math.abs(gained[c][i]);
+        const a = Math.abs(inBuf.getChannelData(c)[i] * gain);
         if (a > maxPeak) maxPeak = a;
       }
 
       if (maxPeak > ceilingLinear) {
         const requiredGain = ceilingLinear / maxPeak;
-        // Distribute gain reduction backwards across lookahead window with smooth cosine ramp
+        // Distribute gain reduction backwards across lookahead window with smooth raised-cosine (Hann) ramp
         const rampStart = Math.max(0, i - lookaheadSamples);
         const rampLen = i - rampStart;
         for (let j = 0; j <= rampLen; j++) {
@@ -467,15 +452,14 @@ export function applyLimitlessMultiStageMastering(
       }
     }
 
-    // 3. Smooth Exponential Release Envelope
-    // Release coefficient per sample
+    // 2. Smooth Program-Dependent Exponential Release Envelope
     const releaseCoeff = Math.exp(-1.0 / (releaseSec * sampleRate));
     let curGain = 1.0;
 
     for (let i = 0; i < length; i++) {
       const targetG = targetGainReduction[i];
       if (targetG < curGain) {
-        // Instantaneous attack (already lookahead-smoothed)
+        // Fast attack (already lookahead-smoothed with cosine S-curve)
         curGain = targetG;
       } else {
         // Musical exponential release
@@ -484,22 +468,20 @@ export function applyLimitlessMultiStageMastering(
       targetGainReduction[i] = curGain;
     }
 
-    // 4. Apply Lookahead Gain Reduction (delayed by lookaheadSamples to align with pre-ramped gain)
+    // 3. Apply Lookahead Gain Reduction (Clean, Linear & 100% Distortion-Free)
     for (let c = 0; c < numChannels; c++) {
-      const src = gained[c];
+      const src = inBuf.getChannelData(c);
       const dst = outBuf.getChannelData(c);
 
       for (let i = 0; i < length; i++) {
-        // Compensate for lookahead delay
-        const srcIdx = Math.min(length - 1, i);
-        const gr = targetGainReduction[srcIdx];
-        let finalSample = src[srcIdx] * gr;
+        const gr = targetGainReduction[i];
+        let sample = src[i] * gain * gr;
 
-        // Final safety guard: strictly guarantees ceiling without clipping (due to float precision)
-        if (finalSample > ceilingLinear) finalSample = ceilingLinear;
-        else if (finalSample < -ceilingLinear) finalSample = -ceilingLinear;
+        // Final safety guard: strictly guarantees ceiling without clipping
+        if (sample > ceilingLinear) sample = ceilingLinear;
+        else if (sample < -ceilingLinear) sample = -ceilingLinear;
 
-        dst[i] = finalSample;
+        dst[i] = sample;
       }
     }
 

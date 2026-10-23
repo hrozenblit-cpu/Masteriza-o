@@ -1,16 +1,27 @@
 import React, { useRef } from 'react';
-import { UploadCloud, Radio, Disc3, Layers, Info, Sparkles, CheckCircle2, Music2, Cpu, FolderDown, FileText, Tag, User } from 'lucide-react';
+import { UploadCloud, Radio, Disc3, Layers, Info, Sparkles, CheckCircle2, Music2, Cpu, FolderDown, FileText, Tag, User, GitFork, X } from 'lucide-react';
 import { AudioInputFormat } from '../audio/audioFormatDetector';
-import { buildMasterWavFilename } from '../audio/trackNamingHelper';
+import { buildMasterWavFilename, stripAudioFileExtension } from '../audio/trackNamingHelper';
+import { analyzeSplitStereoFilename, findSplitStereoPair } from '../audio/splitStereoManager';
+
+export interface PendingSplitMonoState {
+  file: File;
+  channel: 'L' | 'R';
+  baseName: string;
+  expectedPartnerFilename: string;
+}
 
 interface AudioUploaderProps {
   currentTrackTitle: string;
   isAnalyzing: boolean;
+  analysisStatus?: string | null;
   onFileUpload: (file: File) => void;
   onMultipleFilesUpload?: (files: FileList) => void;
+  onSplitStereoUpload?: (fileL: File, fileR: File) => void;
+  pendingSplitMono?: PendingSplitMonoState | null;
+  onDismissPendingSplitMono?: () => void;
+  onOpenSplitStereoModal?: () => void;
   onOpenBatch?: () => void;
-  isStemMode: boolean;
-  setIsStemMode: (stemMode: boolean) => void;
   audioFormat: AudioInputFormat | null;
   overallAiProbability?: number;
   detectedPlatformName?: string;
@@ -27,16 +38,19 @@ interface AudioUploaderProps {
 export function AudioUploader({
   currentTrackTitle,
   isAnalyzing,
+  analysisStatus,
   onFileUpload,
   onMultipleFilesUpload,
+  onSplitStereoUpload,
+  pendingSplitMono,
+  onDismissPendingSplitMono,
+  onOpenSplitStereoModal,
   onOpenBatch,
-  isStemMode,
-  setIsStemMode,
   audioFormat,
   overallAiProbability,
   detectedPlatformName,
   hasAudioLoaded,
-  trackNumber = '01',
+  trackNumber = '',
   onUpdateTrackNumber,
   songTitle = '',
   onUpdateSongTitle,
@@ -45,11 +59,13 @@ export function AudioUploader({
   targetLufs = -14,
 }: AudioUploaderProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const partnerFileInputRef = useRef<HTMLInputElement>(null);
+  const splitStereoInputRef = useRef<HTMLInputElement>(null);
   const [isDragOver, setIsDragOver] = React.useState(false);
 
   const previewMasterFilename = buildMasterWavFilename({
     trackNumber,
-    songTitle: songTitle || currentTrackTitle.replace(/\.[^/.]+$/, ''),
+    songTitle: songTitle || stripAudioFileExtension(currentTrackTitle),
     artist: artistName,
     sampleRate: audioFormat?.sampleRate || 44100,
     bitDepth: audioFormat?.bitDepth || 24,
@@ -70,19 +86,94 @@ export function AudioUploader({
     e.preventDefault();
     e.stopPropagation();
     setIsDragOver(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 1 && onMultipleFilesUpload) {
-      onMultipleFilesUpload(e.dataTransfer.files);
-    } else if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      onFileUpload(e.dataTransfer.files[0]);
+    if (!e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
+
+    // Check if 2 or more files contain a Pro Tools .L and .R pair
+    if (e.dataTransfer.files.length >= 2) {
+      const pair = findSplitStereoPair(e.dataTransfer.files);
+      if (pair && onSplitStereoUpload) {
+        onSplitStereoUpload(pair.fileL, pair.fileR);
+        return;
+      }
+      if (onMultipleFilesUpload) {
+        onMultipleFilesUpload(e.dataTransfer.files);
+        return;
+      }
     }
+
+    const singleFile = e.dataTransfer.files[0];
+    if (pendingSplitMono && onSplitStereoUpload) {
+      const info = analyzeSplitStereoFilename(singleFile.name);
+      if (info.isSplit && info.channel && info.channel !== pendingSplitMono.channel) {
+        const fileL = pendingSplitMono.channel === 'L' ? pendingSplitMono.file : singleFile;
+        const fileR = pendingSplitMono.channel === 'R' ? pendingSplitMono.file : singleFile;
+        onSplitStereoUpload(fileL, fileR);
+        return;
+      }
+    }
+
+    onFileUpload(singleFile);
   };
 
   const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files.length > 1 && onMultipleFilesUpload) {
-      onMultipleFilesUpload(e.target.files);
-    } else if (e.target.files && e.target.files[0]) {
+    if (!e.target.files || e.target.files.length === 0) return;
+
+    if (e.target.files.length >= 2) {
+      const pair = findSplitStereoPair(e.target.files);
+      if (pair && onSplitStereoUpload) {
+        onSplitStereoUpload(pair.fileL, pair.fileR);
+        return;
+      }
+      if (onMultipleFilesUpload) {
+        onMultipleFilesUpload(e.target.files);
+        return;
+      }
+    }
+
+    const singleFile = e.target.files[0];
+    if (pendingSplitMono && onSplitStereoUpload) {
+      const info = analyzeSplitStereoFilename(singleFile.name);
+      if (info.isSplit && info.channel && info.channel !== pendingSplitMono.channel) {
+        const fileL = pendingSplitMono.channel === 'L' ? pendingSplitMono.file : singleFile;
+        const fileR = pendingSplitMono.channel === 'R' ? pendingSplitMono.file : singleFile;
+        onSplitStereoUpload(fileL, fileR);
+        return;
+      }
+    }
+
+    onFileUpload(singleFile);
+    // Reset file input value so re-uploading or switching files always triggers onChange
+    e.target.value = '';
+  };
+
+  const handleSplitStereoInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files || e.target.files.length === 0) return;
+    if (e.target.files.length >= 2 && onSplitStereoUpload) {
+      const pair = findSplitStereoPair(e.target.files);
+      if (pair) {
+        onSplitStereoUpload(pair.fileL, pair.fileR);
+      } else {
+        const fileA = e.target.files[0];
+        const fileB = e.target.files[1];
+        const infoA = analyzeSplitStereoFilename(fileA.name);
+        const fileL = infoA.channel === 'R' ? fileB : fileA;
+        const fileR = infoA.channel === 'R' ? fileA : fileB;
+        onSplitStereoUpload(fileL, fileR);
+      }
+    } else if (e.target.files.length === 1) {
       onFileUpload(e.target.files[0]);
     }
+    // reset input
+    e.target.value = '';
+  };
+
+  const handlePartnerFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files || !e.target.files[0] || !pendingSplitMono || !onSplitStereoUpload) return;
+    const companionFile = e.target.files[0];
+    const fileL = pendingSplitMono.channel === 'L' ? pendingSplitMono.file : companionFile;
+    const fileR = pendingSplitMono.channel === 'R' ? pendingSplitMono.file : companionFile;
+    onSplitStereoUpload(fileL, fileR);
+    e.target.value = '';
   };
 
   const formatFileSize = (bytes: number) => {
@@ -118,36 +209,9 @@ export function AudioUploader({
             )}
           </div>
         </div>
-
-        {/* Stem vs Master mode switch */}
-        <div className="flex items-center gap-1 bg-[#131a2c] p-1 rounded-lg border border-slate-700/60 self-start sm:self-auto">
-          <button
-            onClick={() => setIsStemMode(false)}
-            className={`flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-md transition-colors ${
-              !isStemMode
-                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 shadow-xs'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Disc3 className="w-3.5 h-3.5 text-cyan-400" />
-            Masterização Estéreo
-          </button>
-          <button
-            onClick={() => setIsStemMode(true)}
-            disabled={!hasAudioLoaded}
-            className={`flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-md transition-colors ${
-              isStemMode
-                ? 'bg-emerald-950/60 text-emerald-300 border border-emerald-500/30 shadow-xs'
-                : 'text-slate-400 hover:text-slate-200 disabled:opacity-40'
-            }`}
-          >
-            <Layers className="w-3.5 h-3.5 text-emerald-400" />
-            Mixer de Stems
-          </button>
-        </div>
       </div>
 
-      {/* Main Drag-and-Drop Area & Audio Specs */}
+      {/* Hidden file pickers */}
       <input
         ref={fileInputRef}
         type="file"
@@ -156,6 +220,79 @@ export function AudioUploader({
         onChange={handleFileInput}
         className="hidden"
       />
+      <input
+        ref={splitStereoInputRef}
+        type="file"
+        multiple
+        accept="audio/*,.wav,.wave,.aif,.aiff,.flac"
+        onChange={handleSplitStereoInput}
+        className="hidden"
+      />
+      <input
+        ref={partnerFileInputRef}
+        type="file"
+        accept="audio/*,.wav,.wave,.aif,.aiff,.flac"
+        onChange={handlePartnerFileInput}
+        className="hidden"
+      />
+
+      {/* Prominent Split-Mono Pro Tools Alert Banner */}
+      {pendingSplitMono && (
+        <div className="p-4 rounded-xl bg-gradient-to-r from-amber-950/80 via-[#1f1508] to-[#0e1424] border-2 border-amber-500/80 flex flex-col sm:flex-row items-center justify-between gap-4 shadow-xl">
+          <div className="flex items-start gap-3.5">
+            <div className="w-10 h-10 rounded-xl bg-amber-500/25 text-amber-300 border border-amber-500/50 flex items-center justify-center shrink-0 shadow-inner">
+              <GitFork className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded bg-amber-500/30 text-amber-300 border border-amber-500/60">
+                  PRO TOOLS DUAL MONO
+                </span>
+                <h4 className="text-sm font-bold text-white">
+                  Arquivo Split-Mono: Canal {pendingSplitMono.channel} ({pendingSplitMono.channel === 'L' ? 'Esquerdo' : 'Direito'})
+                </h4>
+              </div>
+              <p className="text-xs text-slate-300 mt-1 max-w-2xl leading-relaxed">
+                Você carregou <strong className="font-mono text-amber-300">{pendingSplitMono.file.name}</strong>, que contém apenas o canal {pendingSplitMono.channel === 'L' ? 'Esquerdo' : 'Direito'}. Para unir os 2 canais em um único áudio Estéreo real, carregue o canal oposto (<strong className="font-mono text-cyan-300">{pendingSplitMono.expectedPartnerFilename}</strong>):
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0 w-full sm:w-auto justify-end">
+            <button
+              type="button"
+              onClick={() => partnerFileInputRef.current?.click()}
+              className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold text-xs flex items-center gap-2 shadow-md shadow-cyan-500/20 cursor-pointer"
+            >
+              <UploadCloud className="w-4 h-4" />
+              <span>Carregar {pendingSplitMono.expectedPartnerFilename} & Unir</span>
+            </button>
+
+            {onOpenSplitStereoModal && (
+              <button
+                type="button"
+                onClick={onOpenSplitStereoModal}
+                className="px-3.5 py-2.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/50 text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-sm"
+                title="Abrir gerenciador visual de canais L e R para conferir ou inverter"
+              >
+                <GitFork className="w-3.5 h-3.5" />
+                <span>Gerenciador L/R</span>
+              </button>
+            )}
+
+            {onDismissPendingSplitMono && (
+              <button
+                type="button"
+                onClick={onDismissPendingSplitMono}
+                className="p-2 rounded-xl text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors cursor-pointer"
+                title="Fechar e manter apenas este canal mono"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {!hasAudioLoaded ? (
         // State 1: Clean, spacious dropzone when no audio is loaded
@@ -175,7 +312,14 @@ export function AudioUploader({
           </div>
 
           <h3 className="text-base font-bold text-white tracking-wide">
-            {isAnalyzing ? 'Carregando e Analisando Áudio/Vídeo...' : 'Arraste sua Música, Fita ou Vídeo MP4 aqui para Masterizar'}
+            {isAnalyzing ? (
+              <span className="flex items-center justify-center gap-2 text-cyan-300">
+                <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-ping inline-block" />
+                {analysisStatus || 'Carregando e Analisando Áudio/Vídeo...'}
+              </span>
+            ) : (
+              'Arraste sua Música, Fita ou Vídeo MP4 aqui para Masterizar'
+            )}
           </h3>
 
           <p className="text-xs text-slate-400 mt-1.5 max-w-xl leading-relaxed">
@@ -189,6 +333,23 @@ export function AudioUploader({
               className="px-4 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs tracking-tight transition-all shadow-md shadow-cyan-500/20"
             >
               Selecionar Arquivo (Áudio ou Vídeo MP4)
+            </button>
+
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (onOpenSplitStereoModal) {
+                  onOpenSplitStereoModal();
+                } else {
+                  splitStereoInputRef.current?.click();
+                }
+              }}
+              className="px-4 py-2 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 font-bold text-xs tracking-tight transition-all flex items-center gap-1.5 shadow-sm cursor-pointer"
+              title="Selecione os dois arquivos .L e .R do Pro Tools para uni-los em um estéreo de 2 canais"
+            >
+              <GitFork className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Unir Split Pro Tools (.L e .R)</span>
             </button>
 
             {onOpenBatch && (
@@ -258,12 +419,35 @@ export function AudioUploader({
                 </div>
               </div>
 
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                className="text-xs font-semibold text-cyan-400 hover:text-cyan-300 px-2.5 py-1.5 rounded-lg bg-cyan-950/40 hover:bg-cyan-950/70 border border-cyan-800/50 transition-colors shrink-0"
-              >
-                Trocar Música
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (onOpenSplitStereoModal) {
+                      onOpenSplitStereoModal();
+                    } else {
+                      splitStereoInputRef.current?.click();
+                    }
+                  }}
+                  className="text-xs font-semibold text-emerald-400 hover:text-emerald-300 px-2.5 py-1.5 rounded-lg bg-emerald-950/40 hover:bg-emerald-950/70 border border-emerald-800/50 transition-colors shrink-0 flex items-center gap-1.5 cursor-pointer"
+                  title="Unir dois canais mono (.L e .R) do Pro Tools em estéreo de 2 canais"
+                >
+                  <GitFork className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Unir Par Split .L/.R</span>
+                </button>
+
+                <button
+                  onClick={() => {
+                    if (fileInputRef.current) {
+                      fileInputRef.current.value = '';
+                    }
+                    fileInputRef.current?.click();
+                  }}
+                  className="text-xs font-semibold text-cyan-400 hover:text-cyan-300 px-2.5 py-1.5 rounded-lg bg-cyan-950/40 hover:bg-cyan-950/70 border border-cyan-800/50 transition-colors shrink-0 cursor-pointer"
+                >
+                  Trocar Música
+                </button>
+              </div>
             </div>
 
             {/* Input Specs Badges */}

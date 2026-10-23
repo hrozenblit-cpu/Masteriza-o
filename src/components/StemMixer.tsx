@@ -1,5 +1,5 @@
 import { AudioStem } from '../types/audio';
-import { Mic, Disc, Music, Guitar, Sparkles, Volume2, VolumeX, Eye } from 'lucide-react';
+import { Mic, Disc, Music, Guitar, Sparkles, Volume2, VolumeX, Eye, Play, Pause, SlidersHorizontal, CheckCircle2, RotateCcw } from 'lucide-react';
 
 interface StemMixerProps {
   stems: AudioStem[];
@@ -7,6 +7,10 @@ interface StemMixerProps {
   onSoloStem: (stemId: string) => void;
   onMuteStem: (stemId: string) => void;
   isPlaying: boolean;
+  onTogglePlay?: () => void;
+  isMasterTouchActive?: boolean;
+  onToggleMasterTouch?: () => void;
+  onResetUnity?: () => void;
 }
 
 export function StemMixer({
@@ -14,6 +18,11 @@ export function StemMixer({
   onUpdateStem,
   onSoloStem,
   onMuteStem,
+  isPlaying,
+  onTogglePlay,
+  isMasterTouchActive = true,
+  onToggleMasterTouch,
+  onResetUnity,
 }: StemMixerProps) {
   const getStemIcon = (type: AudioStem['type']) => {
     switch (type) {
@@ -36,18 +45,70 @@ export function StemMixer({
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
         <div>
           <h2 className="text-base font-bold tracking-tight text-white flex items-center gap-2">
-            <Mic className="w-4 h-4 text-emerald-400" />
-            Humanização Multitrack por Stems Individuais
+            <SlidersHorizontal className="w-4 h-4 text-emerald-400" />
+            Mixer Multitrack de Stems & Toque Master Analógico
           </h2>
           <p className="text-xs text-slate-400 mt-1">
-            Processe cada canal isoladamente para resolver problemas acústicos específicos (ressonância no vocal, ataque na bateria, fase no baixo).
+            Controle de volume, pan, solo e humanização por stems isolados (Vocais, Bateria, Baixo, Instrumentos e FX), somados diretamente ao Master Bus com calor e masterização analógica.
           </p>
         </div>
 
-        <div className="flex items-center gap-2 text-xs font-mono text-slate-400">
-          <span>{stems.length} Stems Ativos</span>
-          <span aria-hidden="true">·</span>
-          <span className="text-emerald-400">Processamento DSP Dedicado</span>
+        <div className="flex flex-wrap items-center gap-2">
+          {onResetUnity && (
+            <button
+              onClick={onResetUnity}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 hover:border-slate-700 transition-all"
+              title="Restaura os faders de stems para o equilíbrio padrão de soma unitária 0 dB"
+            >
+              <RotateCcw className="w-3.5 h-3.5 text-slate-400" />
+              <span>Resetar 0 dB Unity</span>
+            </button>
+          )}
+
+          {onTogglePlay && (
+            <button
+              onClick={onTogglePlay}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
+                isPlaying
+                  ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/30'
+                  : 'bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-md shadow-emerald-500/20'
+              }`}
+            >
+              {isPlaying ? (
+                <>
+                  <Pause className="w-3.5 h-3.5 fill-current" />
+                  <span>Pausar Master</span>
+                </>
+              ) : (
+                <>
+                  <Play className="w-3.5 h-3.5 fill-current" />
+                  <span>Tocar Master & Stems</span>
+                </>
+              )}
+            </button>
+          )}
+
+          {onToggleMasterTouch && (
+            <button
+              onClick={onToggleMasterTouch}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${
+                isMasterTouchActive
+                  ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/50 shadow-xs ring-1 ring-cyan-500/30'
+                  : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200'
+              }`}
+              title="Aplica o equilíbrio e processamento individual de stems diretamente na soma da masterização final"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
+              <span>Toque Multitrack: {isMasterTouchActive ? 'ATIVADO' : 'BYPASS'}</span>
+            </button>
+          )}
+
+          <div className="flex items-center gap-1.5 text-xs font-mono bg-emerald-950/40 text-emerald-300 border border-emerald-500/30 px-2.5 py-1.5 rounded-lg shadow-xs">
+            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+            <span className="font-semibold">Soma Ativa no Master</span>
+            <span aria-hidden="true" className="text-emerald-600">·</span>
+            <span className="text-emerald-400/80">{stems.length} Stems</span>
+          </div>
         </div>
       </div>
 
@@ -199,11 +260,11 @@ export function StemMixer({
         })}
       </div>
 
-      <div className="flex flex-col sm:flex-row items-center justify-between gap-3 p-3 rounded-lg bg-[#111726] border border-slate-800 text-xs text-slate-300">
-        <div className="flex items-center gap-2">
-          <Eye className="w-4 h-4 text-cyan-400 shrink-0" />
+      <div className="flex flex-col sm:flex-row items-center justify-between gap-3 p-3.5 rounded-lg bg-[#111726] border border-slate-800 text-xs text-slate-300">
+        <div className="flex items-center gap-2.5">
+          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
           <span>
-            Cada stem processado é somado à matriz estéreo com ganho compensado e oversampling 2x, garantindo fidelidade acústica livre de aliasing digital.
+            <strong>Soma Unificada no Master Bus:</strong> Todos os stems (Vocais, Bateria, Baixo, Instrumentos e FX) são combinados diretamente no barramento estéreo e passam pela cadeia completa de masterização analógica (Azimute 1/4", De-harshing, Tape Warmth, Orban Treble e Limitless True-Peak). Não há reprodução descompassada ou isolada.
           </span>
         </div>
       </div>

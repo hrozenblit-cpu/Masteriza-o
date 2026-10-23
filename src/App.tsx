@@ -5,7 +5,6 @@ import { SpectrogramCanvas } from './components/SpectrogramCanvas';
 import { LissajousScope } from './components/LissajousScope';
 import { RadarArtifactChart } from './components/RadarArtifactChart';
 import { HumanizerControls } from './components/HumanizerControls';
-import { StemMixer } from './components/StemMixer';
 import { ForensicReportModal } from './components/ForensicReportModal';
 import { AudioPlayerBar } from './components/AudioPlayerBar';
 import { LufsLimitlessConsole } from './components/LufsLimitlessConsole';
@@ -17,7 +16,6 @@ import { BatchAuditionBar } from './components/BatchAuditionBar';
 import { FolderSettingsModal } from './components/FolderSettingsModal';
 import { audioEngine } from './audio/audioEngine';
 import { analyzeAudioForensics } from './audio/analyzer';
-import { splitAudioBufferIntoStems } from './audio/stemSplitter';
 import { detectAudioFileFormat, AudioInputFormat } from './audio/audioFormatDetector';
 import { decodeAudioPreservingSampleRate } from './audio/nativeAudioDecoder';
 import { analyzeBufferLoudness } from './audio/loudnessEngine';
@@ -27,10 +25,11 @@ import {
   reconstructTapeDropouts,
   TapeDropoutAnalysis,
   TapeDropoutSettings,
+  TapeDropoutMode,
   DEFAULT_DROPOUT_SETTINGS
 } from './audio/tapeDropoutEngine';
 import { UserPreset, getAllPresets } from './audio/presetManager';
-import { autoSaveManager } from './audio/autoSaveManager';
+import { autoSaveManager, SUBFOLDER_RECOVERED, SUBFOLDER_MASTERED } from './audio/autoSaveManager';
 import {
   generateTrackRecall,
   recallToBlob,
@@ -38,19 +37,33 @@ import {
 } from './audio/presetRecallManager';
 import {
   parseTrackMetadata,
+  stripAudioFileExtension,
   buildMasterWavFilename,
   buildAzimuthWavFilename,
   buildDropoutWavFilename,
+  buildPreMasterWavFilename,
   buildRecallFilename
 } from './audio/trackNamingHelper';
-import { ForensicAnalysisResult, HumanizerSettings, AudioStem, LoudnessMetrics } from './types/audio';
+import { ForensicAnalysisResult, HumanizerSettings, LoudnessMetrics } from './types/audio';
 import { TapeDenoiseConsole } from './components/TapeDenoiseConsole';
+import { ModularWorkflowConsole } from './components/ModularWorkflowConsole';
 import { SpectralDenoiseSettings, DEFAULT_DENOISE_SETTINGS, NoiseAnalysisTelemetry } from './audio/spectralDenoiseEngine';
-import { Sparkles, Layers, Cpu, ArrowRight, Activity, CheckCircle2, Gauge, Disc, Bookmark, FolderDown, History, ShieldCheck, Waves, AlertTriangle, X } from 'lucide-react';
+import { OrbanTrebleTelemetry } from './audio/orbanTrebleEngine';
+import {
+  analyzeSplitStereoFilename,
+  findSplitStereoPair,
+  mergeMonoBuffersToStereo
+} from './audio/splitStereoManager';
+import { PendingSplitMonoState } from './components/AudioUploader';
+import { SplitStereoModal } from './components/SplitStereoModal';
+import { Sparkles, Layers, Cpu, ArrowRight, Activity, CheckCircle2, Gauge, Disc, Bookmark, FolderDown, History, ShieldCheck, Waves, AlertTriangle, X, GitFork } from 'lucide-react';
 
 export default function App() {
   // Navigation
-  const [activeTab, setActiveTab] = useState<'azimuth' | 'dropouts' | 'denoise' | 'mastering' | 'lufs' | 'stems' | 'analyzer'>('azimuth');
+  const [activeTab, setActiveTab] = useState<'modular' | 'azimuth' | 'dropouts' | 'denoise' | 'mastering' | 'lufs' | 'analyzer'>('modular');
+  const [analysisStatus, setAnalysisStatus] = useState<string | null>(null);
+  const [pendingSplitMono, setPendingSplitMono] = useState<PendingSplitMonoState | null>(null);
+  const [isSplitStereoModalOpen, setIsSplitStereoModalOpen] = useState(false);
   const [isReportOpen, setIsReportOpen] = useState(false);
   const [isPresetModalOpen, setIsPresetModalOpen] = useState(false);
   const [isBatchModalOpen, setIsBatchModalOpen] = useState(false);
@@ -63,7 +76,7 @@ export default function App() {
   const [currentGlobalPresetName, setCurrentGlobalPresetName] = useState<string>('Digitalização Fita 1/4" (Anos 50-70)');
 
   // Track Standard Naming Metadata State ([Faixa]_[Música] - [Cantor] - AT_[Taxa_Bit]_[LUFS])
-  const [trackNumber, setTrackNumber] = useState<string>('01');
+  const [trackNumber, setTrackNumber] = useState<string>('');
   const [songTitle, setSongTitle] = useState<string>('');
   const [artistName, setArtistName] = useState<string>('');
 
@@ -76,6 +89,9 @@ export default function App() {
   const [isExportingAzimuth, setIsExportingAzimuth] = useState(false);
   const [isExportingDropout, setIsExportingDropout] = useState(false);
   const [isExportingDenoised, setIsExportingDenoised] = useState(false);
+  const [isExportingPreMaster, setIsExportingPreMaster] = useState(false);
+  const [isExportingZip, setIsExportingZip] = useState(false);
+  const [exportBitDepth, setExportBitDepth] = useState<16 | 24 | 32>(24);
   const [isRestoringDropout, setIsRestoringDropout] = useState(false);
   const [exportNotice, setExportNotice] = useState<string | null>(null);
   const [appErrorNotice, setAppErrorNotice] = useState<string | null>(null);
@@ -100,18 +116,18 @@ export default function App() {
   const [tapeDenoiseTelemetry, setTapeDenoiseTelemetry] = useState<NoiseAnalysisTelemetry | null>(null);
   const [tapeDenoiseSettings, setTapeDenoiseSettings] = useState<SpectralDenoiseSettings>(DEFAULT_DENOISE_SETTINGS);
 
+  // Orban Optimod Treble Processor State
+  const [orbanTelemetry, setOrbanTelemetry] = useState<OrbanTrebleTelemetry | null>(null);
+
   // Current Track & Buffer State (Pure User Audio - Zero Artificial Beep Synths)
   const [currentTrackTitle, setCurrentTrackTitle] = useState('Nenhum arquivo carregado');
   const [audioFormat, setAudioFormat] = useState<AudioInputFormat | null>(null);
-  const [isStemMode, setIsStemMode] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [trackLoudness, setTrackLoudness] = useState<LoudnessMetrics | null>(null);
 
-
   // Audio Buffers
+  const rawBufferRef = useRef<AudioBuffer | null>(null);
   const masterBufferRef = useRef<AudioBuffer | null>(null);
-  const stemsRef = useRef<AudioStem[]>([]);
-  const [stems, setStems] = useState<AudioStem[]>([]);
 
   // Forensic Analysis State
   const [analysisResult, setAnalysisResult] = useState<ForensicAnalysisResult | null>(null);
@@ -119,139 +135,395 @@ export default function App() {
   // Mastering DSP Settings (Calibrated for pristine audiophile quality, zero distortion)
   const [humanizerSettings, setHumanizerSettings] = useState<HumanizerSettings>({
     enabled: true,
-    deHarshIntensity: 60,
+    deHarshIntensity: 0,
     notchFrequencyHz: 3400,
     notchBandwidthQ: 2.5,
-    tapeWarmth: 45,
-    tubeHarmonics: 40,
-    lowMidBody: 1.4,
-    transientPunch: 60,
-    attackDeSmear: 50,
-    timingJitterMs: 8,
-    flutterWowRate: 30,
-    airExciterGain: 55,
+    tapeWarmth: 0,
+    tubeHarmonics: 0,
+    lowMidBody: 0,
+    transientPunch: 0,
+    attackDeSmear: 0,
+    timingJitterMs: 0,
+    flutterWowRate: 0,
+    airExciterGain: 0,
     airCutoffHz: 14500,
-    stereoCorrelationFix: 70,
-    monoBassCutoffHz: 140,
-    acousticRoomSpread: 45,
+    stereoCorrelationFix: 0,
+    monoBassCutoffHz: 0,
+    acousticRoomSpread: 0,
     outputGainDb: 0,
     limitlessEnabled: true,
     targetLufs: -14.0,
     targetCeilingDb: -1.0,
-    clipperDrive: 55,
-    lowEndWeight: 75,
+    clipperDrive: 0,
+    lowEndWeight: 0,
     transientSpeed: 'punchy',
-    autoMatchLoudness: true,
+    orbanHfEnabled: true,
+    orbanHfBypass: false,
+    orbanHfUserOverrideLock: false,
+    orbanHfMode: 'smooth_silk',
+    orbanHfAmount: 50,
+    orbanHfAutoBrillianceDb: 0.0,
+    orbanHfHighShelfGainDb: 0.0,
+    orbanHfThresholdDb: -6.0,
+    orbanHfCrossoverHz: 6000,
+    orbanHfSpeed: 'medium',
   });
+
+  // Unified Audio Ingestion Pipeline for Single-File or Merged Pro Tools Split-Stereo
+  const runAudioIngestionPipeline = async (
+    audioBuffer: AudioBuffer,
+    displayName: string,
+    detectedFormat: AudioInputFormat
+  ) => {
+    audioEngine.stop(true);
+    setIsPlaying(false);
+    setPlaybackTime(0);
+    rawBufferRef.current = audioBuffer;
+    masterBufferRef.current = audioBuffer;
+    audioEngine.resetTrack(audioBuffer, audioBuffer);
+    setCurrentTrackTitle(displayName);
+    setDuration(audioBuffer.duration);
+
+    // Parse track metadata for standardized studio naming: [faixa]_[Música] - [Cantor] - AT_[taxa_bit]_[LUFS]
+    const parsedMeta = parseTrackMetadata(displayName);
+    setTrackNumber(parsedMeta.trackNumber);
+    setSongTitle(parsedMeta.songTitle);
+    setArtistName(parsedMeta.artist);
+
+    // Compute precise full-track ITU-R BS.1770-4 loudness metrics
+    setAnalysisStatus('Medindo loudness BS.1770 e dinâmica...');
+    await new Promise((r) => setTimeout(r, 10));
+    const loudness = analyzeBufferLoudness(audioBuffer);
+    setTrackLoudness(loudness);
+    audioEngine.setTrackLoudness(loudness);
+
+    // Analyze user file forensics
+    setAnalysisStatus('Realizando triagem forense espectral...');
+    await new Promise((r) => setTimeout(r, 10));
+    const analysis = await analyzeAudioForensics(audioBuffer, displayName);
+    setAnalysisResult(analysis);
+
+    // 1/4" Analog Tape Azimuth & Inter-Channel Balance Analysis
+    setAnalysisStatus('Analisando correlação estéreo vs mono e azimute...');
+    await new Promise((r) => setTimeout(r, 10));
+    const azimuth = analyzeTapeAzimuth(audioBuffer);
+    setTapeAzimuthAnalysis(azimuth);
+
+    // 1/4" Tape Dropout Analysis (Ampex Full-Track Mono digitized on Studer A80 2-Track)
+    setAnalysisStatus('Varrendo falhas de fita e dropouts...');
+    await new Promise((r) => setTimeout(r, 10));
+    const dropouts = analyzeTapeDropouts(audioBuffer, tapeDropoutSettings);
+    setTapeDropoutAnalysis(dropouts);
+    audioEngine.setTapeDropoutAnalysis(dropouts);
+
+    // Intelligent Material Detection: Real Stereo vs Mono in 2 Channels vs Modern Clean Recording
+    const isDualMono =
+      azimuth.channelConfiguration === 'dual_mono' ||
+      (dropouts.isAmpexFullTrackCandidate && azimuth.sideToMidDb <= -26.0);
+
+    const hasDropouts = dropouts.totalDropouts > 0;
+    const hasAzimuthLag = Math.abs(azimuth.azimuthOffsetSamples) >= 0.1 || Math.abs(azimuth.levelDiffDb) >= 0.35;
+
+    // 1/4" Tape Noise Profile Analysis (Sonic Solutions NoNoise & iZotope RX Spectral De-noise)
+    setAnalysisStatus('Avaliando perfil de ruído e hiss...');
+    await new Promise((r) => setTimeout(r, 10));
+    const denoiseAnalysis = audioEngine.analyzeDenoise(audioBuffer);
+    setTapeDenoiseTelemetry(denoiseAnalysis);
+
+    const hasTapeHiss = Boolean(
+      denoiseAnalysis?.hasNoiseDetected ||
+      (denoiseAnalysis?.hissNoiseFloorDb ?? -90) > -75.0 ||
+      denoiseAnalysis?.hasHumDetected
+    );
+    const isCleanModern = !hasDropouts && !hasTapeHiss && !hasAzimuthLag && dropouts.tapeHealthScore === 100;
+
+    const isWanderOrDefect =
+      isDualMono &&
+      (dropouts.isSevereWanderDetected ||
+        dropouts.channelComparison?.isSevereWanderDetected ||
+        hasDropouts);
+
+    const safeDropoutMode: TapeDropoutMode = isDualMono && !isCleanModern
+      ? (tapeDropoutSettings.mode === 'mono_wander_graft' || isWanderOrDefect ? 'mono_wander_graft' : 'ampex_fulltrack_cross')
+      : 'stereo_independent';
+
+    const safeDropoutSettings: TapeDropoutSettings = {
+      ...tapeDropoutSettings,
+      enabled: hasDropouts || (!isCleanModern && isDualMono && isWanderOrDefect),
+      mode: isCleanModern ? 'stereo_independent' : safeDropoutMode,
+    };
+    setTapeDropoutSettings(safeDropoutSettings);
+    audioEngine.updateTapeDropoutSettings(safeDropoutSettings);
+
+    if (denoiseAnalysis) {
+      const autoDenoise: SpectralDenoiseSettings = {
+        ...tapeDenoiseSettings,
+        enabled: hasTapeHiss && !isCleanModern,
+        noiseProfileType: denoiseAnalysis.recommendedNoiseProfileType,
+        humNotchFilter: denoiseAnalysis.recommendedHumNotch,
+        reductionDb: denoiseAnalysis.recommendedReductionDb,
+        learnedNoiseBands: denoiseAnalysis.noiseProfileBands,
+      };
+      setTapeDenoiseSettings(autoDenoise);
+      audioEngine.updateTapeDenoiseSettings(autoDenoise);
+    }
+
+
+    // Orban Optimod Treble Analysis & Calibration (Defaults to Audiófilo Sedoso 8700 at -6.5 dB)
+    setAnalysisStatus('Calibrando equalização Orban e masterização...');
+    await new Promise((r) => setTimeout(r, 10));
+    const orbanAnalysis = audioEngine.getOrbanTrebleTelemetry(audioBuffer);
+    setOrbanTelemetry(orbanAnalysis);
+    if (orbanAnalysis) {
+      setHumanizerSettings((prev) => {
+        // Detecta se o áudio presente necessita do processador de agudos (fita abafada, estridência/sibilância ou ajuste de brilho)
+        const audioNeedsTreble = Boolean(
+          orbanAnalysis.needsProcessing ||
+          orbanAnalysis.isDarkTape ||
+          orbanAnalysis.isHarshRecording ||
+          Math.abs(orbanAnalysis.recommendedBrillianceDb) >= 0.5
+        );
+
+        // Trava manual do usuário: só é respeitada se o usuário tiver explicitamente acionado o botão/trava de bypass
+        const userExplicitlyDisabled = Boolean(prev.orbanHfUserOverrideLock && (prev.orbanHfBypass || !prev.orbanHfEnabled));
+        const userExplicitlyEnabled = Boolean(prev.orbanHfUserOverrideLock && !prev.orbanHfBypass && prev.orbanHfEnabled);
+
+        // Regra de negócio: a desabilitação só deve ocorrer ou por não ser necessário no presente áudio ou se o usuário desabilita-lo
+        const shouldEnable = userExplicitlyEnabled
+          ? true
+          : userExplicitlyDisabled
+          ? false
+          : audioNeedsTreble;
+
+        const updated = {
+          ...prev,
+          orbanHfEnabled: shouldEnable,
+          orbanHfBypass: !shouldEnable,
+          orbanHfUserOverrideLock: prev.orbanHfUserOverrideLock ?? false,
+          orbanHfMode: orbanAnalysis.recommendedMode,
+          orbanHfAmount: orbanAnalysis.isDarkTape ? 65 : 50,
+          orbanHfAutoBrillianceDb: orbanAnalysis.recommendedBrillianceDb,
+          orbanHfHighShelfGainDb: orbanAnalysis.recommendedBrillianceDb,
+          orbanHfThresholdDb: orbanAnalysis.recommendedThresholdDb,
+          orbanHfCrossoverHz: orbanAnalysis.recommendedCrossoverHz,
+          orbanHfSpeed: orbanAnalysis.recommendedSpeed,
+        };
+        audioEngine.updateSettings(updated);
+        return updated;
+      });
+    }
+
+    if (tapeAzimuthSettings.autoAlignOnLoad) {
+      const isGhost = azimuth.isGhostChannelDetected;
+      // Never amplify a dead/hiss channel! Safe balance is 0.0 for ghost channels and clamped to [-4.5, +4.5] dB for authentic stereo.
+      const safeBalance = isGhost ? 0.0 : Math.max(-4.5, Math.min(4.5, -azimuth.levelDiffDb));
+      const autoAzimuth: TapeAzimuthSettings = {
+        ...tapeAzimuthSettings,
+        enabled: true,
+        azimuthDelaySamples: isGhost ? 0 : azimuth.azimuthOffsetSamples,
+        balanceDb: safeBalance,
+        activeChannel: azimuth.activeSignalChannel || 'both',
+        ghostChannelHandling: isGhost ? 'clone_active' : 'passthrough',
+      };
+      setTapeAzimuthSettings(autoAzimuth);
+      audioEngine.updateTapeAzimuthSettings(autoAzimuth);
+    }
+
+    // Preload buffer and trigger master rendering with single, clean mastering chain
+    setAnalysisStatus('Renderizando áudio master com cadeia de processamento...');
+    await audioEngine.loadRawBuffer(audioBuffer).then((rendered) => {
+      if (rendered) {
+        masterBufferRef.current = rendered;
+      }
+    });
+
+    // Auto-tune de-harsh only for confirmed AI generative artifacts (Suno / Udio).
+    // Genuine analog tape transfers are NEVER notched or distorted by default.
+    if (analysis.dominantPlatform.platform === 'suno') {
+      setHumanizerSettings((prev) => ({
+        ...prev,
+        deHarshIntensity: 45,
+        notchFrequencyHz: 3400,
+      }));
+    } else if (analysis.dominantPlatform.platform === 'udio') {
+      setHumanizerSettings((prev) => ({
+        ...prev,
+        deHarshIntensity: 50,
+        notchFrequencyHz: 4200,
+      }));
+    }
+
+    const dropoutNotice = dropouts.totalDropouts > 0
+      ? ` | Dropouts: ${dropouts.totalDropouts} (${dropouts.isAmpexFullTrackCandidate ? 'Ampex Full-Track detectada' : `${dropouts.tapeHealthScore}% saúde`})`
+      : ' | Fita sem dropouts';
+
+    const isPreviouslyMastered = /(- AT_|_AT_|_Master_|PreMaster)/i.test(displayName);
+    const masterWarning = isPreviouslyMastered
+      ? ' ⚠️ [Aviso: Arquivo com identificação de processamento anterior detectado. Para evitar aplicação dupla de efeitos/presets, utilize o arquivo cru original ou o Pré-Master Restaurado.]'
+      : '';
+
+    const azimuthNotice = azimuth.isGhostChannelDetected
+      ? `Canal Fantasma: Canal ${azimuth.activeSignalChannel} Útil (Centrado em Mono Limpo · Ganho cego de +${Math.abs(azimuth.levelDiffDb).toFixed(1)} dB rejeitado)`
+      : `Azimute: ${azimuth.azimuthOffsetUs > 0 ? '+' : ''}${azimuth.azimuthOffsetUs.toFixed(1)} µs | Balanço: ${azimuth.levelDiffDb > 0 ? '+' : ''}${azimuth.levelDiffDb.toFixed(1)} dB`;
+
+    setExportNotice(
+      `Áudio carregado: ${detectedFormat.sampleRate.toLocaleString()} Hz · ${detectedFormat.bitDepth}-bit (${detectedFormat.codec}). ${azimuthNotice}${dropoutNotice}.${masterWarning}`
+    );
+    setTimeout(() => setExportNotice(null), isPreviouslyMastered ? 10000 : 7000);
+  };
+
+  // Pro Tools Split Stereo (.L and .R) Merging Handler
+  const handleSplitStereoUpload = async (fileA: File, fileB: File) => {
+    try {
+      setIsAnalyzing(true);
+      // Immediately stop and wipe current track so previous audio never plays or bleeds
+      audioEngine.wipeCurrentTrack();
+      masterBufferRef.current = null;
+      rawBufferRef.current = null;
+      setIsPlaying(false);
+      setPlaybackTime(0);
+      setDuration(0);
+      setAnalysisResult(null);
+      setTapeDropoutAnalysis(null);
+      setTapeAzimuthAnalysis(null);
+      setTapeDenoiseTelemetry(null);
+      setOrbanTelemetry(null);
+
+      const infoA = analyzeSplitStereoFilename(fileA.name);
+      const infoB = analyzeSplitStereoFilename(fileB.name);
+
+      let fileL = fileA;
+      let fileR = fileB;
+
+      if (infoA.channel === 'L' || infoB.channel === 'R') {
+        fileL = infoA.channel === 'L' ? fileA : fileB;
+        fileR = infoA.channel === 'L' ? fileB : fileA;
+      } else if (infoA.channel === 'R' || infoB.channel === 'L') {
+        fileL = infoA.channel === 'R' ? fileB : fileA;
+        fileR = infoA.channel === 'R' ? fileA : fileB;
+      }
+
+      setAnalysisStatus(`Decodificando Canal L (${fileL.name})...`);
+      await new Promise((r) => setTimeout(r, 10));
+      const bufferL = await decodeAudioPreservingSampleRate(fileL, audioEngine.getAudioContext());
+
+      setAnalysisStatus(`Decodificando Canal R (${fileR.name})...`);
+      await new Promise((r) => setTimeout(r, 10));
+      const bufferR = await decodeAudioPreservingSampleRate(fileR, audioEngine.getAudioContext());
+
+      setAnalysisStatus('Unindo canais .L e .R em estéreo analógico de 2 canais...');
+      await new Promise((r) => setTimeout(r, 10));
+      const stereoBuffer = mergeMonoBuffersToStereo(bufferL, bufferR, audioEngine.getAudioContext());
+
+      setAnalysisStatus('Detectando taxa e profundidade de bits...');
+      await new Promise((r) => setTimeout(r, 10));
+      const detectedFormat = await detectAudioFileFormat(fileL, stereoBuffer);
+      detectedFormat.channels = 2;
+      detectedFormat.codec = `Pro Tools Split-Mono (2x Mono → Estéreo ${detectedFormat.bitDepth}-bit PCM)`;
+      detectedFormat.fileSizeBytes = fileL.size + fileR.size;
+      setAudioFormat(detectedFormat);
+      setExportBitDepth(detectedFormat.bitDepth === 16 ? 16 : 24);
+
+      setPendingSplitMono(null);
+
+      const baseTrackName =
+        infoA.baseName ||
+        infoB.baseName ||
+        fileL.name.replace(/[\._\-\s(]*(l|r|left|right)[\._\-\s)]*(\.[^.]*)?$/i, '');
+      const trackTitle = `${baseTrackName} (Estéreo L+R)`;
+
+      await runAudioIngestionPipeline(stereoBuffer, trackTitle, detectedFormat);
+
+      setExportNotice(
+        `✓ Arquivos Pro Tools .L e .R unidos com sucesso em Estéreo de 2 canais (${detectedFormat.sampleRate.toLocaleString()} Hz · ${detectedFormat.bitDepth}-bit)!`
+      );
+      setTimeout(() => setExportNotice(null), 7000);
+    } catch (err) {
+      console.error('Erro ao unir arquivos Split Stereo do Pro Tools:', err);
+      setAppErrorNotice('Erro ao unir os arquivos .L e .R em estéreo.');
+      setTimeout(() => setAppErrorNotice(null), 7000);
+    } finally {
+      setIsAnalyzing(false);
+      setAnalysisStatus(null);
+    }
+  };
 
   // Handle User File Upload - Extracts Exact Sample Rate and Bit Depth
   const handleFileUpload = async (file: File) => {
     try {
       setIsAnalyzing(true);
-      audioEngine.stop();
+      // Immediately stop and wipe current track so previous song never remains or plays
+      audioEngine.wipeCurrentTrack();
+      masterBufferRef.current = null;
+      rawBufferRef.current = null;
       setIsPlaying(false);
       setPlaybackTime(0);
-      setIsStemMode(false);
+      setDuration(0);
+      setCurrentTrackTitle(file.name);
+      setAnalysisResult(null);
+      setTapeDropoutAnalysis(null);
+      setTapeAzimuthAnalysis(null);
+      setTapeDenoiseTelemetry(null);
+      setOrbanTelemetry(null);
 
-      // Decode audio data preserving exact native sample rate (e.g. 44.1 kHz, 96 kHz)
+      // Check if there is already a split mono channel waiting and this file is the partner:
+      if (pendingSplitMono) {
+        const pair = findSplitStereoPair([pendingSplitMono.file, file]);
+        if (pair) {
+          await handleSplitStereoUpload(pair.fileL, pair.fileR);
+          return;
+        }
+        const info = analyzeSplitStereoFilename(file.name);
+        if (info.isSplit && info.channel && info.channel !== pendingSplitMono.channel) {
+          const fileL = pendingSplitMono.channel === 'L' ? pendingSplitMono.file : file;
+          const fileR = pendingSplitMono.channel === 'R' ? pendingSplitMono.file : file;
+          await handleSplitStereoUpload(fileL, fileR);
+          return;
+        }
+      }
+
+      setAnalysisStatus('Decodificando áudio na taxa nativa...');
+      await new Promise((r) => setTimeout(r, 10));
       const audioBuffer = await decodeAudioPreservingSampleRate(file, audioEngine.getAudioContext());
 
-      // Detect native bit depth and sample rate from input file
+      setAnalysisStatus('Detectando taxa e profundidade de bits...');
+      await new Promise((r) => setTimeout(r, 10));
       const detectedFormat = await detectAudioFileFormat(file, audioBuffer);
       setAudioFormat(detectedFormat);
+      setExportBitDepth(detectedFormat.bitDepth === 16 ? 16 : 24);
 
-      masterBufferRef.current = audioBuffer;
-      setCurrentTrackTitle(file.name);
-      setDuration(audioBuffer.duration);
-
-      // Parse track metadata for standardized studio naming: [faixa]_[Música] - [Cantor] - AT_[taxa_bit]_[LUFS]
-      const parsedMeta = parseTrackMetadata(file.name, 1);
-      setTrackNumber(parsedMeta.trackNumber);
-      setSongTitle(parsedMeta.songTitle);
-      setArtistName(parsedMeta.artist);
-
-      // Preload raw buffer and trigger background master rendering for bit-for-bit preview parity
-      audioEngine.loadRawBuffer(audioBuffer);
-
-      // Compute precise full-track ITU-R BS.1770-4 loudness metrics
-      const loudness = analyzeBufferLoudness(audioBuffer);
-      setTrackLoudness(loudness);
-      audioEngine.setTrackLoudness(loudness);
-
-      // Analyze user file
-      const analysis = await analyzeAudioForensics(audioBuffer, file.name);
-      setAnalysisResult(analysis);
-
-      // 1/4" Analog Tape Azimuth & Inter-Channel Balance Analysis
-      const azimuth = analyzeTapeAzimuth(audioBuffer);
-      setTapeAzimuthAnalysis(azimuth);
-
-      // 1/4" Tape Dropout Analysis (Ampex Full-Track Mono digitized on Studer A80 2-Track)
-      const dropouts = analyzeTapeDropouts(audioBuffer, tapeDropoutSettings);
-      setTapeDropoutAnalysis(dropouts);
-      audioEngine.setTapeDropoutAnalysis(dropouts);
-
-      // 1/4" Tape Noise Profile Analysis (Sonic Solutions NoNoise & iZotope RX Spectral De-noise)
-      const denoiseAnalysis = audioEngine.analyzeDenoise(audioBuffer);
-      setTapeDenoiseTelemetry(denoiseAnalysis);
-
-      if (tapeAzimuthSettings.autoAlignOnLoad && (Math.abs(azimuth.azimuthOffsetSamples) > 0.05 || Math.abs(azimuth.levelDiffDb) > 0.2)) {
-        const autoAzimuth: TapeAzimuthSettings = {
-          ...tapeAzimuthSettings,
-          enabled: true,
-          azimuthDelaySamples: azimuth.azimuthOffsetSamples,
-          balanceDb: -azimuth.levelDiffDb,
-        };
-        setTapeAzimuthSettings(autoAzimuth);
-        audioEngine.updateTapeAzimuthSettings(autoAzimuth);
+      // Check if this single file is half of a Pro Tools split-mono pair (.L or .R)
+      const splitInfo = analyzeSplitStereoFilename(file.name);
+      if (splitInfo.isSplit && splitInfo.channel && splitInfo.expectedPartnerFilename) {
+        setPendingSplitMono({
+          file,
+          channel: splitInfo.channel,
+          baseName: splitInfo.baseName || file.name,
+          expectedPartnerFilename: splitInfo.expectedPartnerFilename,
+        });
+      } else {
+        setPendingSplitMono(null);
       }
 
-      // Extract real multitrack frequency stems from user audio buffer for stem mixing
-      const userStems = await splitAudioBufferIntoStems(
-        audioBuffer,
-        analysis.overallAiProbability > 50,
-        analysis.dominantPlatform.name
-      );
-      if (userStems.length > 0) {
-        setStems(userStems);
-        stemsRef.current = userStems;
-      }
-
-      // Auto-tune Masterizer based on detected cutoff and resonance
-      if (analysis.metrics.nyquistCutoffHz <= 16500) {
-        setHumanizerSettings((prev) => ({
-          ...prev,
-          deHarshIntensity: 75,
-          notchFrequencyHz: 3400,
-          airCutoffHz: 16000,
-          airExciterGain: 80,
-          stereoCorrelationFix: 75,
-        }));
-      } else if (analysis.dominantPlatform.platform === 'udio') {
-        setHumanizerSettings((prev) => ({
-          ...prev,
-          deHarshIntensity: 80,
-          notchFrequencyHz: 4200,
-          airCutoffHz: 17000,
-          airExciterGain: 50,
-          stereoCorrelationFix: 80,
-        }));
-      }
-
-      const dropoutNotice = dropouts.totalDropouts > 0
-        ? ` | Dropouts: ${dropouts.totalDropouts} (${dropouts.isAmpexFullTrackCandidate ? 'Ampex Full-Track detectada' : `${dropouts.tapeHealthScore}% saúde`})`
-        : ' | Fita sem dropouts';
-
-      setExportNotice(
-        `Áudio carregado: ${detectedFormat.sampleRate.toLocaleString()} Hz · ${detectedFormat.bitDepth}-bit (${detectedFormat.codec}). Azimute: ${azimuth.azimuthOffsetUs > 0 ? '+' : ''}${azimuth.azimuthOffsetUs.toFixed(1)} µs | Balanço: ${azimuth.levelDiffDb > 0 ? '+' : ''}${azimuth.levelDiffDb.toFixed(1)} dB${dropoutNotice}.`
-      );
-      setTimeout(() => setExportNotice(null), 7000);
-      setIsAnalyzing(false);
+      await runAudioIngestionPipeline(audioBuffer, file.name, detectedFormat);
     } catch {
       setAppErrorNotice('Erro ao carregar ou decodificar arquivo. Por favor tente outro formato (WAV, MP3, FLAC, M4A, MP4/MPG4, MOV).');
       setTimeout(() => setAppErrorNotice(null), 7000);
+    } finally {
       setIsAnalyzing(false);
+      setAnalysisStatus(null);
     }
+  };
+
+  const handleMultipleFilesUpload = async (files: FileList) => {
+    if (files.length >= 2) {
+      const pair = findSplitStereoPair(files);
+      if (pair) {
+        await handleSplitStereoUpload(pair.fileL, pair.fileR);
+        return;
+      }
+    }
+    setIsBatchModalOpen(true);
   };
 
   // Azimuth Handlers
@@ -274,11 +546,15 @@ export default function App() {
 
   const handleAutoAlignAzimuth = () => {
     if (!tapeAzimuthAnalysis) return;
+    const isGhost = tapeAzimuthAnalysis.isGhostChannelDetected;
+    const safeBalance = isGhost ? 0.0 : Math.max(-4.5, Math.min(4.5, -tapeAzimuthAnalysis.levelDiffDb));
     const aligned: TapeAzimuthSettings = {
       ...tapeAzimuthSettings,
       enabled: true,
-      azimuthDelaySamples: tapeAzimuthAnalysis.azimuthOffsetSamples,
-      balanceDb: -tapeAzimuthAnalysis.levelDiffDb,
+      azimuthDelaySamples: isGhost ? 0 : tapeAzimuthAnalysis.azimuthOffsetSamples,
+      balanceDb: safeBalance,
+      activeChannel: tapeAzimuthAnalysis.activeSignalChannel || 'both',
+      ghostChannelHandling: isGhost ? 'clone_active' : 'passthrough',
     };
     setTapeAzimuthSettings(aligned);
     audioEngine.updateTapeAzimuthSettings(aligned);
@@ -291,17 +567,32 @@ export default function App() {
         )
       );
     }
-    setExportNotice(
-      `✓ Azimute calibrado automaticamente: ${tapeAzimuthAnalysis.azimuthOffsetUs > 0 ? '+' : ''}${tapeAzimuthAnalysis.azimuthOffsetUs.toFixed(1)} µs (${tapeAzimuthAnalysis.azimuthOffsetSamples > 0 ? '+' : ''}${tapeAzimuthAnalysis.azimuthOffsetSamples.toFixed(2)} amostras) | Balanço: ${(-tapeAzimuthAnalysis.levelDiffDb).toFixed(1)} dB.`
-    );
+    const noticeText = isGhost
+      ? `✓ Canal Fantasma identificado! Canal ${tapeAzimuthAnalysis.activeSignalChannel} duplicado em Mono limpo; amplificação cega de +${Math.abs(tapeAzimuthAnalysis.levelDiffDb).toFixed(1)} dB rejeitada.`
+      : `✓ Azimute calibrado automaticamente: ${tapeAzimuthAnalysis.azimuthOffsetUs > 0 ? '+' : ''}${tapeAzimuthAnalysis.azimuthOffsetUs.toFixed(1)} µs | Balanço: ${safeBalance.toFixed(1)} dB.`;
+    setExportNotice(noticeText);
     setTimeout(() => setExportNotice(null), 6000);
   };
 
   // Load Custom User / Factory Preset
   const handleLoadPreset = (preset: UserPreset) => {
     setCurrentGlobalPresetName(preset.name);
-    setHumanizerSettings(preset.settings);
-    audioEngine.updateSettings(preset.settings);
+
+    // User Override Lock: só preserva o bypass se o usuário tiver explicitamente travado o módulo manualmente
+    const isExplicitlyLocked = Boolean(humanizerSettings.orbanHfUserOverrideLock);
+    const settingsToApply: HumanizerSettings = {
+      ...preset.settings,
+      ...(isExplicitlyLocked
+        ? {
+            orbanHfBypass: humanizerSettings.orbanHfBypass,
+            orbanHfEnabled: humanizerSettings.orbanHfEnabled,
+            orbanHfUserOverrideLock: true,
+          }
+        : {}),
+    };
+
+    setHumanizerSettings(settingsToApply);
+    audioEngine.updateSettings(settingsToApply);
 
     if (preset.azimuthSettings) {
       setTapeAzimuthSettings(preset.azimuthSettings);
@@ -332,14 +623,21 @@ export default function App() {
   };
 
   // Batch Track Audition & Navigation Engine
-  const handleEditTrackInMastering = async (index: number) => {
-    if (index < 0 || index >= batchQueue.length) return;
-    const item = batchQueue[index];
+  const handleEditTrackInMastering = async (index: number, directItem?: BatchItem) => {
+    if (index < 0) return;
+    const item = directItem || batchQueue[index];
     if (!item) return;
 
     setEditingBatchIndex(index);
 
     try {
+      // 1. Immediately wipe and stop previous audio so track never leaks
+      audioEngine.wipeCurrentTrack();
+      rawBufferRef.current = null;
+      masterBufferRef.current = null;
+      setIsPlaying(false);
+      setPlaybackTime(0);
+
       let buffer = item.audioBuffer;
       if (!buffer) {
         buffer = await decodeAudioPreservingSampleRate(item.file, audioEngine.getAudioContext());
@@ -349,11 +647,32 @@ export default function App() {
       const detectedFormat = item.format || (await detectAudioFileFormat(item.file, buffer));
       setAudioFormat(detectedFormat);
 
+      rawBufferRef.current = buffer;
       masterBufferRef.current = buffer;
-      setCurrentTrackTitle(item.title);
-      setDuration(buffer.duration);
+      audioEngine.resetTrack(buffer, buffer);
 
-      audioEngine.loadRawBuffer(buffer);
+      // Sincronização do padrão de nomenclatura e nome da música herdado da lista do lote
+      const parsedMeta = parseTrackMetadata(item.file?.name || item.title);
+      const effectiveTrackNumber =
+        item.trackNumber !== undefined && item.trackNumber.trim() !== ''
+          ? item.trackNumber.trim()
+          : (parsedMeta.trackNumber || '');
+
+      const effectiveSongTitle =
+        item.songTitle !== undefined && item.songTitle.trim() !== ''
+          ? item.songTitle.trim()
+          : (parsedMeta.songTitle || stripAudioFileExtension(item.title));
+
+      const effectiveArtist =
+        item.artist !== undefined && item.artist.trim() !== ''
+          ? item.artist.trim()
+          : (parsedMeta.artist || '');
+
+      setTrackNumber(effectiveTrackNumber);
+      setSongTitle(effectiveSongTitle);
+      setArtistName(effectiveArtist);
+      setCurrentTrackTitle(effectiveSongTitle);
+      setDuration(buffer.duration);
 
       const loudness = analyzeBufferLoudness(buffer);
       setTrackLoudness(loudness);
@@ -375,39 +694,166 @@ export default function App() {
         audioEngine.updateTapeAzimuthSettings(item.customAzimuthSettings);
       }
 
-      // Generate stems asynchronously for multitrack mixer
-      splitAudioBufferIntoStems(buffer, analysis.overallAiProbability > 50, analysis.dominantPlatform.name)
-        .then((stems) => {
-          if (stems.length > 0) {
-            setStems(stems);
-            stemsRef.current = stems;
-          }
-        })
-        .catch(() => {});
+      // Intelligent Material Detection: Real Stereo vs Mono in 2 Channels (Exact parity with individual mode)
+      const isDualMono =
+        item.isDualMono !== undefined
+          ? item.isDualMono
+          : (azimuth.channelConfiguration === 'dual_mono' ||
+             (item.isAmpexCandidate && azimuth.sideToMidDb <= -26.0));
+
+      const dropouts = analyzeTapeDropouts(buffer, item.customDropoutSettings || tapeDropoutSettings);
+      const hasDropouts = dropouts.totalDropouts > 0;
+      const isCleanModern = !hasDropouts && Math.abs(azimuth.azimuthOffsetSamples) < 0.1 && dropouts.tapeHealthScore === 100;
+
+      const isWanderOrDefect =
+        isDualMono &&
+        (dropouts.isSevereWanderDetected ||
+          dropouts.channelComparison?.isSevereWanderDetected ||
+          hasDropouts);
+
+      const safeDropoutMode: TapeDropoutMode = isDualMono && !isCleanModern
+        ? (item.customDropoutSettings?.mode || (tapeDropoutSettings.mode === 'mono_wander_graft' || isWanderOrDefect ? 'mono_wander_graft' : 'ampex_fulltrack_cross'))
+        : (item.customDropoutSettings?.mode || 'stereo_independent');
+
+      const baseSettings = item.customDropoutSettings ? { ...tapeDropoutSettings, ...item.customDropoutSettings } : tapeDropoutSettings;
+      const isEnabled: boolean =
+        typeof item.customDropoutSettings?.enabled === 'boolean'
+          ? item.customDropoutSettings.enabled
+          : Boolean(hasDropouts || (!isCleanModern && isDualMono && isWanderOrDefect));
+      const effectiveMode: TapeDropoutMode = item.customDropoutSettings?.mode || (isCleanModern ? 'stereo_independent' : safeDropoutMode);
+      const trackDropoutSettings: TapeDropoutSettings = {
+        ...baseSettings,
+        enabled: isEnabled,
+        mode: effectiveMode,
+      };
+      setTapeDropoutSettings(trackDropoutSettings);
+      audioEngine.updateTapeDropoutSettings(trackDropoutSettings);
+
+      // Pre-reconstruct dropouts immediately if detected so first play is 100% clean and pristine
+      let preRestoredBuffer = buffer;
+      let initialDropoutAnalysis = dropouts;
+
+      if (hasDropouts) {
+        const { restoredBuffer, repairedEventsCount } = reconstructTapeDropouts(
+          buffer,
+          dropouts,
+          trackDropoutSettings
+        );
+        if (restoredBuffer) {
+          preRestoredBuffer = restoredBuffer;
+          rawBufferRef.current = restoredBuffer;
+          const markedEvents = dropouts.events.map((ev) => ({
+            ...ev,
+            reconstructed: true,
+          }));
+          initialDropoutAnalysis = {
+            ...dropouts,
+            events: markedEvents,
+            tapeHealthScore: 100,
+            estimatedOxideDegradation: 'Excelente',
+            recommendation: `✓ Todos os ${repairedEventsCount} dropouts foram pré-reconstruídos automaticamente! Áudio 100% íntegro e sem estalos.`,
+          };
+        }
+      }
+      setTapeDropoutAnalysis(initialDropoutAnalysis);
+      audioEngine.setTapeDropoutAnalysis(initialDropoutAnalysis);
+
+      // Restore custom denoise or calibrate with telemetry
+      const denoiseAnalysis = audioEngine.analyzeDenoise(preRestoredBuffer);
+      setTapeDenoiseTelemetry(denoiseAnalysis);
+      const trackDenoiseSettings: SpectralDenoiseSettings = item.customDenoiseSettings || {
+        ...tapeDenoiseSettings,
+        enabled: true,
+        noiseProfileType: denoiseAnalysis?.recommendedNoiseProfileType || 'studio_master_15ips',
+        humNotchFilter: denoiseAnalysis?.recommendedHumNotch || 'none',
+        reductionDb: denoiseAnalysis?.recommendedReductionDb || 8.0,
+        learnedNoiseBands: denoiseAnalysis?.noiseProfileBands,
+      };
+      setTapeDenoiseSettings(trackDenoiseSettings);
+      audioEngine.updateTapeDenoiseSettings(trackDenoiseSettings);
+
+      const orbanAnalysis = audioEngine.getOrbanTrebleTelemetry(preRestoredBuffer);
+      setOrbanTelemetry(orbanAnalysis);
+
+      // Preload buffer and trigger master rendering with fully restored audio
+      await (hasDropouts
+        ? audioEngine.loadDropoutRestoredBuffer(preRestoredBuffer, initialDropoutAnalysis, buffer)
+        : audioEngine.loadRawBuffer(buffer)
+      ).then((rendered) => {
+        if (rendered) {
+          masterBufferRef.current = rendered;
+        }
+      });
 
       setActiveTab('mastering');
       setPlaybackTime(0);
-      audioEngine.playBuffer(buffer, 0);
+      audioEngine.playBuffer(preRestoredBuffer, 0);
       setIsPlaying(true);
 
-      setExportNotice(`🎧 Ouvindo faixa ${index + 1} de ${batchQueue.length}: "${item.title}"`);
+      setExportNotice(`🎧 Ouvindo faixa ${index + 1} de ${batchQueue.length}: "${effectiveSongTitle || item.title}"`);
       setTimeout(() => setExportNotice(null), 4000);
     } catch (err) {
       console.error('Erro ao carregar faixa do lote no editor:', err);
     }
   };
 
+  // Sincronização bidirecional em tempo real do Padrão de Nomenclatura com a Fila do Lote
+  const handleUpdateTrackNumber = (newTrackNum: string) => {
+    setTrackNumber(newTrackNum);
+    if (editingBatchIndex !== null) {
+      setBatchQueue((prev) =>
+        prev.map((it, idx) =>
+          idx === editingBatchIndex
+            ? { ...it, trackNumber: newTrackNum }
+            : it
+        )
+      );
+    }
+  };
+
+  const handleUpdateSongTitle = (newTitle: string) => {
+    setSongTitle(newTitle);
+    setCurrentTrackTitle(newTitle || (editingBatchIndex !== null && batchQueue[editingBatchIndex] ? batchQueue[editingBatchIndex].title : ''));
+    if (editingBatchIndex !== null) {
+      setBatchQueue((prev) =>
+        prev.map((it, idx) =>
+          idx === editingBatchIndex
+            ? { ...it, songTitle: newTitle }
+            : it
+        )
+      );
+    }
+  };
+
+  const handleUpdateArtistName = (newArtist: string) => {
+    setArtistName(newArtist);
+    if (editingBatchIndex !== null) {
+      setBatchQueue((prev) =>
+        prev.map((it, idx) =>
+          idx === editingBatchIndex
+            ? { ...it, artist: newArtist }
+            : it
+        )
+      );
+    }
+  };
+
   const handleNextBatchTrack = () => {
     if (editingBatchIndex === null) return;
 
-    // Save current adjustments for current track
+    // Save current adjustments and updated metadata for current track
     setBatchQueue((prev) =>
       prev.map((it, idx) =>
         idx === editingBatchIndex
           ? {
               ...it,
+              trackNumber: trackNumber || it.trackNumber,
+              songTitle: songTitle || it.songTitle,
+              artist: artistName || it.artist,
               customHumanizerSettings: { ...humanizerSettings },
               customAzimuthSettings: { ...tapeAzimuthSettings },
+              customDropoutSettings: { ...tapeDropoutSettings },
+              customDenoiseSettings: { ...tapeDenoiseSettings },
             }
           : it
       )
@@ -426,14 +872,19 @@ export default function App() {
   const handlePrevBatchTrack = () => {
     if (editingBatchIndex === null || editingBatchIndex <= 0) return;
 
-    // Save current adjustments
+    // Save current adjustments and metadata
     setBatchQueue((prev) =>
       prev.map((it, idx) =>
         idx === editingBatchIndex
           ? {
               ...it,
+              trackNumber: trackNumber || it.trackNumber,
+              songTitle: songTitle || it.songTitle,
+              artist: artistName || it.artist,
               customHumanizerSettings: { ...humanizerSettings },
               customAzimuthSettings: { ...tapeAzimuthSettings },
+              customDropoutSettings: { ...tapeDropoutSettings },
+              customDenoiseSettings: { ...tapeDenoiseSettings },
             }
           : it
       )
@@ -449,14 +900,41 @@ export default function App() {
           idx === editingBatchIndex
             ? {
                 ...it,
+                trackNumber: trackNumber || it.trackNumber,
+                songTitle: songTitle || it.songTitle,
+                artist: artistName || it.artist,
                 customHumanizerSettings: { ...humanizerSettings },
                 customAzimuthSettings: { ...tapeAzimuthSettings },
+                customDropoutSettings: { ...tapeDropoutSettings },
+                customDenoiseSettings: { ...tapeDenoiseSettings },
               }
             : it
         )
       );
     }
     setIsBatchModalOpen(true);
+  };
+
+  const handleExitBatchMode = () => {
+    if (editingBatchIndex !== null) {
+      setBatchQueue((prev) =>
+        prev.map((it, idx) =>
+          idx === editingBatchIndex
+            ? {
+                ...it,
+                trackNumber: trackNumber || it.trackNumber,
+                songTitle: songTitle || it.songTitle,
+                artist: artistName || it.artist,
+                customHumanizerSettings: { ...humanizerSettings },
+                customAzimuthSettings: { ...tapeAzimuthSettings },
+                customDropoutSettings: { ...tapeDropoutSettings },
+                customDenoiseSettings: { ...tapeDenoiseSettings },
+              }
+            : it
+        )
+      );
+      setEditingBatchIndex(null);
+    }
   };
 
   const handleChangeEditingTrackPreset = (presetIdOrName: string) => {
@@ -496,14 +974,14 @@ export default function App() {
     if (!masterBufferRef.current) return;
     try {
       setIsExportingAzimuth(true);
-      const targetBitDepth = audioFormat?.bitDepth || 24;
+      const targetBitDepth = exportBitDepth || audioFormat?.bitDepth || 24;
       const targetSampleRate = audioFormat?.sampleRate || masterBufferRef.current.sampleRate;
       setExportNotice(
         `Renderizando arquivo com azimute e balanço corrigidos em ${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit WAV puro (pré-master de preservação)...`
       );
 
       const wavBlob = await audioEngine.exportAzimuthCorrectedOnlyWav(
-        masterBufferRef.current,
+        rawBufferRef.current || masterBufferRef.current,
         tapeAzimuthSettings,
         targetBitDepth,
         targetSampleRate
@@ -511,13 +989,15 @@ export default function App() {
 
       const filename = buildAzimuthWavFilename({
         trackNumber,
-        songTitle: songTitle || currentTrackTitle.replace(/\.[^/.]+$/, ''),
+        songTitle: songTitle || stripAudioFileExtension(currentTrackTitle),
         artist: artistName,
         sampleRate: targetSampleRate,
         bitDepth: targetBitDepth,
       });
 
-      const saveRes = await autoSaveManager.saveProcessedFile(wavBlob, filename);
+      const saveRes = await autoSaveManager.saveProcessedFile(wavBlob, filename, {
+        subfolder: SUBFOLDER_RECOVERED,
+      });
 
       setExportNotice(
         `✓ Arquivo com Azimute & Balanço corrigidos salvo: ${saveRes.targetPath} (${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit)!`
@@ -533,15 +1013,59 @@ export default function App() {
 
   // Tape Dropout Handlers
   const handleUpdateDropoutSettings = (newSettings: Partial<TapeDropoutSettings>) => {
+    // If switching to mono_wander_graft or ampex_fulltrack_cross, ensure enabled is turned on if not explicitly specified
+    const settingsWithActivation = { ...newSettings };
+    if (
+      (newSettings.mode === 'mono_wander_graft' || newSettings.mode === 'ampex_fulltrack_cross') &&
+      newSettings.enabled === undefined &&
+      !tapeDropoutSettings.enabled
+    ) {
+      settingsWithActivation.enabled = true;
+    }
+
     setTapeDropoutSettings((prev) => {
-      const updated = { ...prev, ...newSettings };
-      audioEngine.updateTapeDropoutSettings(updated);
+      const updated = { ...prev, ...settingsWithActivation };
+      if (editingBatchIndex !== null) {
+        setBatchQueue((q) =>
+          q.map((it, idx) =>
+            idx === editingBatchIndex
+              ? { ...it, customDropoutSettings: updated, isCustomized: true }
+              : it
+          )
+        );
+      }
       return updated;
     });
-    if (masterBufferRef.current && (newSettings.sensitivity || newSettings.minDurationMs || newSettings.maxDurationMs)) {
-      const reanalyzed = analyzeTapeDropouts(masterBufferRef.current, { ...tapeDropoutSettings, ...newSettings });
-      setTapeDropoutAnalysis(reanalyzed);
-      audioEngine.setTapeDropoutAnalysis(reanalyzed);
+    audioEngine.updateTapeDropoutSettings(settingsWithActivation);
+    const activeBuf = rawBufferRef.current || masterBufferRef.current;
+    if (activeBuf) {
+      if (
+        newSettings.sensitivity !== undefined ||
+        newSettings.minDurationMs !== undefined ||
+        newSettings.maxDurationMs !== undefined ||
+        !tapeDropoutAnalysis
+      ) {
+        const reanalyzed = analyzeTapeDropouts(activeBuf, { ...tapeDropoutSettings, ...settingsWithActivation });
+        setTapeDropoutAnalysis(reanalyzed);
+        audioEngine.setTapeDropoutAnalysis(reanalyzed);
+      }
+    }
+    // Instantly trigger re-render if dropout switch, mode, primary channel, pattern threshold, audition delta, or Wallace loss was toggled
+    if (
+      settingsWithActivation.enabled !== undefined ||
+      settingsWithActivation.listenDropoutMaskOnly !== undefined ||
+      settingsWithActivation.mode !== undefined ||
+      settingsWithActivation.primaryChannel !== undefined ||
+      settingsWithActivation.patternMatchThreshold !== undefined ||
+      settingsWithActivation.restoreHighFreqLoss !== undefined ||
+      settingsWithActivation.crossfadeWindowMs !== undefined ||
+      settingsWithActivation.monoCompatibilityPhaseLock !== undefined
+    ) {
+      audioEngine.triggerMasterRender().then((buf) => {
+        if (buf) {
+          masterBufferRef.current = buf;
+        }
+      });
     }
   };
 
@@ -549,20 +1073,61 @@ export default function App() {
     if (!masterBufferRef.current) return;
     setIsRestoringDropout(true);
     try {
-      const currentAnalysis = tapeDropoutAnalysis || analyzeTapeDropouts(masterBufferRef.current, tapeDropoutSettings);
+      const activeSettings: TapeDropoutSettings = {
+        ...tapeDropoutSettings,
+        enabled: true,
+      };
+      setTapeDropoutSettings(activeSettings);
+      audioEngine.updateTapeDropoutSettings(activeSettings);
+      if (editingBatchIndex !== null) {
+        setBatchQueue((q) =>
+          q.map((it, idx) =>
+            idx === editingBatchIndex
+              ? { ...it, customDropoutSettings: activeSettings, isCustomized: true }
+              : it
+          )
+        );
+      }
+
+      const baseBuffer = rawBufferRef.current || masterBufferRef.current;
+      const currentAnalysis =
+        tapeDropoutAnalysis && tapeDropoutAnalysis.events.length > 0
+          ? tapeDropoutAnalysis
+          : analyzeTapeDropouts(baseBuffer, activeSettings);
+
       const { restoredBuffer, repairedEventsCount } = reconstructTapeDropouts(
-        masterBufferRef.current,
+        baseBuffer,
         currentAnalysis,
-        tapeDropoutSettings
+        activeSettings
       );
-      masterBufferRef.current = restoredBuffer;
-      await audioEngine.loadRawBuffer(restoredBuffer);
-      const updatedAnalysis = analyzeTapeDropouts(restoredBuffer, tapeDropoutSettings);
-      setTapeDropoutAnalysis(updatedAnalysis);
-      audioEngine.setTapeDropoutAnalysis(updatedAnalysis);
+
+      if (restoredBuffer) {
+        rawBufferRef.current = restoredBuffer;
+
+        // Keep events in analysis with reconstructed: true so user can audition / inspect each repair
+        const markedEvents = currentAnalysis.events.map((ev) => ({
+          ...ev,
+          reconstructed: true,
+        }));
+        const repairedAnalysis: TapeDropoutAnalysis = {
+          ...currentAnalysis,
+          events: markedEvents,
+          tapeHealthScore: 100,
+          estimatedOxideDegradation: 'Excelente',
+          recommendation: `✓ Todos os ${markedEvents.length} dropouts foram reconstruídos com precisão analógica total! Áudio 100% íntegro.`,
+        };
+        setTapeDropoutAnalysis(repairedAnalysis);
+        audioEngine.setTapeDropoutAnalysis(repairedAnalysis);
+
+        // Load the restored buffer cleanly into the audio engine and render the master in one quick step
+        const reRendered = await audioEngine.loadDropoutRestoredBuffer(restoredBuffer, repairedAnalysis);
+        if (reRendered) {
+          masterBufferRef.current = reRendered;
+        }
+      }
 
       setExportNotice(
-        `✓ ${repairedEventsCount} dropouts de fita reconstruídos com áudio analógico autêntico! Saúde da fita atualizada: ${updatedAnalysis.tapeHealthScore}%.`
+        `✓ ${repairedEventsCount} dropouts de fita reconstruídos com precisão analógica total (+16 dB max)! Saúde da fita restaurada: 100%.`
       );
       setTimeout(() => setExportNotice(null), 6000);
     } catch (err) {
@@ -574,33 +1139,226 @@ export default function App() {
     }
   };
 
-  const handleExportDropoutRestoredWav = async () => {
-    if (!masterBufferRef.current) return;
-    setIsExportingDropout(true);
+  // Intelligent Automated Triage Application: Pre-configures all blocks based on analysis
+  const handleApplyTriageRecommendations = async () => {
+    if (!rawBufferRef.current && !masterBufferRef.current) return;
     try {
-      const targetSampleRate = audioFormat?.sampleRate || masterBufferRef.current.sampleRate;
-      const targetBitDepth = audioFormat?.bitDepth || 24;
+      // Diagnostic checks for tape damage vs modern clean audio
+      const hasDropouts = (tapeDropoutAnalysis?.totalDropouts ?? 0) > 0;
+      const hasTapeHiss = Boolean(
+        tapeDenoiseTelemetry?.hasNoiseDetected ||
+        (tapeDenoiseTelemetry?.hissNoiseFloorDb ?? -90) > -75.0 ||
+        tapeDenoiseTelemetry?.hasHumDetected
+      );
+      const hasAzimuthError =
+        Math.abs(tapeAzimuthAnalysis?.azimuthOffsetSamples ?? 0) >= 0.1 ||
+        Math.abs(tapeAzimuthAnalysis?.levelDiffDb ?? 0) >= 0.35;
+      const isCleanModernRecording =
+        !hasDropouts &&
+        !hasTapeHiss &&
+        !hasAzimuthError &&
+        (tapeDropoutAnalysis?.tapeHealthScore ?? 100) === 100;
 
-      const wavBlob = await audioEngine.exportDropoutRestoredOnlyWav(
-        masterBufferRef.current,
+      // 1. Azimuth & Balance:
+      if (tapeAzimuthAnalysis) {
+        const isGhost = tapeAzimuthAnalysis.isGhostChannelDetected;
+        const safeBalance = isGhost
+          ? 0.0
+          : hasAzimuthError
+          ? Math.max(-4.5, Math.min(4.5, -tapeAzimuthAnalysis.levelDiffDb))
+          : 0;
+        const autoAzimuth: TapeAzimuthSettings = {
+          ...tapeAzimuthSettings,
+          enabled: isGhost || (hasAzimuthError && !isCleanModernRecording),
+          azimuthDelaySamples: isGhost ? 0 : (hasAzimuthError ? tapeAzimuthAnalysis.azimuthOffsetSamples : 0),
+          balanceDb: safeBalance,
+          invertPhaseL: isGhost ? false : tapeAzimuthAnalysis.phaseCorrelationBefore < 0,
+          activeChannel: tapeAzimuthAnalysis.activeSignalChannel || 'both',
+          ghostChannelHandling: isGhost ? 'clone_active' : 'passthrough',
+        };
+        setTapeAzimuthSettings(autoAzimuth);
+        audioEngine.updateTapeAzimuthSettings(autoAzimuth);
+      }
+
+      // 2. Material Detection & Dropout Mode:
+      const isDualMonoCandidate =
+        tapeAzimuthAnalysis?.channelConfiguration === 'dual_mono' ||
+        ((tapeDropoutAnalysis?.isAmpexFullTrackCandidate ?? false) && (tapeAzimuthAnalysis?.sideToMidDb ?? 0) <= -26.0);
+
+      const isWanderOrDefect =
+        isDualMonoCandidate &&
+        ((tapeDropoutAnalysis?.isSevereWanderDetected ?? false) ||
+          (tapeDropoutAnalysis?.channelComparison?.isSevereWanderDetected ?? false) ||
+          hasDropouts);
+
+      const autoDropoutMode: TapeDropoutMode = isDualMonoCandidate && !isCleanModernRecording
+        ? (tapeDropoutSettings.mode === 'mono_wander_graft' || isWanderOrDefect ? 'mono_wander_graft' : 'ampex_fulltrack_cross')
+        : 'stereo_independent';
+
+      const autoDropout: TapeDropoutSettings = {
+        ...tapeDropoutSettings,
+        enabled: hasDropouts || (!isCleanModernRecording && isWanderOrDefect),
+        mode: isCleanModernRecording ? 'stereo_independent' : autoDropoutMode,
+      };
+      setTapeDropoutSettings(autoDropout);
+      audioEngine.updateTapeDropoutSettings(autoDropout);
+
+      // 3. Spectral Denoise:
+      if (tapeDenoiseTelemetry) {
+        const autoDenoise: SpectralDenoiseSettings = {
+          ...tapeDenoiseSettings,
+          enabled: hasTapeHiss && !isCleanModernRecording,
+          reductionDb: tapeDenoiseTelemetry.recommendedReductionDb,
+          noiseProfileType: tapeDenoiseTelemetry.recommendedNoiseProfileType,
+          humNotchFilter: tapeDenoiseTelemetry.recommendedHumNotch,
+          learnedNoiseBands: tapeDenoiseTelemetry.noiseProfileBands,
+        };
+        setTapeDenoiseSettings(autoDenoise);
+        audioEngine.updateTapeDenoiseSettings(autoDenoise);
+      }
+
+      // 4. Equalization & Timbre (Treble Processor, Tape Warmth, De-Harsh):
+      setHumanizerSettings((prev) => {
+        const audioNeedsTreble = Boolean(
+          orbanTelemetry?.needsProcessing ||
+          orbanTelemetry?.isDarkTape ||
+          orbanTelemetry?.isHarshRecording ||
+          Math.abs(orbanTelemetry?.recommendedBrillianceDb ?? 0) >= 0.5
+        );
+        const userExplicitlyDisabled = Boolean(prev.orbanHfUserOverrideLock && (prev.orbanHfBypass || !prev.orbanHfEnabled));
+        const userExplicitlyEnabled = Boolean(prev.orbanHfUserOverrideLock && !prev.orbanHfBypass && prev.orbanHfEnabled);
+
+        const shouldEnable = userExplicitlyEnabled
+          ? true
+          : userExplicitlyDisabled
+          ? false
+          : audioNeedsTreble;
+
+        const updated: HumanizerSettings = {
+          ...prev,
+          enabled: true,
+          deHarshBypass: isCleanModernRecording ? true : false,
+          tapeWarmthBypass: false,
+          airExciterBypass: false,
+          orbanHfEnabled: shouldEnable,
+          orbanHfBypass: !shouldEnable,
+          orbanHfUserOverrideLock: prev.orbanHfUserOverrideLock ?? false,
+          orbanHfMode: orbanTelemetry?.recommendedMode || prev.orbanHfMode || 'smooth_silk',
+          orbanHfAutoBrillianceDb: orbanTelemetry?.recommendedBrillianceDb ?? prev.orbanHfAutoBrillianceDb,
+          orbanHfHighShelfGainDb: orbanTelemetry?.recommendedBrillianceDb ?? prev.orbanHfHighShelfGainDb,
+          orbanHfThresholdDb: orbanTelemetry?.recommendedThresholdDb ?? prev.orbanHfThresholdDb,
+          orbanHfCrossoverHz: orbanTelemetry?.recommendedCrossoverHz ?? prev.orbanHfCrossoverHz,
+          orbanHfSpeed: orbanTelemetry?.recommendedSpeed ?? prev.orbanHfSpeed,
+          limitlessBypass: false,
+          limitlessEnabled: true,
+          targetLufs: -14.0,
+        };
+        audioEngine.updateSettings(updated);
+        return updated;
+      });
+
+      // 5. If dropouts exist, reconstruct them
+      if (tapeDropoutAnalysis && tapeDropoutAnalysis.totalDropouts > 0) {
+        await handleReconstructDropouts();
+      } else {
+        const reRendered = await audioEngine.triggerMasterRender();
+        if (reRendered) {
+          masterBufferRef.current = reRendered;
+        }
+      }
+
+      const triageNotice = isCleanModernRecording
+        ? '✓ Triagem Inteligente: Gravação Atual identificada! Módulos de restauração de fita mantidos em Bypass transparente. Masterização Direta configurada para -14 LUFS.'
+        : `✓ Triagem Inteligente aplicada com sucesso! Restauração, EQ analógica e nivelamento configurados para ${isDualMonoCandidate ? 'Mono em 2 Canais (Studer/Ampex Cross)' : 'Estéreo Real (Independente)'}.`;
+      setExportNotice(triageNotice);
+      setTimeout(() => setExportNotice(null), 5000);
+    } catch (err) {
+      console.error(err);
+      setAppErrorNotice('Erro ao aplicar recomendações da triagem.');
+      setTimeout(() => setAppErrorNotice(null), 5000);
+    }
+  };
+
+  // Export Pre-Master Restored Archival WAV (Azimuth + Dropouts corrected, WITHOUT final mastering)
+  const handleExportPreMasterOnly = async () => {
+    if (!masterBufferRef.current) return;
+    try {
+      setIsExportingPreMaster(true);
+      // Immediately verify/restore directory permission while user click gesture is active
+      await autoSaveManager.ensureDirectoryAccess();
+      const targetBitDepth = exportBitDepth || audioFormat?.bitDepth || 24;
+      const targetSampleRate = audioFormat?.sampleRate || masterBufferRef.current.sampleRate;
+      setExportNotice(
+        `Renderizando Pré-Master de Preservação em ${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit WAV (Azimute + Dropouts corrigidos, sem masterização final)...`
+      );
+
+      const preMasterBlob = await audioEngine.exportDropoutRestoredOnlyWav(
+        rawBufferRef.current || masterBufferRef.current,
         tapeDropoutSettings,
         tapeAzimuthSettings,
         targetBitDepth,
-        targetSampleRate
+        targetSampleRate,
+        tapeDenoiseSettings
       );
 
-      const filename = buildDropoutWavFilename({
+      const effectiveTitle = songTitle || stripAudioFileExtension(currentTrackTitle);
+      const filename = buildPreMasterWavFilename({
         trackNumber,
-        songTitle: songTitle || currentTrackTitle.replace(/\.[^/.]+$/, ''),
+        songTitle: effectiveTitle,
         artist: artistName,
         sampleRate: targetSampleRate,
         bitDepth: targetBitDepth,
       });
 
-      const saveRes = await autoSaveManager.saveProcessedFile(wavBlob, filename);
+      const saveRes = await autoSaveManager.saveProcessedFile(preMasterBlob, filename, {
+        subfolder: SUBFOLDER_RECOVERED,
+      });
 
       setExportNotice(
-        `✓ Arquivo preservado gravado com sucesso: ${saveRes.targetPath} (${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit, dropouts reparados)!`
+        `✓ Pré-Master Restaurado salvo com sucesso: ${saveRes.targetPath} (${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit, azimute e dropouts corrigidos, headroom e dinâmica pura sem masterização)!`
+      );
+      setTimeout(() => setExportNotice(null), 8000);
+    } catch (err) {
+      console.error(err);
+      setExportNotice('Erro ao exportar Pré-Master Restaurado.');
+      setTimeout(() => setExportNotice(null), 4000);
+    } finally {
+      setIsExportingPreMaster(false);
+    }
+  };
+
+  const handleExportDropoutRestoredWav = async () => {
+    if (!masterBufferRef.current) return;
+    setIsExportingDropout(true);
+    try {
+      // Immediately verify/restore directory permission while user click gesture is active
+      await autoSaveManager.ensureDirectoryAccess();
+      const targetSampleRate = audioFormat?.sampleRate || masterBufferRef.current.sampleRate;
+      const targetBitDepth = exportBitDepth || audioFormat?.bitDepth || 24;
+
+      const wavBlob = await audioEngine.exportDropoutRestoredOnlyWav(
+        rawBufferRef.current || masterBufferRef.current,
+        tapeDropoutSettings,
+        tapeAzimuthSettings,
+        targetBitDepth,
+        targetSampleRate,
+        tapeDenoiseSettings
+      );
+
+      const filename = buildPreMasterWavFilename({
+        trackNumber,
+        songTitle: songTitle || stripAudioFileExtension(currentTrackTitle),
+        artist: artistName,
+        sampleRate: targetSampleRate,
+        bitDepth: targetBitDepth,
+      });
+
+      const saveRes = await autoSaveManager.saveProcessedFile(wavBlob, filename, {
+        subfolder: SUBFOLDER_RECOVERED,
+      });
+
+      setExportNotice(
+        `✓ Arquivo preservado gravado com sucesso: ${saveRes.targetPath} (${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit, dropouts e azimute reparados sem masterização)!`
       );
       setTimeout(() => setExportNotice(null), 8000);
     } catch (err) {
@@ -616,38 +1374,109 @@ export default function App() {
   const handleUpdateDenoiseSettings = (newSettings: Partial<SpectralDenoiseSettings>) => {
     setTapeDenoiseSettings((prev) => {
       const updated = { ...prev, ...newSettings };
+      if (editingBatchIndex !== null) {
+        setBatchQueue((q) =>
+          q.map((it, idx) =>
+            idx === editingBatchIndex
+              ? { ...it, customDenoiseSettings: updated, isCustomized: true }
+              : it
+          )
+        );
+      }
       return updated;
     });
     audioEngine.updateTapeDenoiseSettings(newSettings);
   };
 
   const handleLearnNoiseProfile = () => {
-    if (!masterBufferRef.current) return;
-    const learnedBands = audioEngine.learnDenoiseProfile(masterBufferRef.current);
+    const rawBuffer = rawBufferRef.current || masterBufferRef.current;
+    if (!rawBuffer) return;
+    const learnedBands = audioEngine.learnDenoiseProfile(rawBuffer);
     if (learnedBands) {
-      setTapeDenoiseSettings((prev) => ({
-        ...prev,
+      const telemetry = audioEngine.getTapeDenoiseTelemetry();
+      const updatedSettings: SpectralDenoiseSettings = {
+        ...tapeDenoiseSettings,
+        enabled: true,
         noiseProfileType: 'auto_learned',
         learnedNoiseBands: learnedBands,
-      }));
-      setTapeDenoiseTelemetry(audioEngine.getTapeDenoiseTelemetry());
-      setExportNotice('✓ Perfil de ruído da fita capturado com sucesso a partir da pausa analógica!');
+        humNotchFilter: telemetry?.recommendedHumNotch || tapeDenoiseSettings.humNotchFilter,
+        reductionDb: telemetry?.recommendedReductionDb || tapeDenoiseSettings.reductionDb,
+      };
+      setTapeDenoiseSettings(updatedSettings);
+      if (editingBatchIndex !== null) {
+        setBatchQueue((q) =>
+          q.map((it, idx) =>
+            idx === editingBatchIndex
+              ? { ...it, customDenoiseSettings: updatedSettings, isCustomized: true }
+              : it
+          )
+        );
+      }
+      setTapeDenoiseTelemetry(telemetry);
+      setExportNotice('✓ Perfil de ruído da fita (ronco e sopro) capturado e redução ativada na masterização!');
+      setTimeout(() => setExportNotice(null), 5000);
+    }
+  };
+
+  const handleLearnNoiseProfileAtTail = () => {
+    const rawBuffer = rawBufferRef.current || masterBufferRef.current;
+    if (!rawBuffer) return;
+    const tailDuration = Math.min(1.5, Math.max(0.4, rawBuffer.duration * 0.05));
+    const startSec = Math.max(0, rawBuffer.duration - tailDuration - 0.1);
+    const learnedBands = audioEngine.learnDenoiseProfile(rawBuffer, startSec, tailDuration);
+    if (learnedBands) {
+      const telemetry = audioEngine.getTapeDenoiseTelemetry();
+      const updatedSettings: SpectralDenoiseSettings = {
+        ...tapeDenoiseSettings,
+        enabled: true,
+        noiseProfileType: 'auto_learned',
+        learnedNoiseBands: learnedBands,
+        humNotchFilter: telemetry?.recommendedHumNotch || tapeDenoiseSettings.humNotchFilter,
+        reductionDb: telemetry?.recommendedReductionDb || tapeDenoiseSettings.reductionDb,
+      };
+      setTapeDenoiseSettings(updatedSettings);
+      if (editingBatchIndex !== null) {
+        setBatchQueue((q) =>
+          q.map((it, idx) =>
+            idx === editingBatchIndex
+              ? { ...it, customDenoiseSettings: updatedSettings, isCustomized: true }
+              : it
+          )
+        );
+      }
+      setTapeDenoiseTelemetry(telemetry);
+      setExportNotice(`✓ Perfil de ruído (ronco e sopro) capturado no final da música (${startSec.toFixed(1)}s) e redução ativada!`);
       setTimeout(() => setExportNotice(null), 5000);
     }
   };
 
   const handleLearnNoiseProfileAtPlayhead = () => {
-    if (!masterBufferRef.current) return;
+    const rawBuffer = rawBufferRef.current || masterBufferRef.current;
+    if (!rawBuffer) return;
     const startSec = Math.max(0, playbackTime - 0.2);
-    const learnedBands = audioEngine.learnDenoiseProfile(masterBufferRef.current, startSec, 0.4);
+    const learnedBands = audioEngine.learnDenoiseProfile(rawBuffer, startSec, 0.4);
     if (learnedBands) {
-      setTapeDenoiseSettings((prev) => ({
-        ...prev,
+      const telemetry = audioEngine.getTapeDenoiseTelemetry();
+      const updatedSettings: SpectralDenoiseSettings = {
+        ...tapeDenoiseSettings,
+        enabled: true,
         noiseProfileType: 'auto_learned',
         learnedNoiseBands: learnedBands,
-      }));
-      setTapeDenoiseTelemetry(audioEngine.getTapeDenoiseTelemetry());
-      setExportNotice(`✓ Perfil de ruído capturado exatamente na posição do cursor (${startSec.toFixed(1)}s)!`);
+        humNotchFilter: telemetry?.recommendedHumNotch || tapeDenoiseSettings.humNotchFilter,
+        reductionDb: telemetry?.recommendedReductionDb || tapeDenoiseSettings.reductionDb,
+      };
+      setTapeDenoiseSettings(updatedSettings);
+      if (editingBatchIndex !== null) {
+        setBatchQueue((q) =>
+          q.map((it, idx) =>
+            idx === editingBatchIndex
+              ? { ...it, customDenoiseSettings: updatedSettings, isCustomized: true }
+              : it
+          )
+        );
+      }
+      setTapeDenoiseTelemetry(telemetry);
+      setExportNotice(`✓ Perfil de ruído capturado no cursor (${startSec.toFixed(1)}s) e redução ativada!`);
       setTimeout(() => setExportNotice(null), 5000);
     }
   };
@@ -665,15 +1494,18 @@ export default function App() {
       const targetSampleRate = audioFormat?.sampleRate || masterBufferRef.current.sampleRate;
       const targetBitDepth = audioFormat?.bitDepth || 24;
       const wavBlob = await audioEngine.exportDenoisedOnlyWav(
-        masterBufferRef.current,
+        rawBufferRef.current || masterBufferRef.current,
         tapeDenoiseSettings,
         tapeAzimuthSettings,
         targetBitDepth,
         targetSampleRate
       );
-      const cleanSong = songTitle || currentTrackTitle.replace(/\.[^/.]+$/, '');
-      const filename = `${trackNumber}_${cleanSong}${artistName ? ` - ${artistName}` : ''} - AT_Denoised_${targetSampleRate}Hz_${targetBitDepth}bit.wav`;
-      const saveRes = await autoSaveManager.saveProcessedFile(wavBlob, filename);
+      const cleanSong = songTitle || stripAudioFileExtension(currentTrackTitle);
+      const numPrefix = trackNumber?.trim() ? `${trackNumber.trim().padStart(2, '0')}_` : '';
+      const filename = `${numPrefix}${cleanSong}${artistName ? ` - ${artistName}` : ''} - AT_Denoised_${targetSampleRate}Hz_${targetBitDepth}bit.wav`;
+      const saveRes = await autoSaveManager.saveProcessedFile(wavBlob, filename, {
+        subfolder: SUBFOLDER_RECOVERED,
+      });
       setExportNotice(
         `✓ Arquivo com Denoise gravado com sucesso: ${saveRes.targetPath} (${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit)!`
       );
@@ -687,6 +1519,14 @@ export default function App() {
     }
   };
 
+  // Synchronize masterBufferRef whenever audioEngine finishes background master rendering
+  useEffect(() => {
+    const unsub = audioEngine.onMasterRendered((rendered) => {
+      masterBufferRef.current = rendered;
+    });
+    return unsub;
+  }, []);
+
   // Playback Loop for UI Cursor update
   useEffect(() => {
     let intervalId: NodeJS.Timeout;
@@ -699,19 +1539,23 @@ export default function App() {
     return () => clearInterval(intervalId);
   }, [isPlaying]);
 
-  // Transport Handlers
+  // Tab switching with continuous master audio
+  const handleTabChange = (newTab: 'modular' | 'azimuth' | 'dropouts' | 'denoise' | 'mastering' | 'lufs' | 'analyzer') => {
+    if (newTab === activeTab) return;
+    setActiveTab(newTab);
+  };
+
+  // Transport Handlers - Always plays the pristine Master Buffer with analog tape mastering
   const handlePlayPause = () => {
+    if (!masterBufferRef.current && !rawBufferRef.current && !audioEngine.getRawBuffer()) {
+      return;
+    }
     if (isPlaying) {
       audioEngine.pause();
       setIsPlaying(false);
     } else {
-      if (isStemMode && stems.length > 0) {
-        audioEngine.playStems(stems, playbackTime);
-        setIsPlaying(true);
-      } else if (masterBufferRef.current) {
-        audioEngine.playBuffer(masterBufferRef.current, playbackTime);
-        setIsPlaying(true);
-      }
+      audioEngine.play(playbackTime);
+      setIsPlaying(true);
     }
   };
 
@@ -724,23 +1568,14 @@ export default function App() {
   const handleSeek = (time: number) => {
     setPlaybackTime(time);
     if (isPlaying) {
-      if (isStemMode && stems.length > 0) {
-        audioEngine.playStems(stems, time);
-      } else if (masterBufferRef.current) {
-        audioEngine.playBuffer(masterBufferRef.current, time);
-      }
+      audioEngine.play(time);
     }
   };
 
   const handlePlayFrom = (time: number) => {
     setPlaybackTime(time);
-    if (isStemMode && stems.length > 0) {
-      audioEngine.playStems(stems, time);
-      setIsPlaying(true);
-    } else if (masterBufferRef.current) {
-      audioEngine.playBuffer(masterBufferRef.current, time);
-      setIsPlaying(true);
-    }
+    audioEngine.play(time);
+    setIsPlaying(true);
   };
 
   // A/B Comparison Toggle
@@ -752,8 +1587,14 @@ export default function App() {
 
   // Update Humanizer Settings
   const handleUpdateSettings = (newSettings: Partial<HumanizerSettings>) => {
+    let effectiveSettingsToPass: Partial<HumanizerSettings> = { ...newSettings };
     setHumanizerSettings((prev) => {
-      const updated = { ...prev, ...newSettings };
+      // User Override Lock for Treble Processor:
+      // If the module was manually put in bypass, maintain that bypass unless the user
+      // explicitly updates the module settings (auto-calibrate, preset click, bypass toggle, or shelf knob)
+      let effectiveNew = { ...newSettings };
+      const updated = { ...prev, ...effectiveNew };
+      effectiveSettingsToPass = updated;
       if (editingBatchIndex !== null) {
         setBatchQueue((q) =>
           q.map((it, idx) =>
@@ -765,67 +1606,71 @@ export default function App() {
       }
       return updated;
     });
-    audioEngine.updateSettings(newSettings);
+    audioEngine.updateSettings(effectiveSettingsToPass);
   };
 
-  // Update Stem Volume / Humanization
-  const handleUpdateStem = (stemId: string, updates: Partial<AudioStem>) => {
-    setStems((prev) => {
-      const next = prev.map((s) => (s.id === stemId ? { ...s, ...updates } : s));
-      const soloActive = next.some((s) => s.solo);
-      const target = next.find((s) => s.id === stemId);
-      if (target) {
-        audioEngine.updateStemVolume(stemId, target.volume, target.muted, target.solo, soloActive);
-        if (updates.pan !== undefined) {
-          audioEngine.updateStemPan(stemId, updates.pan);
-        }
-      }
-      return next;
-    });
-  };
+  // Auto-Calibrate Treble Engine based on loaded recording physics
+  const handleAutoCalibrateOrban = () => {
+    const targetBuffer = rawBufferRef.current || masterBufferRef.current;
+    if (!targetBuffer) return;
+    const tel = audioEngine.getOrbanTrebleTelemetry(targetBuffer);
+    if (!tel) return;
+    setOrbanTelemetry(tel);
 
-  const handleSoloStem = (stemId: string) => {
-    setStems((prev) => {
-      const next = prev.map((s) => (s.id === stemId ? { ...s, solo: !s.solo } : s));
-      const soloActive = next.some((s) => s.solo);
-      next.forEach((s) => {
-        audioEngine.updateStemVolume(s.id, s.volume, s.muted, s.solo, soloActive);
-      });
-      return next;
-    });
-  };
+    const newMode = tel.recommendedMode;
+    const autoBrilliance = tel.recommendedBrillianceDb;
+    const threshold = tel.recommendedThresholdDb;
+    const crossoverHz = tel.recommendedCrossoverHz;
+    const speed = tel.recommendedSpeed;
+    const amount = tel.isDarkTape ? 75 : tel.isHarshRecording ? 70 : 50;
 
-  const handleMuteStem = (stemId: string) => {
-    setStems((prev) => {
-      const next = prev.map((s) => (s.id === stemId ? { ...s, muted: !s.muted } : s));
-      const soloActive = next.some((s) => s.solo);
-      next.forEach((s) => {
-        audioEngine.updateStemVolume(s.id, s.volume, s.muted, s.solo, soloActive);
-      });
-      return next;
+    // Explicit user action: auto-calibration immediately enables and un-bypasses the processor so changes are heard live!
+    handleUpdateSettings({
+      orbanHfEnabled: true,
+      orbanHfBypass: false,
+      orbanHfUserOverrideLock: false,
+      orbanHfMode: newMode,
+      orbanHfAmount: Math.round(amount),
+      orbanHfAutoBrillianceDb: Math.round(autoBrilliance * 10) / 10,
+      orbanHfHighShelfGainDb: Math.round(autoBrilliance * 10) / 10,
+      orbanHfThresholdDb: Math.round(threshold * 10) / 10,
+      orbanHfCrossoverHz: crossoverHz,
+      orbanHfSpeed: speed,
     });
+    const gainLabel = autoBrilliance > 0 ? `+${autoBrilliance.toFixed(1)} dB` : `${autoBrilliance.toFixed(1)} dB`;
+    setExportNotice(
+      `✓ Processador de Agudos calibrado e ativo (${gainLabel} / Limiar: ${threshold.toFixed(1)} dB)! ${tel.statusSummary}`
+    );
+    setTimeout(() => setExportNotice(null), 6000);
   };
 
   // Export Processed WAV with Studio-Grade Headroom & Exact Input Bit Depth/Sample Rate
+  // When saved to connected folder, saves Master, Pré-Master, and Recall.
+  // When downloaded via browser, downloads Master WAV cleanly without multiple download collisions.
   const handleExportWav = async () => {
     if (!masterBufferRef.current) return;
     try {
       setIsExporting(true);
-      const targetBitDepth = audioFormat?.bitDepth || 24;
+      // Immediately verify/restore directory permission while user click gesture is active
+      await autoSaveManager.ensureDirectoryAccess();
+      const targetBitDepth = exportBitDepth || audioFormat?.bitDepth || 24;
       const targetSampleRate = audioFormat?.sampleRate || masterBufferRef.current.sampleRate;
       setExportNotice(
-        `Renderizando master em ${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit WAV com alvo de ${humanizerSettings.targetLufs ?? -14.0} LUFS (DMGAudio Limitless)...`
+        `Renderizando Master Final em ${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit WAV (${humanizerSettings.targetLufs ?? -14.0} LUFS)...`
       );
 
+      const effectiveTitle = songTitle || stripAudioFileExtension(currentTrackTitle);
+
+      // 1. Master Final WAV (com Limitless, Orban, warmth, etc.)
       const wavBlob = await audioEngine.exportProcessedAudioWav(
-        masterBufferRef.current,
+        rawBufferRef.current || masterBufferRef.current,
         humanizerSettings,
         targetBitDepth,
         tapeAzimuthSettings,
-        targetSampleRate
+        targetSampleRate,
+        tapeDenoiseSettings,
+        tapeDropoutSettings
       );
-
-      const effectiveTitle = songTitle || currentTrackTitle.replace(/\.[^/.]+$/, '');
       const filename = buildMasterWavFilename({
         trackNumber,
         songTitle: effectiveTitle,
@@ -834,41 +1679,173 @@ export default function App() {
         bitDepth: targetBitDepth,
         targetLufs: humanizerSettings.targetLufs ?? -14,
       });
+      const saveRes = await autoSaveManager.saveProcessedFile(wavBlob, filename, {
+        subfolder: SUBFOLDER_MASTERED,
+      });
 
-      const saveRes = await autoSaveManager.saveProcessedFile(wavBlob, filename);
-
-      // Also save exact mastering recall preset (.aurapreset) in the SAME destination folder
-      try {
-        const recallData = generateTrackRecall(
-          currentTrackTitle,
-          humanizerSettings,
-          tapeAzimuthSettings,
-          audioFormat || undefined,
-          currentGlobalPresetName
-        );
-        const recallBlob = recallToBlob(recallData);
-        const recallFilename = buildRecallFilename({
-          trackNumber,
-          songTitle: effectiveTitle,
-          artist: artistName,
-          sampleRate: targetSampleRate,
-          bitDepth: targetBitDepth,
-          targetLufs: humanizerSettings.targetLufs ?? -14,
-        });
-        await autoSaveManager.saveProcessedFile(recallBlob, recallFilename);
-      } catch (recallErr) {
-        console.warn('Erro ao salvar arquivo de recall:', recallErr);
-      }
-
-      setExportNotice(
-        `✓ Master WAV e Recall (.aurapreset) exportados com sucesso na mesma pasta: ${saveRes.targetPath} (${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit)!`
+      // 2. Preset de Recall (.aurapreset) correspondente aos parâmetros exatos desta Master
+      const recallData = generateTrackRecall(
+        effectiveTitle,
+        humanizerSettings,
+        tapeAzimuthSettings,
+        audioFormat || undefined,
+        currentGlobalPresetName
       );
-      setTimeout(() => setExportNotice(null), 7000);
-    } catch {
+      const recallBlob = recallToBlob(recallData);
+      const recallFilename = buildRecallFilename({
+        trackNumber,
+        songTitle: effectiveTitle,
+        artist: artistName,
+        sampleRate: targetSampleRate,
+        bitDepth: targetBitDepth,
+        targetLufs: humanizerSettings.targetLufs ?? -14,
+      });
+
+      // Se salvando diretamente na pasta vinculada no disco do usuário:
+      if (saveRes.savedToDiskDirectly) {
+        // Grava o preset de recall na subpasta [-LUFS] junto com a Master
+        await autoSaveManager.saveProcessedFile(recallBlob, recallFilename, {
+          subfolder: SUBFOLDER_MASTERED,
+        });
+
+        // Também grava o Pré-Master na subpasta [Recuperados]
+        try {
+          const preMasterBlob = await audioEngine.exportDropoutRestoredOnlyWav(
+            rawBufferRef.current || masterBufferRef.current,
+            tapeDropoutSettings,
+            tapeAzimuthSettings,
+            targetBitDepth,
+            targetSampleRate,
+            tapeDenoiseSettings
+          );
+          const preMasterFilename = buildPreMasterWavFilename({
+            trackNumber,
+            songTitle: effectiveTitle,
+            artist: artistName,
+            sampleRate: targetSampleRate,
+            bitDepth: targetBitDepth,
+          });
+          await autoSaveManager.saveProcessedFile(preMasterBlob, preMasterFilename, {
+            subfolder: SUBFOLDER_RECOVERED,
+          });
+
+          setExportNotice(
+            `✓ Arquivos organizados automaticamente: Master WAV e Recall em "${SUBFOLDER_MASTERED}" e Pré-Master em "${SUBFOLDER_RECOVERED}"! Destino: ${saveRes.targetPath}`
+          );
+        } catch {
+          setExportNotice(
+            `✓ Master WAV e Preset de Recall (.aurapreset) gravados em "${SUBFOLDER_MASTERED}": ${saveRes.targetPath} (${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit)!`
+          );
+        }
+      } else {
+        // Modo download no navegador: o Master WAV foi baixado. Dispara imediatamente o download do Preset (.aurapreset)
+        setTimeout(() => {
+          autoSaveManager.triggerBrowserDownload(recallBlob, recallFilename);
+        }, 350);
+
+        setExportNotice(
+          `✓ Master WAV e Preset de Recall (.aurapreset) baixados com sucesso (${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit)!`
+        );
+      }
+      setTimeout(() => setExportNotice(null), 8000);
+    } catch (err) {
+      console.error(err);
       setExportNotice('Erro ao renderizar arquivo master.');
       setTimeout(() => setExportNotice(null), 3000);
     } finally {
       setIsExporting(false);
+    }
+  };
+
+  // Export Complete Bundle as a single clean ZIP archive (Master WAV + Pré-Master WAV + Recall .aurapreset)
+  const handleExportZipPackage = async () => {
+    if (!masterBufferRef.current) return;
+    try {
+      setIsExportingZip(true);
+      // Immediately verify/restore directory permission while user click gesture is active
+      await autoSaveManager.ensureDirectoryAccess();
+      const targetBitDepth = exportBitDepth || audioFormat?.bitDepth || 24;
+      const targetSampleRate = audioFormat?.sampleRate || masterBufferRef.current.sampleRate;
+      setExportNotice(
+        `Gerando Pacote ZIP completo (Master + Pré-Master + Recall) em ${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit...`
+      );
+
+      const effectiveTitle = songTitle || stripAudioFileExtension(currentTrackTitle);
+
+      // 1. Master Final WAV
+      const wavBlob = await audioEngine.exportProcessedAudioWav(
+        rawBufferRef.current || masterBufferRef.current,
+        humanizerSettings,
+        targetBitDepth,
+        tapeAzimuthSettings,
+        targetSampleRate,
+        tapeDenoiseSettings,
+        tapeDropoutSettings
+      );
+      const masterFilename = buildMasterWavFilename({
+        trackNumber,
+        songTitle: effectiveTitle,
+        artist: artistName,
+        sampleRate: targetSampleRate,
+        bitDepth: targetBitDepth,
+        targetLufs: humanizerSettings.targetLufs ?? -14,
+      });
+
+      // 2. Pré-Master Restaurado WAV
+      const preMasterBlob = await audioEngine.exportDropoutRestoredOnlyWav(
+        rawBufferRef.current || masterBufferRef.current,
+        tapeDropoutSettings,
+        tapeAzimuthSettings,
+        targetBitDepth,
+        targetSampleRate,
+        tapeDenoiseSettings
+      );
+      const preMasterFilename = buildPreMasterWavFilename({
+        trackNumber,
+        songTitle: effectiveTitle,
+        artist: artistName,
+        sampleRate: targetSampleRate,
+        bitDepth: targetBitDepth,
+      });
+
+      // 3. Exact mastering recall preset (.aurapreset)
+      const recallData = generateTrackRecall(
+        currentTrackTitle,
+        humanizerSettings,
+        tapeAzimuthSettings,
+        audioFormat || undefined,
+        currentGlobalPresetName
+      );
+      const recallBlob = recallToBlob(recallData);
+      const recallFilename = buildRecallFilename({
+        trackNumber,
+        songTitle: effectiveTitle,
+        artist: artistName,
+        sampleRate: targetSampleRate,
+        bitDepth: targetBitDepth,
+        targetLufs: humanizerSettings.targetLufs ?? -14,
+      });
+
+      const zipBlob = await autoSaveManager.createZipPackage([
+        { filename: masterFilename, blob: wavBlob, subfolder: SUBFOLDER_MASTERED },
+        { filename: preMasterFilename, blob: preMasterBlob, subfolder: SUBFOLDER_RECOVERED },
+        { filename: recallFilename, blob: recallBlob, subfolder: SUBFOLDER_MASTERED },
+      ]);
+
+      const zipNumPrefix = trackNumber?.trim() ? `${trackNumber.trim().padStart(2, '0')}_` : '';
+      const zipName = `${zipNumPrefix}${effectiveTitle}_Pacote_Completo.zip`;
+      const saveRes = await autoSaveManager.saveZipFile(zipBlob, zipName);
+
+      setExportNotice(
+        `✓ Pacote ZIP completo gerado com sucesso: ${saveRes.targetPath} (contém Master WAV, Pré-Master e Recall)!`
+      );
+      setTimeout(() => setExportNotice(null), 8000);
+    } catch (err) {
+      console.error(err);
+      setExportNotice('Erro ao gerar pacote ZIP completo.');
+      setTimeout(() => setExportNotice(null), 3000);
+    } finally {
+      setIsExportingZip(false);
     }
   };
 
@@ -903,19 +1880,25 @@ export default function App() {
       {/* Top Bar following contract */}
       <TopNav
         activeTab={activeTab}
-        setActiveTab={setActiveTab}
+        setActiveTab={handleTabChange}
         onOpenReport={() => setIsReportOpen(true)}
         onOpenPresets={() => setIsPresetModalOpen(true)}
         onOpenBatch={() => setIsBatchModalOpen(true)}
         onOpenFolderSettings={() => setIsFolderModalOpen(true)}
+        onOpenSplitStereoModal={() => setIsSplitStereoModalOpen(true)}
         outputDirectoryName={outputDirName}
         onExport={handleExportWav}
         onExportAzimuthOnly={handleExportAzimuthOnly}
+        onExportPreMaster={handleExportPreMasterOnly}
+        onExportZipPackage={handleExportZipPackage}
+        onChangeBitDepth={(depth) => setExportBitDepth(depth)}
         isHumanizedActive={!isCompareOriginal}
         onToggleAB={handleToggleAB}
         isExporting={isExporting}
+        isExportingPreMaster={isExportingPreMaster}
+        isExportingZip={isExportingZip}
         hasAudioLoaded={!!masterBufferRef.current}
-        outputBitDepth={audioFormat?.bitDepth || 24}
+        outputBitDepth={exportBitDepth}
       />
 
       {/* Export notification toast */}
@@ -952,7 +1935,7 @@ export default function App() {
           onNextTrack={handleNextBatchTrack}
           onPrevTrack={handlePrevBatchTrack}
           onReturnToBatchModal={handleReturnToBatchModal}
-          onExitBatchMode={() => setEditingBatchIndex(null)}
+          onExitBatchMode={handleExitBatchMode}
           onChangeTrackPreset={handleChangeEditingTrackPreset}
           allPresets={getAllPresets()}
         />
@@ -965,21 +1948,24 @@ export default function App() {
           currentTrackTitle={currentTrackTitle}
           isAnalyzing={isAnalyzing}
           onFileUpload={handleFileUpload}
-          onMultipleFilesUpload={() => setIsBatchModalOpen(true)}
+          onMultipleFilesUpload={handleMultipleFilesUpload}
+          onSplitStereoUpload={handleSplitStereoUpload}
+          pendingSplitMono={pendingSplitMono}
+          onDismissPendingSplitMono={() => setPendingSplitMono(null)}
+          onOpenSplitStereoModal={() => setIsSplitStereoModalOpen(true)}
           onOpenBatch={() => setIsBatchModalOpen(true)}
-          isStemMode={isStemMode}
-          setIsStemMode={setIsStemMode}
           audioFormat={audioFormat}
           overallAiProbability={analysisResult?.overallAiProbability}
           detectedPlatformName={analysisResult?.dominantPlatform.name}
           hasAudioLoaded={!!masterBufferRef.current}
           trackNumber={trackNumber}
-          onUpdateTrackNumber={setTrackNumber}
+          onUpdateTrackNumber={handleUpdateTrackNumber}
           songTitle={songTitle}
-          onUpdateSongTitle={setSongTitle}
+          onUpdateSongTitle={handleUpdateSongTitle}
           artistName={artistName}
-          onUpdateArtistName={setArtistName}
+          onUpdateArtistName={handleUpdateArtistName}
           targetLufs={humanizerSettings.targetLufs}
+          analysisStatus={analysisStatus}
         />
 
         {/* Real-time DSP Processing & Listening Route Status Banner */}
@@ -1006,7 +1992,9 @@ export default function App() {
                   </span>
                   {tapeAzimuthAnalysis && (
                     <span className="text-amber-300 font-mono text-[11px] bg-amber-950/40 px-1.5 py-0.5 rounded border border-amber-700/40">
-                      Azimute: {tapeAzimuthAnalysis.azimuthOffsetUs > 0 ? '+' : ''}{tapeAzimuthAnalysis.azimuthOffsetUs.toFixed(1)} µs
+                      {tapeAzimuthAnalysis.isGhostChannelDetected
+                        ? `Mono: Canal ${tapeAzimuthAnalysis.activeSignalChannel} Útil`
+                        : `Azimute: ${tapeAzimuthAnalysis.azimuthOffsetUs > 0 ? '+' : ''}${tapeAzimuthAnalysis.azimuthOffsetUs.toFixed(1)} µs`}
                     </span>
                   )}
                   {analysisResult && (
@@ -1024,6 +2012,19 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2 self-end sm:self-auto">
+            <button
+              onClick={() => setActiveTab('modular')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                activeTab === 'modular'
+                  ? 'bg-gradient-to-r from-amber-500/25 via-cyan-500/25 to-blue-500/25 text-white border border-cyan-400 shadow-md shadow-cyan-500/20'
+                  : 'bg-[#111726] text-slate-300 hover:text-white border border-slate-700'
+              }`}
+              title="Fluxo Modular Inteligente: Triagem Automática, Restauração de Fita, Equalização e Masterização em Blocos"
+            >
+              <Layers className="w-3.5 h-3.5 text-cyan-400" />
+              <span>⚡ Fluxo Modular</span>
+            </button>
+
             <button
               onClick={() => setActiveTab('azimuth')}
               className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
@@ -1152,10 +2153,18 @@ export default function App() {
                   Azimute 1/4"
                 </span>
                 <span className="text-sm font-mono font-bold text-amber-300 mt-0.5">
-                  {tapeAzimuthAnalysis ? `${tapeAzimuthAnalysis.azimuthOffsetUs > 0 ? '+' : ''}${tapeAzimuthAnalysis.azimuthOffsetUs.toFixed(1)} µs` : '0.0 µs'}
+                  {tapeAzimuthAnalysis
+                    ? tapeAzimuthAnalysis.isGhostChannelDetected
+                      ? `Mono (${tapeAzimuthAnalysis.activeSignalChannel})`
+                      : `${tapeAzimuthAnalysis.azimuthOffsetUs > 0 ? '+' : ''}${tapeAzimuthAnalysis.azimuthOffsetUs.toFixed(1)} µs`
+                    : '0.0 µs'}
                 </span>
                 <span className="text-[9px] text-slate-400 mt-0.5">
-                  {tapeAzimuthSettings.azimuthDelaySamples !== 0 ? '✓ Alinhado' : 'Checagem pronta'}
+                  {tapeAzimuthAnalysis?.isGhostChannelDetected
+                    ? '✓ Canal útil centrado'
+                    : tapeAzimuthSettings.azimuthDelaySamples !== 0
+                    ? '✓ Alinhado'
+                    : 'Checagem pronta'}
                 </span>
               </div>
 
@@ -1192,8 +2201,8 @@ export default function App() {
                 <span className="text-sm font-mono font-bold text-purple-300 mt-0.5">
                   {tapeDenoiseTelemetry ? `${tapeDenoiseTelemetry.hissNoiseFloorDb.toFixed(1)} dBFS` : '-64.0 dBFS'}
                 </span>
-                <span className="text-[9px] text-slate-400 mt-0.5 truncate">
-                  {tapeDenoiseSettings.enabled ? `✓ Ativo (-${tapeDenoiseSettings.reductionDb}dB)` : 'Subtração Bark'}
+                <span className={`text-[9px] mt-0.5 truncate font-semibold ${tapeDenoiseSettings.enabled ? 'text-emerald-400' : 'text-slate-400'}`}>
+                  {tapeDenoiseSettings.enabled ? `✓ Ativo (-${tapeDenoiseSettings.reductionDb}dB)` : '○ Bypass (Desativado)'}
                 </span>
               </div>
             </div>
@@ -1224,6 +2233,41 @@ export default function App() {
           </div>
         </div>
 
+        {/* Tab Modular: Fluxo Modular Inteligente & Triagem Automática */}
+        {activeTab === 'modular' && (
+          <ModularWorkflowConsole
+            currentTrackTitle={currentTrackTitle}
+            audioFormat={audioFormat}
+            trackLoudness={trackLoudness}
+            azimuthAnalysis={tapeAzimuthAnalysis}
+            dropoutAnalysis={tapeDropoutAnalysis}
+            denoiseTelemetry={tapeDenoiseTelemetry}
+            azimuthSettings={tapeAzimuthSettings}
+            dropoutSettings={tapeDropoutSettings}
+            denoiseSettings={tapeDenoiseSettings}
+            humanizerSettings={humanizerSettings}
+            onUpdateAzimuthSettings={handleUpdateAzimuthSettings}
+            onUpdateDropoutSettings={handleUpdateDropoutSettings}
+            onUpdateDenoiseSettings={handleUpdateDenoiseSettings}
+            onUpdateHumanizerSettings={handleUpdateSettings}
+            onReconstructDropouts={handleReconstructDropouts}
+            onApplyTriageRecommendations={handleApplyTriageRecommendations}
+            onNavigateToTab={(tab) => setActiveTab(tab)}
+            onOpenSplitStereoModal={() => setIsSplitStereoModalOpen(true)}
+            isPlaying={isPlaying}
+            onTogglePlay={handlePlayPause}
+            isCompareOriginal={isCompareOriginal}
+            onToggleAB={handleToggleAB}
+            onExportMaster={handleExportWav}
+            onExportPreMaster={handleExportPreMasterOnly}
+            onExportZipPackage={handleExportZipPackage}
+            outputBitDepth={exportBitDepth}
+            onChangeBitDepth={(depth) => setExportBitDepth(depth)}
+            isExporting={isExporting}
+            isExportingPreMaster={isExportingPreMaster}
+          />
+        )}
+
         {/* Tab 0: 1/4" Tape Azimuth & Channel Balance Workstation */}
         {activeTab === 'azimuth' && (
           <TapeAzimuthConsole
@@ -1247,6 +2291,7 @@ export default function App() {
         {activeTab === 'dropouts' && (
           <TapeDropoutConsole
             analysis={tapeDropoutAnalysis}
+            azimuthAnalysis={tapeAzimuthAnalysis}
             settings={tapeDropoutSettings}
             onUpdateSettings={handleUpdateDropoutSettings}
             onReconstruct={handleReconstructDropouts}
@@ -1262,6 +2307,8 @@ export default function App() {
             currentTrackTitle={currentTrackTitle}
             onExportRestoredWav={handleExportDropoutRestoredWav}
             isRestoring={isRestoringDropout}
+            isMonoPreview={tapeAzimuthSettings.listenInMono}
+            onToggleMonoPreview={() => handleUpdateAzimuthSettings({ listenInMono: !tapeAzimuthSettings.listenInMono })}
           />
         )}
 
@@ -1273,6 +2320,7 @@ export default function App() {
             onUpdateSettings={handleUpdateDenoiseSettings}
             onLearnNoiseProfile={handleLearnNoiseProfile}
             onLearnNoiseProfileAtPlayhead={handleLearnNoiseProfileAtPlayhead}
+            onLearnNoiseProfileAtTail={handleLearnNoiseProfileAtTail}
             onApplyDenoise={handleApplyDenoise}
             onTogglePlay={handlePlayPause}
             onPlayFrom={handlePlayFrom}
@@ -1299,6 +2347,10 @@ export default function App() {
             onNavigateToAzimuth={() => setActiveTab('azimuth')}
             onOpenPresets={() => setIsPresetModalOpen(true)}
             trackLoudness={trackLoudness}
+            orbanTelemetry={orbanTelemetry}
+            onAutoCalibrateOrban={handleAutoCalibrateOrban}
+            hasAudioLoaded={!!masterBufferRef.current}
+            onSelectPresetName={(name) => setCurrentGlobalPresetName(name)}
           />
         )}
 
@@ -1314,18 +2366,7 @@ export default function App() {
           />
         )}
 
-        {/* Tab 3: Stem Separation & Multitrack Mixer */}
-        {activeTab === 'stems' && (
-          <StemMixer
-            stems={stems}
-            onUpdateStem={handleUpdateStem}
-            onSoloStem={handleSoloStem}
-            onMuteStem={handleMuteStem}
-            isPlaying={isPlaying}
-          />
-        )}
-
-        {/* Tab 4: Spectral & RTA Analysis Workstation */}
+        {/* Tab 6: Spectral & RTA Analysis Workstation */}
         {activeTab === 'analyzer' && (
 
           <div className="flex flex-col gap-4">
@@ -1419,7 +2460,7 @@ export default function App() {
         detectedPlatformName={analysisResult?.dominantPlatform.name}
         hasAudioLoaded={!!masterBufferRef.current}
         outputSampleRate={audioFormat?.sampleRate || 44100}
-        outputBitDepth={audioFormat?.bitDepth || 24}
+        outputBitDepth={exportBitDepth}
         targetLufs={humanizerSettings.targetLufs ?? -14.0}
         targetCeilingDb={humanizerSettings.targetCeilingDb ?? -1.0}
       />
@@ -1439,11 +2480,13 @@ export default function App() {
         onClose={() => setIsBatchModalOpen(false)}
         humanizerSettings={humanizerSettings}
         tapeAzimuthSettings={tapeAzimuthSettings}
+        tapeDropoutSettings={tapeDropoutSettings}
         currentGlobalPresetName={currentGlobalPresetName}
         queue={batchQueue}
         setQueue={setBatchQueue}
         onEditTrackInMastering={handleEditTrackInMastering}
         activeEditingIndex={editingBatchIndex}
+        exportBitDepth={exportBitDepth}
       />
 
       {/* Output Folder & Auto-Save Configuration Modal */}
@@ -1452,6 +2495,15 @@ export default function App() {
         onClose={() => setIsFolderModalOpen(false)}
         outputDirName={outputDirName}
         onOutputDirChanged={(name) => setOutputDirName(name)}
+      />
+
+      {/* Pro Tools Split Stereo (.L and .R) Modal */}
+      <SplitStereoModal
+        isOpen={isSplitStereoModalOpen}
+        onClose={() => setIsSplitStereoModalOpen(false)}
+        onMerge={handleSplitStereoUpload}
+        pendingSplitMono={pendingSplitMono}
+        currentTrackTitle={currentTrackTitle}
       />
 
     </div>

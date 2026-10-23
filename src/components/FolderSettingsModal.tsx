@@ -34,7 +34,22 @@ export function FolderSettingsModal({
   if (!isOpen) return null;
 
   const hasDirectory = autoSaveManager.hasSelectedDirectory();
+  const hasStoredDir = autoSaveManager.hasStoredDirectory();
+  const baseName = outputDirName || autoSaveManager.getBaseDirName();
   const inIframe = isInsideIframe();
+
+  const handleReconnectDirectory = async () => {
+    setErrorMessage(null);
+    setFeedbackMsg(null);
+    const result = await autoSaveManager.reconnectStoredDirectory();
+    if (result.success) {
+      onOutputDirChanged(result.dirName);
+      setFeedbackMsg(`✓ Acesso à pasta "${result.dirName}/${subfolderName}" restabelecido com sucesso!`);
+      setTimeout(() => setFeedbackMsg(null), 6000);
+    } else {
+      setErrorMessage(result.error || 'Não foi possível reconectar à pasta.');
+    }
+  };
 
   const handlePickDirectory = async () => {
     setErrorMessage(null);
@@ -153,13 +168,23 @@ export function FolderSettingsModal({
               automaticamente a subpasta dentro dela e salvará os arquivos diretamente.
             </p>
 
+            {hasStoredDir && !hasDirectory && (
+              <button
+                onClick={handleReconnectDirectory}
+                className="w-full py-2.5 px-4 rounded-xl font-bold text-xs bg-emerald-500 hover:bg-emerald-400 text-slate-950 flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20 transition-all cursor-pointer"
+              >
+                <CheckCircle2 className="w-4 h-4" />
+                <span>Reconectar Permissão da Pasta: "{baseName}"</span>
+              </button>
+            )}
+
             <button
               onClick={handlePickDirectory}
               className="w-full py-2.5 px-4 rounded-xl font-bold text-xs bg-amber-400 hover:bg-amber-300 text-slate-950 flex items-center justify-center gap-2 shadow-lg shadow-amber-500/20 transition-all cursor-pointer"
             >
               <FolderPlus className="w-4 h-4" />
               <span>
-                {hasDirectory ? 'Alterar Pasta Selecionada no PC' : 'Selecionar Pasta no Computador'}
+                {hasDirectory ? 'Alterar Pasta Selecionada no PC' : 'Selecionar Nova Pasta no Computador'}
               </span>
             </button>
           </div>

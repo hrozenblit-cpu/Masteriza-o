@@ -32,6 +32,7 @@ interface TapeDenoiseConsoleProps {
   onUpdateSettings: (newSettings: Partial<SpectralDenoiseSettings>) => void;
   onLearnNoiseProfile: () => void;
   onLearnNoiseProfileAtPlayhead?: () => void;
+  onLearnNoiseProfileAtTail?: () => void;
   onApplyDenoise: () => void;
   onTogglePlay?: () => void;
   onPlayFrom?: (timeSeconds: number) => void;
@@ -52,6 +53,7 @@ export function TapeDenoiseConsole({
   onUpdateSettings,
   onLearnNoiseProfile,
   onLearnNoiseProfileAtPlayhead,
+  onLearnNoiseProfileAtTail,
   onApplyDenoise,
   onTogglePlay,
   onPlayFrom,
@@ -171,15 +173,16 @@ export function TapeDenoiseConsole({
           <button
             type="button"
             onClick={() => {
-              if (settings.listenNoiseDeltaOnly) onUpdateSettings({ listenNoiseDeltaOnly: false });
+              // Ensure denoise is enabled when listening to Denoised audio
+              onUpdateSettings({ enabled: true, listenNoiseDeltaOnly: false });
               if (isCompareOriginal && onToggleCompareOriginal) onToggleCompareOriginal();
             }}
             className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
-              !isCompareOriginal && !settings.listenNoiseDeltaOnly
+              !isCompareOriginal && !settings.listenNoiseDeltaOnly && settings.enabled
                 ? 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/60 ring-1 ring-emerald-500/30'
                 : 'bg-[#101524] text-slate-400 hover:text-slate-200 border border-slate-800'
             }`}
-            title="Ouvir o áudio com a redução espectral de ruído aplicada"
+            title="Ouvir o áudio com a redução espectral de ruído ativada e aplicada"
           >
             <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
             <span>DENOISED (Ruído Reduzido)</span>
@@ -187,7 +190,11 @@ export function TapeDenoiseConsole({
 
           <button
             type="button"
-            onClick={() => onUpdateSettings({ listenNoiseDeltaOnly: !settings.listenNoiseDeltaOnly })}
+            onClick={() => {
+              const nextDelta = !settings.listenNoiseDeltaOnly;
+              onUpdateSettings({ listenNoiseDeltaOnly: nextDelta, enabled: true });
+              if (isCompareOriginal && onToggleCompareOriginal) onToggleCompareOriginal();
+            }}
             className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
               settings.listenNoiseDeltaOnly
                 ? 'bg-purple-500/30 text-purple-200 border border-purple-500/80 ring-1 ring-purple-500/40 shadow-xs animate-pulse'
@@ -314,11 +321,24 @@ export function TapeDenoiseConsole({
                 onClick={onLearnNoiseProfile}
                 disabled={!hasAudioLoaded || isProcessing}
                 className="flex-1 w-full py-2.5 px-3 rounded-xl bg-gradient-to-r from-amber-500/25 via-amber-400/25 to-yellow-500/25 hover:from-amber-500/35 hover:to-yellow-500/35 border border-amber-500/50 text-amber-200 font-bold text-xs flex items-center justify-center gap-2 transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
-                title="Localiza o trecho mais silencioso da fita (descartando silêncio digital inicial) e mede a impressão digital de ruído"
+                title="Localiza o trecho mais silencioso e estacionário da fita (priorizando o final/outro e início onde o ruído de fita e ronco estão puros)"
               >
                 <Radio className="w-4 h-4 text-amber-400 animate-pulse" />
                 <span>⚡ Auto-Aprender Fita</span>
               </button>
+
+              {onLearnNoiseProfileAtTail && (
+                <button
+                  type="button"
+                  onClick={onLearnNoiseProfileAtTail}
+                  disabled={!hasAudioLoaded || isProcessing}
+                  className="w-full sm:w-auto py-2.5 px-3 rounded-xl bg-[#141b2c] hover:bg-[#1a243a] border border-amber-500/40 text-amber-300 font-bold text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
+                  title="Captura a impressão digital de ruído (ronco e sopro) no final da música (últimos segundos de runout da fita)"
+                >
+                  <Waves className="w-4 h-4 text-amber-400" />
+                  <span>🏁 No Final (Outro)</span>
+                </button>
+              )}
 
               {onLearnNoiseProfileAtPlayhead && (
                 <button
@@ -329,7 +349,7 @@ export function TapeDenoiseConsole({
                   title="Captura a impressão digital de ruído exatamente no ponto em que o cursor de reprodução está parado"
                 >
                   <Activity className="w-4 h-4 text-cyan-400" />
-                  <span>🎯 Capturar no Cursor ({formatMinSec(playbackTime)})</span>
+                  <span>🎯 No Cursor ({formatMinSec(playbackTime)})</span>
                 </button>
               )}
             </div>
@@ -351,16 +371,34 @@ export function TapeDenoiseConsole({
               Controles de Atenuação Espectral
             </span>
 
-            <label className="flex items-center gap-1.5 cursor-pointer">
+            <label className="flex items-center gap-2 cursor-pointer bg-[#101726] px-2.5 py-1 rounded-lg border border-slate-700 hover:border-slate-600 transition-colors">
               <input
                 type="checkbox"
                 checked={settings.enabled}
                 onChange={(e) => onUpdateSettings({ enabled: e.target.checked })}
-                className="rounded border-slate-700 text-emerald-500 focus:ring-emerald-500/40 bg-slate-900"
+                className="rounded border-slate-700 text-emerald-500 focus:ring-emerald-500/40 bg-slate-900 cursor-pointer"
               />
-              <span className="text-[11px] font-mono text-emerald-300 font-bold">Módulo Ativo</span>
+              <span className={`text-[11px] font-mono font-bold ${settings.enabled ? 'text-emerald-300' : 'text-slate-400'}`}>
+                {settings.enabled ? `● Denoise Ativo (-${settings.reductionDb.toFixed(1)}dB)` : '○ Bypassed (Desativado)'}
+              </span>
             </label>
           </div>
+
+          {!settings.enabled && (
+            <div className="p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 flex items-center justify-between gap-2 text-xs text-amber-300">
+              <span className="flex items-center gap-1.5 font-mono text-[11px]">
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                Módulo em bypass. Ative para ouvir a redução de ruído em tempo real.
+              </span>
+              <button
+                type="button"
+                onClick={() => onUpdateSettings({ enabled: true })}
+                className="px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 text-[11px] font-mono font-bold cursor-pointer"
+              >
+                Ativar Denoise
+              </button>
+            </div>
+          )}
 
           {/* Noise Profile Preset Selector */}
           <div className="space-y-1.5">
@@ -370,7 +408,7 @@ export function TapeDenoiseConsole({
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
               <button
                 type="button"
-                onClick={() => onUpdateSettings({ noiseProfileType: 'studio_master_15ips' })}
+                onClick={() => onUpdateSettings({ noiseProfileType: 'studio_master_15ips', enabled: true })}
                 className={`p-2.5 rounded-lg border text-left flex flex-col gap-0.5 transition-all cursor-pointer ${
                   settings.noiseProfileType === 'studio_master_15ips'
                     ? 'bg-cyan-500/20 border-cyan-500 text-cyan-200 ring-1 ring-cyan-500/40'
@@ -383,7 +421,7 @@ export function TapeDenoiseConsole({
 
               <button
                 type="button"
-                onClick={() => onUpdateSettings({ noiseProfileType: 'tape_hiss_type1' })}
+                onClick={() => onUpdateSettings({ noiseProfileType: 'tape_hiss_type1', enabled: true })}
                 className={`p-2.5 rounded-lg border text-left flex flex-col gap-0.5 transition-all cursor-pointer ${
                   settings.noiseProfileType === 'tape_hiss_type1'
                     ? 'bg-amber-500/20 border-amber-500 text-amber-200 ring-1 ring-amber-500/40'
@@ -396,7 +434,7 @@ export function TapeDenoiseConsole({
 
               <button
                 type="button"
-                onClick={() => onUpdateSettings({ noiseProfileType: 'tape_hiss_type2' })}
+                onClick={() => onUpdateSettings({ noiseProfileType: 'tape_hiss_type2', enabled: true })}
                 className={`p-2.5 rounded-lg border text-left flex flex-col gap-0.5 transition-all cursor-pointer ${
                   settings.noiseProfileType === 'tape_hiss_type2'
                     ? 'bg-emerald-500/20 border-emerald-500 text-emerald-200 ring-1 ring-emerald-500/40'
@@ -409,7 +447,7 @@ export function TapeDenoiseConsole({
 
               <button
                 type="button"
-                onClick={() => onUpdateSettings({ noiseProfileType: 'hum_60hz' })}
+                onClick={() => onUpdateSettings({ noiseProfileType: 'hum_60hz', enabled: true })}
                 className={`p-2.5 rounded-lg border text-left flex flex-col gap-0.5 transition-all cursor-pointer ${
                   settings.noiseProfileType === 'hum_60hz'
                     ? 'bg-rose-500/20 border-rose-500 text-rose-200 ring-1 ring-rose-500/40'
@@ -422,7 +460,7 @@ export function TapeDenoiseConsole({
 
               <button
                 type="button"
-                onClick={() => onUpdateSettings({ noiseProfileType: 'hum_50hz' })}
+                onClick={() => onUpdateSettings({ noiseProfileType: 'hum_50hz', enabled: true })}
                 className={`p-2.5 rounded-lg border text-left flex flex-col gap-0.5 transition-all cursor-pointer ${
                   settings.noiseProfileType === 'hum_50hz'
                     ? 'bg-rose-500/20 border-rose-500 text-rose-200 ring-1 ring-rose-500/40'
@@ -435,7 +473,7 @@ export function TapeDenoiseConsole({
 
               <button
                 type="button"
-                onClick={() => onUpdateSettings({ noiseProfileType: 'auto_learned' })}
+                onClick={() => onUpdateSettings({ noiseProfileType: 'auto_learned', enabled: true })}
                 disabled={!settings.learnedNoiseBands}
                 className={`p-2.5 rounded-lg border text-left flex flex-col gap-0.5 transition-all cursor-pointer disabled:opacity-40 ${
                   settings.noiseProfileType === 'auto_learned'
@@ -467,7 +505,10 @@ export function TapeDenoiseConsole({
                 max="24"
                 step="0.5"
                 value={settings.reductionDb}
-                onChange={(e) => onUpdateSettings({ reductionDb: parseFloat(e.target.value) })}
+                onChange={(e) => {
+                  const val = parseFloat(e.target.value);
+                  onUpdateSettings({ reductionDb: val, enabled: val > 0 ? true : settings.enabled });
+                }}
                 className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-400"
               />
               <div className="flex justify-between text-[10px] font-mono text-slate-500">

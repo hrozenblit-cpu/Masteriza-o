@@ -17,6 +17,14 @@ import {
   learnNoiseProfileFromBuffer,
   CRITICAL_BAND_CENTERS_HZ
 } from './spectralDenoiseEngine';
+import {
+  processBufferWithOrbanTreble,
+  analyzeBufferTreble,
+  OrbanTrebleSettings,
+  OrbanTrebleTelemetry,
+  DEFAULT_ORBAN_SETTINGS,
+  ORBAN_PRESETS
+} from './orbanTrebleEngine';
 
 export class AudioEngine {
   private ctx: AudioContext | null = null;
@@ -25,6 +33,10 @@ export class AudioEngine {
   private monitorGain: GainNode | null = null; // Independent monitor listening attenuator
   private dacSafetyLimiter: DynamicsCompressorNode | null = null; // Hardware DAC True-Peak Safety Ceiling (prevents USB audio interface & WASAPI clipping)
   private userVolume: number = 0.90; // Default 0.90 (-1.0 dB True-Peak Safe Headroom for external USB Audio Interfaces)
+
+  // Multitrack Stems Summing & Acoustic Touch
+  private stems: AudioStem[] = [];
+  private isStemTouchActive: boolean = true;
 
   // Tape 1/4" Azimuth & Channel Balance Pre-Alignment Settings
   private tapeAzimuthSettings: TapeAzimuthSettings = {
@@ -48,17 +60,25 @@ export class AudioEngine {
   // Master Stereo Source nodes
   private sourceNode: AudioBufferSourceNode | null = null;
   private sourceGain: GainNode | null = null;
+  private allActiveSources: Set<AudioBufferSourceNode> = new Set();
+  private allActiveGains: Set<GainNode> = new Set();
+  private pendingFadingSources: Set<{ src: AudioBufferSourceNode; gain: GainNode; timer: any }> = new Set();
   private stemSources: Map<string, AudioBufferSourceNode> = new Map();
   private stemGains: Map<string, GainNode> = new Map();
   private stemPanners: Map<string, StereoPannerNode> = new Map();
 
+  // Track identification & generation epoch (strictly guarantees that switching tracks never plays stale audio)
+  private currentTrackId: number = 0;
+
   // Dual-Buffer Precision Architecture (Bit-for-Bit parity with exported WAV)
+  private pristineRawBuffer: AudioBuffer | null = null;
   private rawBuffer: AudioBuffer | null = null;
   private masteredBuffer: AudioBuffer | null = null;
   private isCompareOriginal: boolean = false;
   private renderDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private isRenderingMaster: boolean = false;
   private onMasterRenderedCallbacks: Set<(buf: AudioBuffer) => void> = new Set();
+  private masterRenderListeners: Set<(buf: AudioBuffer) => void> = new Set();
 
   // Independent Stereo Analysers for true L/R VU Metering and Phase Goniometer
   private splitterNode: ChannelSplitterNode | null = null;
@@ -79,33 +99,43 @@ export class AudioEngine {
 
   private currentSettings: HumanizerSettings = {
     enabled: true,
-    deHarshIntensity: 65,
+    deHarshIntensity: 0,
     notchFrequencyHz: 3400,
     notchBandwidthQ: 2.8,
-    tapeWarmth: 40,
-    tubeHarmonics: 30,
-    lowMidBody: 1.2,
-    transientPunch: 60,
-    attackDeSmear: 50,
-    timingJitterMs: 8,
-    flutterWowRate: 35,
-    airExciterGain: 60,
+    tapeWarmth: 0,
+    tubeHarmonics: 0,
+    lowMidBody: 0,
+    transientPunch: 0,
+    attackDeSmear: 0,
+    timingJitterMs: 0,
+    flutterWowRate: 0,
+    airExciterGain: 0,
     airCutoffHz: 15800,
-    harmonicSynthesisAmount: 85,
-    stereoCorrelationFix: 75,
-    monoBassCutoffHz: 140,
-    acousticRoomSpread: 45,
-    antiDetectionMode: true,
-    watermarkScrambler: true,
-    analogAirDither: 50,
+    harmonicSynthesisAmount: 0,
+    stereoCorrelationFix: 0,
+    monoBassCutoffHz: 0,
+    acousticRoomSpread: 0,
+    antiDetectionMode: false,
+    watermarkScrambler: false,
+    analogAirDither: 0,
     outputGainDb: 0,
     limitlessEnabled: true,
     targetLufs: -14.0,
     targetCeilingDb: -1.0,
-    clipperDrive: 55,
-    lowEndWeight: 75,
+    clipperDrive: 0,
+    lowEndWeight: 0,
     transientSpeed: 'punchy',
     autoMatchLoudness: true,
+    orbanHfEnabled: true,
+    orbanHfBypass: false,
+    orbanHfUserOverrideLock: false,
+    orbanHfMode: 'smooth_silk',
+    orbanHfAmount: 50,
+    orbanHfAutoBrillianceDb: 0.0,
+    orbanHfHighShelfGainDb: 0.0,
+    orbanHfThresholdDb: -6.0,
+    orbanHfCrossoverHz: 6000,
+    orbanHfSpeed: 'medium',
   };
 
   constructor() {
@@ -177,13 +207,14 @@ export class AudioEngine {
     this.monitorGain.gain.setValueAtTime(this.userVolume, ctx.currentTime);
 
     // Hardware DAC Anti-Clip Brickwall Protection Node:
-    // High-speed transparent limiter prevents inter-sample overshoots from hitting Windows WASAPI hard ceiling
+    // Pure brickwall safety ceiling at -0.1 dBFS: never compresses nominal playback peaks (-1.0 dBTP),
+    // strictly acting as a transparent safeguard against physical USB DAC clipping.
     this.dacSafetyLimiter = ctx.createDynamicsCompressor();
-    this.dacSafetyLimiter.threshold.setValueAtTime(-0.5, ctx.currentTime); // -0.5 dBFS safety ceiling
-    this.dacSafetyLimiter.knee.setValueAtTime(4.0, ctx.currentTime);       // Musical soft-knee avoids harsh distortion
-    this.dacSafetyLimiter.ratio.setValueAtTime(12, ctx.currentTime);       // Transparent limiting ratio
-    this.dacSafetyLimiter.attack.setValueAtTime(0.002, ctx.currentTime);   // 2ms smooth attack
-    this.dacSafetyLimiter.release.setValueAtTime(0.05, ctx.currentTime);   // 50ms musical release
+    this.dacSafetyLimiter.threshold.setValueAtTime(-0.1, ctx.currentTime); // -0.1 dBFS safety ceiling
+    this.dacSafetyLimiter.knee.setValueAtTime(0.0, ctx.currentTime);       // Hard knee: completely transparent for all signals below -0.1 dBFS
+    this.dacSafetyLimiter.ratio.setValueAtTime(20, ctx.currentTime);       // Transparent limiting ratio
+    this.dacSafetyLimiter.attack.setValueAtTime(0.001, ctx.currentTime);   // 1ms ultra-fast attack
+    this.dacSafetyLimiter.release.setValueAtTime(0.02, ctx.currentTime);   // 20ms transparent release
 
     this.analyser.connect(this.monitorGain);
     this.monitorGain.connect(this.dacSafetyLimiter);
@@ -219,13 +250,93 @@ export class AudioEngine {
   }
 
   /**
+   * Immediately wipes active audio buffer, stops all playback nodes immediately,
+   * cancels all pending renders and resets track epoch ID so that the previous song
+   * NEVER plays when switching tracks.
+   */
+  public wipeCurrentTrack() {
+    this.currentTrackId++;
+    if (this.renderDebounceTimer) {
+      clearTimeout(this.renderDebounceTimer);
+      this.renderDebounceTimer = null;
+    }
+    this.stopNodesOnly();
+    this.isPlaying = false;
+    this.pauseOffset = 0;
+    this.rawBuffer = null;
+    this.pristineRawBuffer = null;
+    this.masteredBuffer = null;
+    this.tapeDropoutAnalysis = null;
+    this.trackLoudnessMetrics = null;
+    this.onMasterRenderedCallbacks.clear();
+  }
+
+  /**
+   * Resets active track state and cancels any pending renders from previous songs
+   */
+  public resetTrack(buffer: AudioBuffer, pristine?: AudioBuffer, analysis?: TapeDropoutAnalysis | null) {
+    this.currentTrackId++;
+    if (this.renderDebounceTimer) {
+      clearTimeout(this.renderDebounceTimer);
+      this.renderDebounceTimer = null;
+    }
+    this.stopNodesOnly();
+    this.isPlaying = false;
+    this.pauseOffset = 0;
+
+    this.rawBuffer = buffer;
+    this.pristineRawBuffer = pristine || buffer;
+    this.masteredBuffer = null;
+    this.tapeDropoutAnalysis = analysis || null;
+    this.onMasterRenderedCallbacks.clear();
+  }
+
+  public setRawBuffer(buffer: AudioBuffer) {
+    this.rawBuffer = buffer;
+  }
+
+  /**
    * Called when the user uploads a new raw track.
-   * Caches raw buffer and starts background render of the master buffer immediately.
+   * Caches pristine raw buffer, wipes previous track's master, and starts render immediately.
    */
   public async loadRawBuffer(buffer: AudioBuffer): Promise<AudioBuffer | null> {
-    this.rawBuffer = buffer;
-    this.masteredBuffer = null;
+    this.resetTrack(buffer);
     return this.triggerMasterRender();
+  }
+
+  /**
+   * Loads an audio buffer that has already had tape dropouts cleanly reconstructed,
+   * retaining the repaired dropout analysis telemetry without duplicate processing.
+   */
+  public async loadDropoutRestoredBuffer(
+    buffer: AudioBuffer,
+    analysis: TapeDropoutAnalysis,
+    pristine?: AudioBuffer
+  ): Promise<AudioBuffer | null> {
+    this.resetTrack(buffer, pristine || buffer, analysis);
+    return this.triggerMasterRender();
+  }
+
+  /**
+   * Sets multitrack stems and triggers master summing re-render.
+   */
+  public setStems(stems: AudioStem[], isStemTouchActive: boolean = true) {
+    this.stems = stems;
+    this.isStemTouchActive = isStemTouchActive;
+    if (this.rawBuffer) {
+      this.scheduleMasterRender();
+    }
+  }
+
+  public getStems(): AudioStem[] {
+    return this.stems;
+  }
+
+  public setStemTouchActive(active: boolean) {
+    this.isStemTouchActive = active;
+    if (this.rawBuffer) {
+      this.scheduleMasterRender();
+    }
   }
 
   /**
@@ -300,6 +411,7 @@ export class AudioEngine {
     const res = learnNoiseProfileFromBuffer(targetBuffer, explicitStartSec, explicitDurationSec);
     this.tapeDenoiseSettings.learnedNoiseBands = res.profileBands;
     this.tapeDenoiseSettings.noiseProfileType = 'auto_learned';
+    this.tapeDenoiseSettings.enabled = true;
     if (this.tapeDenoiseTelemetry) {
       this.tapeDenoiseTelemetry.noiseProfileBands = res.profileBands;
       this.tapeDenoiseTelemetry.quietestSegmentStartSec = res.startSec;
@@ -308,6 +420,13 @@ export class AudioEngine {
     }
     this.scheduleMasterRender();
     return res.profileBands;
+  }
+
+
+  public getOrbanTrebleTelemetry(buffer?: AudioBuffer): OrbanTrebleTelemetry | null {
+    const target = buffer || this.rawBuffer;
+    if (!target) return null;
+    return analyzeBufferTreble(target);
   }
 
   private scheduleMasterRender() {
@@ -319,19 +438,45 @@ export class AudioEngine {
     }
     this.renderDebounceTimer = setTimeout(() => {
       this.triggerMasterRender().catch(() => {});
-    }, 120);
+    }, 45);
+  }
+
+  public onMasterRendered(cb: (buf: AudioBuffer) => void): () => void {
+    this.masterRenderListeners.add(cb);
+    return () => {
+      this.masterRenderListeners.delete(cb);
+    };
+  }
+
+  public getMasteredBuffer(): AudioBuffer | null {
+    return this.masteredBuffer;
+  }
+
+  public getRawBuffer(): AudioBuffer | null {
+    return this.pristineRawBuffer || this.rawBuffer;
+  }
+
+  public isStemTouchEnabled(): boolean {
+    return this.isStemTouchActive;
   }
 
   public async triggerMasterRender(): Promise<AudioBuffer | null> {
-    if (!this.rawBuffer) {
+    const renderTrackId = this.currentTrackId;
+    const sourceToRender = this.pristineRawBuffer || this.rawBuffer;
+    if (!sourceToRender) {
       return null;
     }
     if (this.isRenderingMaster) {
-      // Re-trigger after current render completes
+      // Re-trigger after current in-flight render completes
       return new Promise((resolve) => {
         const cb = (buf: AudioBuffer) => {
           this.onMasterRenderedCallbacks.delete(cb);
-          resolve(buf);
+          if (this.currentTrackId === renderTrackId) {
+            resolve(buf);
+          } else {
+            // Track changed while waiting! Render the new track instead of returning stale audio
+            this.triggerMasterRender().then(resolve);
+          }
         };
         this.onMasterRenderedCallbacks.add(cb);
       });
@@ -339,7 +484,13 @@ export class AudioEngine {
 
     this.isRenderingMaster = true;
     try {
-      const rendered = await this.renderMasteredBuffer(this.rawBuffer, this.currentSettings);
+      const rendered = await this.renderMasteredBuffer(sourceToRender, this.currentSettings);
+
+      // If user switched tracks while render was in progress, DISCARD the stale master!
+      if (this.currentTrackId !== renderTrackId) {
+        return null;
+      }
+
       this.masteredBuffer = rendered;
 
       // If currently playing in Mastered mode, seamlessly crossfade to the updated master
@@ -352,6 +503,15 @@ export class AudioEngine {
         cb(rendered);
       }
       this.onMasterRenderedCallbacks.clear();
+
+      for (const listener of this.masterRenderListeners) {
+        try {
+          listener(rendered);
+        } catch (err) {
+          console.error(err);
+        }
+      }
+
       return rendered;
     } finally {
       this.isRenderingMaster = false;
@@ -368,7 +528,7 @@ export class AudioEngine {
     this.isCompareOriginal = compareOriginal;
 
     if (this.isPlaying && this.rawBuffer) {
-      const targetBuffer = compareOriginal ? this.rawBuffer : (this.masteredBuffer || this.rawBuffer);
+      const targetBuffer = compareOriginal ? (this.pristineRawBuffer || this.rawBuffer) : (this.masteredBuffer || this.rawBuffer);
       const curTime = this.getCurrentPlaybackTime();
       this.startSourceWithBuffer(targetBuffer, curTime, true);
     }
@@ -382,27 +542,56 @@ export class AudioEngine {
    * Plays the stereo master buffer.
    * If in Mastered mode, plays the mastered buffer (which sounds 100% identical to the exported WAV).
    * If in Original Cru mode, plays the raw original audio.
+   * If master is not ready yet, plays rawBuffer immediately and hot-swaps to master when ready.
    */
-  public async playBuffer(buffer: AudioBuffer, offsetSeconds: number = 0) {
-    const ctx = this.getAudioContext();
-    this.rawBuffer = buffer;
+  public play(offsetSeconds: number = 0) {
+    const activeBuf = this.isCompareOriginal
+      ? (this.pristineRawBuffer || this.rawBuffer!)
+      : (this.masteredBuffer || this.rawBuffer!);
 
-    // If master buffer is not ready yet, render it
-    if (!this.masteredBuffer) {
-      // Start playback with raw buffer immediately, and hot-swap to master as soon as rendered
-      const activeBuf = this.isCompareOriginal ? buffer : buffer;
+    if (activeBuf) {
       this.startSourceWithBuffer(activeBuf, offsetSeconds, false);
+      this.isPlaying = true;
+    }
+
+    // If master buffer is not ready yet, render it in background and hot-swap seamlessly
+    if (!this.masteredBuffer && this.rawBuffer) {
+      const playTrackId = this.currentTrackId;
       this.triggerMasterRender().then((mastered) => {
-        if (mastered && this.isPlaying && !this.isCompareOriginal) {
+        if (mastered && this.currentTrackId === playTrackId && this.isPlaying && !this.isCompareOriginal) {
           const curTime = this.getCurrentPlaybackTime();
           this.startSourceWithBuffer(mastered, curTime, true);
         }
       });
-      return;
+    }
+  }
+
+  public async playBuffer(buffer?: AudioBuffer, offsetSeconds: number = 0) {
+    const ctx = this.getAudioContext();
+
+    if (buffer && buffer !== this.rawBuffer) {
+      this.resetTrack(buffer);
     }
 
-    const activeBuf = this.isCompareOriginal ? this.rawBuffer : this.masteredBuffer;
-    this.startSourceWithBuffer(activeBuf, offsetSeconds, false);
+    const activeBuf = this.isCompareOriginal
+      ? (this.pristineRawBuffer || this.rawBuffer || buffer)
+      : (this.masteredBuffer || this.rawBuffer || buffer);
+
+    if (activeBuf) {
+      this.startSourceWithBuffer(activeBuf, offsetSeconds, false);
+      this.isPlaying = true;
+    }
+
+    // If master buffer is not ready yet, render it in background and hot-swap seamlessly
+    if (!this.masteredBuffer && (this.rawBuffer || buffer)) {
+      const playTrackId = this.currentTrackId;
+      this.triggerMasterRender().then((mastered) => {
+        if (mastered && this.currentTrackId === playTrackId && this.isPlaying && !this.isCompareOriginal) {
+          const curTime = this.getCurrentPlaybackTime();
+          this.startSourceWithBuffer(mastered, curTime, true);
+        }
+      });
+    }
   }
 
   /**
@@ -412,8 +601,50 @@ export class AudioEngine {
     if (!this.ctx || !this.sumBusNode) return;
     const ctx = this.ctx;
 
+    // Immediately stop and flush any prior fading nodes so multiple clicks/updates NEVER leak background audio
+    for (const item of this.pendingFadingSources) {
+      if (item.timer) clearTimeout(item.timer);
+      try {
+        item.src.stop();
+        item.src.disconnect();
+        item.gain.disconnect();
+      } catch {
+        // safe ignore
+      }
+      this.allActiveSources.delete(item.src);
+      this.allActiveGains.delete(item.gain);
+    }
+    this.pendingFadingSources.clear();
+
     const oldSrc = this.sourceNode;
     const oldGain = this.sourceGain;
+
+    // Stop and clear all multitrack stem nodes so they never play simultaneously with master buffer
+    for (const [, src] of this.stemSources.entries()) {
+      try {
+        src.stop();
+        src.disconnect();
+      } catch {
+        // safe ignore
+      }
+    }
+    for (const [, gain] of this.stemGains.entries()) {
+      try {
+        gain.disconnect();
+      } catch {
+        // safe ignore
+      }
+    }
+    for (const [, panner] of this.stemPanners.entries()) {
+      try {
+        panner.disconnect();
+      } catch {
+        // safe ignore
+      }
+    }
+    this.stemSources.clear();
+    this.stemGains.clear();
+    this.stemPanners.clear();
 
     const newSrc = ctx.createBufferSource();
     newSrc.buffer = buffer;
@@ -430,15 +661,26 @@ export class AudioEngine {
       oldGain.gain.setValueAtTime(curVal, ctx.currentTime);
       oldGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.02);
 
-      setTimeout(() => {
+      const fadingItem: { src: AudioBufferSourceNode; gain: GainNode; timer: any } = {
+        src: oldSrc,
+        gain: oldGain,
+        timer: null
+      };
+
+      fadingItem.timer = setTimeout(() => {
         try {
-          oldSrc.stop();
-          oldSrc.disconnect();
-          oldGain.disconnect();
+          fadingItem.src.stop();
+          fadingItem.src.disconnect();
+          fadingItem.gain.disconnect();
         } catch {
           // safe ignore
         }
-      }, 35);
+        this.pendingFadingSources.delete(fadingItem);
+        this.allActiveSources.delete(fadingItem.src);
+        this.allActiveGains.delete(fadingItem.gain);
+      }, 25);
+
+      this.pendingFadingSources.add(fadingItem);
     } else {
       if (oldSrc) {
         try {
@@ -447,6 +689,7 @@ export class AudioEngine {
         } catch {
           // safe ignore
         }
+        this.allActiveSources.delete(oldSrc);
       }
       if (oldGain) {
         try {
@@ -454,6 +697,7 @@ export class AudioEngine {
         } catch {
           // safe ignore
         }
+        this.allActiveGains.delete(oldGain);
       }
       // Micro-ramp (6ms) eliminates abrupt waveform step clicks on start/seek
       newGain.gain.setValueAtTime(0, ctx.currentTime);
@@ -462,6 +706,9 @@ export class AudioEngine {
 
     newSrc.connect(newGain);
     newGain.connect(this.sumBusNode);
+
+    this.allActiveSources.add(newSrc);
+    this.allActiveGains.add(newGain);
 
     const safeOffset = offsetSeconds % buffer.duration;
     newSrc.start(0, safeOffset);
@@ -478,7 +725,7 @@ export class AudioEngine {
    */
   public playStems(stems: AudioStem[], offsetSeconds: number = 0) {
     const ctx = this.getAudioContext();
-    this.stop();
+    this.stop(true);
 
     if (!this.sumBusNode) return;
 
@@ -565,8 +812,12 @@ export class AudioEngine {
     }
   }
 
-  public stop() {
-    if (this.sourceGain && this.ctx && this.isPlaying) {
+  public stop(immediate: boolean = false) {
+    if (this.renderDebounceTimer) {
+      clearTimeout(this.renderDebounceTimer);
+      this.renderDebounceTimer = null;
+    }
+    if (!immediate && this.sourceGain && this.ctx && this.isPlaying) {
       try {
         const curGain = this.sourceGain.gain.value;
         this.sourceGain.gain.cancelScheduledValues(this.ctx.currentTime);
@@ -588,6 +839,39 @@ export class AudioEngine {
   }
 
   private stopNodesOnly() {
+    // Terminate and clear all fading sources and their timers
+    for (const item of this.pendingFadingSources) {
+      if (item.timer) clearTimeout(item.timer);
+      try {
+        item.src.stop();
+        item.src.disconnect();
+        item.gain.disconnect();
+      } catch {
+        // safe ignore
+      }
+    }
+    this.pendingFadingSources.clear();
+
+    // Terminate all tracked active sources
+    for (const src of this.allActiveSources) {
+      try {
+        src.stop();
+        src.disconnect();
+      } catch {
+        // safe ignore
+      }
+    }
+    this.allActiveSources.clear();
+
+    for (const gain of this.allActiveGains) {
+      try {
+        gain.disconnect();
+      } catch {
+        // safe ignore
+      }
+    }
+    this.allActiveGains.clear();
+
     if (this.sourceNode) {
       try {
         this.sourceNode.stop();
@@ -781,7 +1065,8 @@ export class AudioEngine {
     settings: HumanizerSettings,
     customAzimuthSettings?: TapeAzimuthSettings,
     targetSampleRate?: number,
-    customDenoiseSettings?: SpectralDenoiseSettings
+    customDenoiseSettings?: SpectralDenoiseSettings,
+    customDropoutSettings?: TapeDropoutSettings
   ): Promise<AudioBuffer> {
     if (!buffer) {
       throw new Error('Nenhum buffer de áudio disponível para renderização.');
@@ -796,25 +1081,42 @@ export class AudioEngine {
         azimuthToUse.balanceDb !== 0 ||
         azimuthToUse.invertPhaseL ||
         azimuthToUse.invertPhaseR ||
-        azimuthToUse.listenInMono)
+        azimuthToUse.listenInMono ||
+        (azimuthToUse.ghostChannelHandling !== 'passthrough' &&
+          (azimuthToUse.activeChannel === 'L' || azimuthToUse.activeChannel === 'R')))
     ) {
       sourceBuffer = processBufferWithAzimuthAndBalance(buffer, azimuthToUse);
     }
 
     // 0.1 Pre-Mastering Stage: Tape Dropout Detection & Cross-Channel Reconstruction
-    // Especially critical for Full-Track Ampex transferred to Studer A80 2-Track
-    if (this.tapeDropoutSettings.enabled) {
-      const dropAnalysis = this.tapeDropoutAnalysis || analyzeTapeDropouts(sourceBuffer, this.tapeDropoutSettings);
-      if (dropAnalysis.events.length > 0) {
-        const { restoredBuffer } = reconstructTapeDropouts(sourceBuffer, dropAnalysis, this.tapeDropoutSettings);
+    // Especially critical for Full-Track Ampex transferred to Studer A80 2-Track and Mono Wander Graft
+    const dropoutToUse = customDropoutSettings || this.tapeDropoutSettings;
+    if (dropoutToUse.enabled) {
+      let dropAnalysis = this.tapeDropoutAnalysis;
+      if (
+        !dropAnalysis ||
+        dropAnalysis.sampleRate !== sourceBuffer.sampleRate ||
+        Math.abs(dropAnalysis.duration - sourceBuffer.duration) > 0.05
+      ) {
+        dropAnalysis = analyzeTapeDropouts(sourceBuffer, dropoutToUse);
+        this.tapeDropoutAnalysis = dropAnalysis;
+      }
+      if (dropAnalysis && (dropAnalysis.events.length > 0 || dropoutToUse.mode === 'mono_wander_graft')) {
+        const { restoredBuffer } = reconstructTapeDropouts(sourceBuffer, dropAnalysis, dropoutToUse);
         sourceBuffer = restoredBuffer;
       }
+    }
+    if (dropoutToUse.enabled && dropoutToUse.listenDropoutMaskOnly) {
+      return sourceBuffer;
     }
 
     // 0.2 Pre-Mastering Stage: Sonic Solutions NoNoise / iZotope RX Spectral De-noise
     const denoiseToUse = customDenoiseSettings || this.tapeDenoiseSettings;
     if (denoiseToUse.enabled || denoiseToUse.listenNoiseDeltaOnly) {
       sourceBuffer = processBufferWithSpectralDenoise(sourceBuffer, denoiseToUse);
+    }
+    if (denoiseToUse.listenNoiseDeltaOnly) {
+      return sourceBuffer;
     }
 
     const sampleRate = targetSampleRate || sourceBuffer.sampleRate;
@@ -873,6 +1175,28 @@ export class AudioEngine {
     source.start(0);
     let renderedBuffer = await offlineCtx.startRendering();
 
+    // 5.1 Processador Inteligente de Agudos (Flat Input Response & HF Limiter)
+    const isOrbanEnabled = settings.orbanHfEnabled !== false;
+    const isOrbanBypassed = !!settings.orbanHfBypass;
+    if (isOrbanEnabled && !isOrbanBypassed) {
+      const shelfGain = settings.orbanHfHighShelfGainDb !== undefined
+        ? settings.orbanHfHighShelfGainDb
+        : (settings.orbanHfAutoBrillianceDb !== undefined ? settings.orbanHfAutoBrillianceDb : 0.0);
+
+      renderedBuffer = processBufferWithOrbanTreble(renderedBuffer, {
+        enabled: true,
+        bypass: false,
+        mode: settings.orbanHfMode || 'broadcast_optimod',
+        amount: settings.orbanHfAmount !== undefined ? settings.orbanHfAmount : 50,
+        autoBrillianceDb: shelfGain,
+        highShelfGainDb: shelfGain,
+        harmonicAirExciter: settings.orbanHfHarmonicAir ?? 0,
+        thresholdDb: settings.orbanHfThresholdDb !== undefined ? settings.orbanHfThresholdDb : -6.0,
+        crossoverHz: settings.orbanHfCrossoverHz || 6000,
+        speed: settings.orbanHfSpeed || 'fast',
+      });
+    }
+
     // 6. DMGAudio Limitless Multi-Stage Dynamics & Loudness Maximizer (Target LUFS Matching)
     const isLimitlessBypassed = !!settings.limitlessBypass || settings.limitlessEnabled === false;
     if (!isLimitlessBypassed && settings.targetLufs !== undefined) {
@@ -901,13 +1225,21 @@ export class AudioEngine {
       return curve;
     }
 
-    // High-fidelity analog tape saturation:
-    // Pure linear for small signals, smooth hyperbolic tape saturation at top end with zero kinks
-    const drive = 1.0 + (Math.max(0, Math.min(100, amount)) / 100) * 0.45;
-    const norm = Math.tanh(drive);
+    // High-fidelity analog tape warmth:
+    // Strictly unity gain (f'(0) = 1.0) for nominal audio to preserve 100% attack transient clarity and punch.
+    // Soft analog tape rounding only applies to extreme peaks above -2 dBFS without harsh digital or squashing artifacts.
+    const warmth = Math.max(0, Math.min(100, amount)) / 100;
+    const knee = 0.78 + (1.0 - warmth) * 0.18; // 0.78 to 0.96 linear headroom
     for (let i = 0; i < nSamples; ++i) {
       const x = (i * 2) / (nSamples - 1) - 1;
-      curve[i] = Math.tanh(x * drive) / norm;
+      const absX = Math.abs(x);
+      if (absX <= knee || warmth <= 0.01) {
+        curve[i] = x;
+      } else {
+        const excess = (absX - knee) / (1.0 - knee);
+        const sat = knee + (1.0 - knee) * (excess / (1.0 + excess * 0.35 * warmth));
+        curve[i] = (x < 0 ? -1 : 1) * Math.min(1.0, sat);
+      }
     }
     return curve;
   }
@@ -921,14 +1253,17 @@ export class AudioEngine {
     targetBitDepth: 16 | 24 | 32 = 24,
     customAzimuthSettings?: TapeAzimuthSettings,
     targetSampleRate?: number,
-    customDenoiseSettings?: SpectralDenoiseSettings
+    customDenoiseSettings?: SpectralDenoiseSettings,
+    customDropoutSettings?: TapeDropoutSettings
   ): Promise<Blob> {
+    const sourceBuffer = buffer || this.pristineRawBuffer || this.rawBuffer;
     const renderedBuffer = await this.renderMasteredBuffer(
-      buffer,
+      sourceBuffer,
       settings,
       customAzimuthSettings,
       targetSampleRate,
-      customDenoiseSettings
+      customDenoiseSettings,
+      customDropoutSettings
     );
     return audioBufferToWavBlob(renderedBuffer, targetBitDepth, settings.targetCeilingDb ?? -1.0, targetSampleRate);
   }
@@ -943,7 +1278,8 @@ export class AudioEngine {
     targetBitDepth: 16 | 24 | 32 = 24,
     targetSampleRate?: number
   ): Promise<Blob> {
-    let alignedBuffer = processBufferWithAzimuthAndBalance(buffer, azimuthSettings);
+    const sourceBuffer = buffer || this.pristineRawBuffer || this.rawBuffer;
+    let alignedBuffer = processBufferWithAzimuthAndBalance(sourceBuffer, azimuthSettings);
     if (targetSampleRate && alignedBuffer.sampleRate !== targetSampleRate) {
       const targetFrames = Math.round(alignedBuffer.duration * targetSampleRate);
       const resCtx = new OfflineAudioContext(alignedBuffer.numberOfChannels, targetFrames, targetSampleRate);
@@ -957,24 +1293,33 @@ export class AudioEngine {
   }
 
   /**
-   * Exports an archival preservation WAV with Tape Azimuth aligned and Dropouts reconstructed.
-   * Completely bypasses mastering EQ/compressor for pristine archival transfers.
+   * Exports an archival preservation WAV with Tape Azimuth aligned, Dropouts reconstructed,
+   * and optional Spectral Denoise.
+   * Completely bypasses mastering EQ/compressor/maximizer for pristine archival transfers.
    */
   public async exportDropoutRestoredOnlyWav(
     buffer: AudioBuffer,
     dropoutSettings: TapeDropoutSettings,
     azimuthSettings: TapeAzimuthSettings,
     targetBitDepth: 16 | 24 | 32 = 24,
-    targetSampleRate?: number
+    targetSampleRate?: number,
+    denoiseSettings?: SpectralDenoiseSettings
   ): Promise<Blob> {
-    let procBuffer = buffer;
+    const originalSource = buffer || this.pristineRawBuffer || this.rawBuffer;
+    let procBuffer = originalSource;
     if (azimuthSettings.enabled) {
-      procBuffer = processBufferWithAzimuthAndBalance(buffer, azimuthSettings);
+      procBuffer = processBufferWithAzimuthAndBalance(procBuffer, azimuthSettings);
     }
     if (dropoutSettings.enabled) {
-      const dropAnalysis = this.tapeDropoutAnalysis || analyzeTapeDropouts(procBuffer, dropoutSettings);
-      const { restoredBuffer } = reconstructTapeDropouts(procBuffer, dropAnalysis, dropoutSettings);
-      procBuffer = restoredBuffer;
+      const dropAnalysis = analyzeTapeDropouts(procBuffer, dropoutSettings);
+      if (dropAnalysis && (dropAnalysis.events.length > 0 || dropoutSettings.mode === 'mono_wander_graft')) {
+        const { restoredBuffer } = reconstructTapeDropouts(procBuffer, dropAnalysis, dropoutSettings);
+        procBuffer = restoredBuffer;
+      }
+    }
+    const denoiseToUse = denoiseSettings || this.tapeDenoiseSettings;
+    if (denoiseToUse && (denoiseToUse.enabled || denoiseToUse.listenNoiseDeltaOnly)) {
+      procBuffer = processBufferWithSpectralDenoise(procBuffer, denoiseToUse);
     }
 
     if (targetSampleRate && procBuffer.sampleRate !== targetSampleRate) {
@@ -999,14 +1344,16 @@ export class AudioEngine {
     targetBitDepth: 16 | 24 | 32 = 24,
     targetSampleRate?: number
   ): Promise<Blob> {
-    let procBuffer = buffer;
+    let procBuffer = this.rawBuffer || buffer;
     if (azimuthSettings.enabled) {
-      procBuffer = processBufferWithAzimuthAndBalance(buffer, azimuthSettings);
+      procBuffer = processBufferWithAzimuthAndBalance(procBuffer, azimuthSettings);
     }
     if (this.tapeDropoutSettings.enabled) {
       const dropAnalysis = this.tapeDropoutAnalysis || analyzeTapeDropouts(procBuffer, this.tapeDropoutSettings);
-      const { restoredBuffer } = reconstructTapeDropouts(procBuffer, dropAnalysis, this.tapeDropoutSettings);
-      procBuffer = restoredBuffer;
+      if (dropAnalysis && (dropAnalysis.events.length > 0 || this.tapeDropoutSettings.mode === 'mono_wander_graft')) {
+        const { restoredBuffer } = reconstructTapeDropouts(procBuffer, dropAnalysis, this.tapeDropoutSettings);
+        procBuffer = restoredBuffer;
+      }
     }
     if (denoiseSettings.enabled || denoiseSettings.listenNoiseDeltaOnly) {
       procBuffer = processBufferWithSpectralDenoise(procBuffer, denoiseSettings);
@@ -1028,6 +1375,13 @@ export class AudioEngine {
 /**
  * Converts an AudioBuffer into WAV Blob preserving exact sample rate and requested bit depth
  */
+/**
+ * Converts an AudioBuffer into a universally compliant WAV Blob:
+ * - 16-bit PCM: 100% universal across Windows Media Player, macOS QuickTime, car players, TVs, phones
+ * - 24-bit PCM: Audiophile studio master with clean 3-byte packing and RIFF word-alignment
+ * - 32-bit Float: Fully compliant with mandatory RIFF 'fact' subchunk per specification
+ * - Zero-NaN / Zero-Infinity protection guarantees no corrupted audio or silent files
+ */
 export function audioBufferToWavBlob(
   buffer: AudioBuffer,
   targetBitDepth: 16 | 24 | 32 = 24,
@@ -1037,13 +1391,25 @@ export function audioBufferToWavBlob(
   const numChannels = buffer.numberOfChannels;
   const sampleRate = targetSampleRate || buffer.sampleRate;
   const bitDepth = targetBitDepth;
+  const totalFrames = buffer.length;
+
   const bytesPerSample = bitDepth / 8;
   const blockAlign = numChannels * bytesPerSample;
   const byteRate = sampleRate * blockAlign;
-  const dataLength = buffer.length * blockAlign;
-  const bufferLength = 44 + dataLength;
+  const rawDataLength = totalFrames * blockAlign;
 
-  const arrayBuffer = new ArrayBuffer(bufferLength);
+  // RIFF standard requires chunks to be 2-byte word aligned
+  const paddingByte = rawDataLength % 2;
+  const dataChunkLength = rawDataLength + paddingByte;
+
+  // 'fact' subchunk is MANDATORY for format tag 3 (IEEE Float) per RIFF specification
+  const isFloat = bitDepth === 32;
+  const factChunkLength = isFloat ? 12 : 0; // 'fact' (4) + size 4 (4) + dwSampleLength (4)
+
+  const headerLength = 44 + factChunkLength;
+  const totalBufferLength = headerLength + dataChunkLength;
+
+  const arrayBuffer = new ArrayBuffer(totalBufferLength);
   const view = new DataView(arrayBuffer);
 
   const writeString = (offset: number, str: string) => {
@@ -1052,15 +1418,16 @@ export function audioBufferToWavBlob(
     }
   };
 
-  // RIFF Chunk
+  // 1. RIFF Header
   writeString(0, 'RIFF');
-  view.setUint32(4, 36 + dataLength, true);
+  // RIFF Chunk Size = Total file size minus 8 bytes (RIFF identifier + RIFF size field)
+  view.setUint32(4, 36 + factChunkLength + dataChunkLength, true);
   writeString(8, 'WAVE');
 
-  // fmt Subchunk
+  // 2. 'fmt ' Subchunk
   writeString(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  const audioFormatTag = bitDepth === 32 ? 3 : 1; // 3 = IEEE Float, 1 = PCM Integer
+  view.setUint32(16, 16, true); // Subchunk1Size for standard PCM / Float = 16 bytes
+  const audioFormatTag = isFloat ? 3 : 1; // 1 = WAVE_FORMAT_PCM, 3 = WAVE_FORMAT_IEEE_FLOAT
   view.setUint16(20, audioFormatTag, true);
   view.setUint16(22, numChannels, true);
   view.setUint32(24, sampleRate, true);
@@ -1068,9 +1435,20 @@ export function audioBufferToWavBlob(
   view.setUint16(32, blockAlign, true);
   view.setUint16(34, bitDepth, true);
 
-  // data Subchunk
-  writeString(36, 'data');
-  view.setUint32(40, dataLength, true);
+  let curOffset = 36;
+
+  // 3. Mandatory 'fact' Subchunk for IEEE Float (WMP and QuickTime reject float WAV without this)
+  if (isFloat) {
+    writeString(curOffset, 'fact');
+    view.setUint32(curOffset + 4, 4, true); // size of fact data
+    view.setUint32(curOffset + 8, totalFrames, true); // number of sample frames
+    curOffset += 12;
+  }
+
+  // 4. 'data' Subchunk
+  writeString(curOffset, 'data');
+  view.setUint32(curOffset + 4, rawDataLength, true);
+  curOffset += 8;
 
   // Channel Interleaving
   const channelData: Float32Array[] = [];
@@ -1078,32 +1456,46 @@ export function audioBufferToWavBlob(
     channelData.push(buffer.getChannelData(c));
   }
 
-  let offset = 44;
   const maxLinear = Math.pow(10, Math.min(0, targetCeilingDb) / 20);
 
-  for (let i = 0; i < buffer.length; i++) {
+  for (let i = 0; i < totalFrames; i++) {
     for (let c = 0; c < numChannels; c++) {
       let sample = channelData[c][i];
+
+      // Robust NaN / Infinity / undefined guard
+      if (!Number.isFinite(sample)) {
+        sample = 0;
+      }
+
+      // Ceiling limiter protection
       if (sample > maxLinear) sample = maxLinear;
-      if (sample < -maxLinear) sample = -maxLinear;
+      else if (sample < -maxLinear) sample = -maxLinear;
 
       if (bitDepth === 16) {
+        // 16-bit Signed PCM (-32768 to +32767)
         const s = Math.max(-1, Math.min(1, sample));
-        const intSample = s < 0 ? s * 0x8000 : s * 0x7fff;
-        view.setInt16(offset, intSample, true);
-        offset += 2;
+        const intSample = s < 0 ? Math.round(s * 0x8000) : Math.round(s * 0x7fff);
+        view.setInt16(curOffset, intSample, true);
+        curOffset += 2;
       } else if (bitDepth === 24) {
+        // 24-bit Signed PCM (-8388608 to +8388607) Little-Endian
         const s = Math.max(-1, Math.min(1, sample));
         const intSample = Math.floor(s < 0 ? s * 8388608 : s * 8388607);
-        view.setUint8(offset, intSample & 0xff);
-        view.setUint8(offset + 1, (intSample >> 8) & 0xff);
-        view.setUint8(offset + 2, (intSample >> 16) & 0xff);
-        offset += 3;
+        view.setUint8(curOffset, intSample & 0xff);
+        view.setUint8(curOffset + 1, (intSample >> 8) & 0xff);
+        view.setUint8(curOffset + 2, (intSample >> 16) & 0xff);
+        curOffset += 3;
       } else if (bitDepth === 32) {
-        view.setFloat32(offset, sample, true);
-        offset += 4;
+        // 32-bit IEEE 754 Single-Precision Floating Point
+        view.setFloat32(curOffset, sample, true);
+        curOffset += 4;
       }
     }
+  }
+
+  // If raw data length was odd, write the 0 padding byte per RIFF specification
+  if (paddingByte > 0) {
+    view.setUint8(curOffset, 0);
   }
 
   return new Blob([arrayBuffer], { type: 'audio/wav' });
