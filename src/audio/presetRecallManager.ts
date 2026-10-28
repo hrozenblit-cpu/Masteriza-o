@@ -1,5 +1,7 @@
 import { HumanizerSettings } from '../types/audio';
 import { TapeAzimuthSettings } from './tapeAzimuthEngine';
+import { TapeDropoutSettings } from './tapeDropoutEngine';
+import { SpectralDenoiseSettings } from './spectralDenoiseEngine';
 import { AudioInputFormat } from './audioFormatDetector';
 import { BatchItem } from '../components/BatchProcessingModal';
 
@@ -13,6 +15,8 @@ export interface TrackMasterRecall {
   isCustomized?: boolean;
   humanizerSettings: HumanizerSettings;
   azimuthSettings: TapeAzimuthSettings;
+  dropoutSettings?: TapeDropoutSettings;
+  denoiseSettings?: SpectralDenoiseSettings;
   audioFormat?: {
     sampleRate: number;
     bitDepth: number;
@@ -41,7 +45,9 @@ export function generateTrackRecall(
   audioFormat?: AudioInputFormat,
   presetName?: string,
   presetId?: string,
-  isCustomized?: boolean
+  isCustomized?: boolean,
+  dropoutSettings?: TapeDropoutSettings,
+  denoiseSettings?: SpectralDenoiseSettings
 ): TrackMasterRecall {
   return {
     version: '1.0',
@@ -53,6 +59,8 @@ export function generateTrackRecall(
     isCustomized: !!isCustomized,
     humanizerSettings: { ...settings },
     azimuthSettings: { ...azimuthSettings },
+    dropoutSettings: dropoutSettings ? { ...dropoutSettings } : undefined,
+    denoiseSettings: denoiseSettings ? { ...denoiseSettings } : undefined,
     audioFormat: audioFormat
       ? {
           sampleRate: audioFormat.sampleRate,
@@ -82,7 +90,9 @@ export function generateBatchSessionRecall(
       item.format,
       item.presetName,
       item.presetId,
-      item.isCustomized
+      item.isCustomized,
+      item.customDropoutSettings,
+      item.customDenoiseSettings
     )
   );
 
@@ -135,6 +145,8 @@ export async function parseRecallFile(file: File): Promise<TrackMasterRecall | n
         isCustomized: data.isCustomized,
         humanizerSettings,
         azimuthSettings,
+        dropoutSettings: data.dropoutSettings,
+        denoiseSettings: data.denoiseSettings,
         audioFormat: data.audioFormat,
         notes: data.notes,
       };

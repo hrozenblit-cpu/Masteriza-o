@@ -55,7 +55,7 @@ import {
   SUBFOLDER_MASTERED
 } from '../audio/autoSaveManager';
 import { audioEngine } from '../audio/audioEngine';
-import { getAllPresets, UserPreset } from '../audio/presetManager';
+import { getAllPresets, UserPreset, getPresetForAudioAnalysis } from '../audio/presetManager';
 import { decodeAudioPreservingSampleRate } from '../audio/nativeAudioDecoder';
 import {
   generateTrackRecall,
@@ -192,7 +192,7 @@ export function BatchProcessingModal({
               customAzimuthSettings: selectedPreset.azimuthSettings
                 ? { ...selectedPreset.azimuthSettings }
                 : it.customAzimuthSettings,
-              isCustomized: false,
+              isCustomized: true,
             }
           : it
       )
@@ -254,7 +254,12 @@ export function BatchProcessingModal({
 
     if (newItems.length === 0) return;
 
-    setQueue((prev) => [...prev, ...newItems]);
+    // If all items in previous queue are already done, start fresh with new items so previous session doesn't linger
+    const isPreviousSessionFinished = queue.length > 0 && queue.every((it) => it.status === 'done');
+    setQueue((prev) => {
+      const baseQueue = isPreviousSessionFinished ? [] : prev;
+      return [...baseQueue, ...newItems];
+    });
 
     // Quick background analysis of audio format and azimuth for newly added files
     const ctx = audioEngine.getAudioContext();
@@ -321,39 +326,27 @@ export function BatchProcessingModal({
           ? false
           : audioNeedsTreble;
 
+        // Seleção inteligente do Preset para esta faixa analisada no lote
+        const recommendedPreset = getPresetForAudioAnalysis(forensicAnalysis, {
+          isDarkTape: trebleAnalysis.isDarkTape,
+          hasDropouts,
+          hasAzimuthError,
+          isDualMono,
+        });
+
         let itemHumanizer: HumanizerSettings = {
-          ...humanizerSettings,
+          ...recommendedPreset.settings,
           orbanHfEnabled: shouldEnableOrban,
           orbanHfBypass: !shouldEnableOrban,
           orbanHfUserOverrideLock: humanizerSettings.orbanHfUserOverrideLock ?? false,
           orbanHfMode: trebleAnalysis.recommendedMode,
-          orbanHfAmount: trebleAnalysis.isDarkTape ? 65 : 50,
+          orbanHfAmount: trebleAnalysis.isDarkTape ? 65 : (recommendedPreset.settings.orbanHfAmount || 50),
           orbanHfAutoBrillianceDb: trebleAnalysis.recommendedBrillianceDb,
           orbanHfHighShelfGainDb: trebleAnalysis.recommendedBrillianceDb,
           orbanHfThresholdDb: trebleAnalysis.recommendedThresholdDb,
           orbanHfCrossoverHz: trebleAnalysis.recommendedCrossoverHz,
           orbanHfSpeed: trebleAnalysis.recommendedSpeed,
         };
-
-        if (forensicAnalysis.metrics.nyquistCutoffHz <= 16500) {
-          itemHumanizer = {
-            ...itemHumanizer,
-            deHarshIntensity: 75,
-            notchFrequencyHz: 3400,
-            airCutoffHz: 16000,
-            airExciterGain: 80,
-            stereoCorrelationFix: 75,
-          };
-        } else if (forensicAnalysis.dominantPlatform.platform === 'udio') {
-          itemHumanizer = {
-            ...itemHumanizer,
-            deHarshIntensity: 80,
-            notchFrequencyHz: 4200,
-            airCutoffHz: 17000,
-            airExciterGain: 50,
-            stereoCorrelationFix: 80,
-          };
-        }
 
         setQueue((prev) =>
           prev.map((it) =>
@@ -365,6 +358,8 @@ export function BatchProcessingModal({
                   duration: audioBuffer.duration,
                   audioBuffer,
                   initialLufs: loudnessAnalysis.integratedLufs,
+                  presetId: recommendedPreset.id,
+                  presetName: recommendedPreset.name,
                   overallAiProbability: forensicAnalysis.overallAiProbability,
                   dominantPlatformName: forensicAnalysis.dominantPlatform.name,
                   isVintageAnalogTape: forensicAnalysis.dominantPlatform.platform === 'human_analog',
@@ -497,22 +492,47 @@ export function BatchProcessingModal({
       const file = e.target.files[0];
       const recall = await parseRecallFile(file);
       if (recall) {
+        const updatedPresetName = `Recall: ${recall.trackTitle || recall.presetName || 'Master Anterior'}`;
         setQueue((prev) =>
           prev.map((it) =>
             it.id === selectedTrackForRecall
               ? {
                   ...it,
                   presetId: recall.presetId || 'imported_recall',
-                  presetName: `Recall: ${recall.trackTitle || recall.presetName || 'Master Anterior'}`,
+                  presetName: updatedPresetName,
                   customHumanizerSettings: { ...recall.humanizerSettings },
                   customAzimuthSettings: { ...recall.azimuthSettings },
+                  customDropoutSettings: recall.dropoutSettings,
+                  customDenoiseSettings: recall.denoiseSettings,
                   isCustomized: true,
                 }
               : it
           )
         );
+
+        // Se a faixa restaurada for a mesma atualmente aberta para escuta no master, atualiza imediatamente os nós DSP
+        if (
+          typeof activeEditingIndex === 'number' &&
+          activeEditingIndex >= 0 &&
+          queue[activeEditingIndex]?.id === selectedTrackForRecall &&
+          onEditTrackInMastering
+        ) {
+          const liveItem: BatchItem = {
+            ...queue[activeEditingIndex],
+            presetId: recall.presetId || 'imported_recall',
+            presetName: updatedPresetName,
+            customHumanizerSettings: { ...recall.humanizerSettings },
+            customAzimuthSettings: { ...recall.azimuthSettings },
+            customDropoutSettings: recall.dropoutSettings,
+            customDenoiseSettings: recall.denoiseSettings,
+            isCustomized: true,
+          };
+          onEditTrackInMastering(activeEditingIndex, liveItem);
+        }
+
+        const lufs = recall.humanizerSettings?.targetLufs ?? -14;
         setDirSelectMsg(
-          `✓ Recall de master restaurado para "${recall.trackTitle}"! Parâmetros originais reaplicados com sucesso.`
+          `✓ Recall de master restaurado para "${recall.trackTitle}"! Alvo: ${lufs} LUFS e parâmetros 100% atuando no áudio.`
         );
         setTimeout(() => setDirSelectMsg(null), 5000);
       } else {
@@ -704,25 +724,19 @@ export function BatchProcessingModal({
           }
         }
 
-        // Auto-tune de-harsh and air exciter based on forensic cutoff (identical to individual mode)
-        if (!item.isCustomized) {
-          if (forensicAnalysis.metrics.nyquistCutoffHz <= 16500) {
-            trackHumanizer = {
-              ...trackHumanizer,
-              deHarshIntensity: 75,
-              notchFrequencyHz: 3400,
-              airCutoffHz: 16000,
-              airExciterGain: 80,
-              stereoCorrelationFix: 75,
-            };
-          } else if (forensicAnalysis.dominantPlatform.platform === 'udio') {
+        // Sintonia fina cirúrgica caso a faixa esteja utilizando o preset de Resgate de IA
+        if (item.presetId === 'factory_ai_rescue' || (!item.customHumanizerSettings && forensicAnalysis.overallAiProbability > 45)) {
+          if (forensicAnalysis.dominantPlatform.platform === 'udio') {
             trackHumanizer = {
               ...trackHumanizer,
               deHarshIntensity: 80,
               notchFrequencyHz: 4200,
-              airCutoffHz: 17000,
-              airExciterGain: 50,
-              stereoCorrelationFix: 80,
+            };
+          } else if (forensicAnalysis.dominantPlatform.platform === 'suno' || forensicAnalysis.metrics.nyquistCutoffHz <= 16500) {
+            trackHumanizer = {
+              ...trackHumanizer,
+              deHarshIntensity: 75,
+              notchFrequencyHz: 3400,
             };
           }
         }
@@ -866,7 +880,9 @@ export function BatchProcessingModal({
             item.format,
             item.presetName || currentGlobalPresetName,
             item.presetId,
-            item.isCustomized
+            item.isCustomized,
+            trackDropoutSettings,
+            trackDenoiseSettings
           );
           const recallBlob = recallToBlob(trackRecall);
           const recallFileName = buildRecallFilename({
@@ -992,7 +1008,7 @@ export function BatchProcessingModal({
             <div>
               <h2 className="text-base font-bold text-white flex items-center gap-2">
                 <span>Processamento em Lote & Auto-Salvamento em Pasta</span>
-                <span className="text-[10px] font-extrabold px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">v2.0</span>
+                <span className="text-[10px] font-extrabold px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">v3.0</span>
               </h2>
               <p className="text-xs text-slate-400">
                 Digitalize e processe múltiplas fitas 1/4" em fila com calibração automática de azimute e salvamento direto na pasta de sua escolha.
@@ -1231,6 +1247,22 @@ export function BatchProcessingModal({
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
+                {completedCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setQueue([]);
+                      setCurrentProcessingIndex(-1);
+                    }}
+                    disabled={isProcessingBatch}
+                    className="px-2.5 py-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-emerald-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                    title="Limpar arquivos da sessão anterior concluída e iniciar um novo lote limpo"
+                  >
+                    <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Nova Sessão (Limpar Concluídas)</span>
+                  </button>
+                )}
+
                 {queue.length > 0 && (
                   <button
                     type="button"
@@ -1493,7 +1525,7 @@ export function BatchProcessingModal({
                               <Bookmark className="w-3 h-3 text-cyan-400 shrink-0" />
                               <span className="text-slate-400 font-mono">Preset:</span>
                               <select
-                                value={item.presetId || item.presetName}
+                                value={item.presetId || allPresets.find((p) => p.name === item.presetName)?.id || allPresets[0]?.id}
                                 onChange={(e) => handleTrackPresetChange(item.id, e.target.value)}
                                 disabled={isProcessingBatch}
                                 className="bg-transparent text-[11px] font-semibold text-cyan-300 focus:outline-none cursor-pointer truncate max-w-[170px]"

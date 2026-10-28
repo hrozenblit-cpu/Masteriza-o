@@ -368,14 +368,13 @@ export function analyzeTapeAzimuth(audioBuffer: AudioBuffer): TapeAzimuthAnalysi
 
   // Determine if audio is genuine mono two-track or authentic stereo:
   // Mono Two-Track (e.g. mono tape digitized on 2-track deck, or Ampex full-track):
-  // Even with severe tape dropouts (oxide flaking in one channel) and azimuth delay,
-  // Side energy remains low compared to Mid (S/M <= -17.5 dB), and correlation is positive (>= 0.65).
-  // In true stereo mixes (with panned instruments, stereo reverbs, stereo chorus), Side energy is substantial (S/M >= -15.5 dB, typically -8 dB to -14 dB).
+  // On a genuine mono tape reading on a stereo head, Side energy is strictly residual tape noise / azimuth delay (S/M <= -26 dB)
+  // and phase correlation is >= 0.92.
+  // In true stereo mixes (even centered ones with bass/lead vocal), Side energy is substantial (S/M >= -22 dB, typically -8 dB to -18 dB).
   const isDualMono =
     !isGhostChannelDetected &&
-    (sideToMidDb <= -21.0 ||
-      (sideToMidDb <= -17.0 && (phaseCorrAfter >= 0.65 || phaseCorr >= 0.60)) ||
-      (phaseCorrAfter >= 0.88 && sideToMidDb <= -15.0));
+    (sideToMidDb <= -28.0 ||
+      (sideToMidDb <= -26.0 && (phaseCorrAfter >= 0.92 || phaseCorr >= 0.90)));
 
   const isModernStereoRecording =
     !isDualMono &&

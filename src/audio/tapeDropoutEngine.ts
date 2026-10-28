@@ -76,9 +76,9 @@ export const DEFAULT_DROPOUT_SETTINGS: TapeDropoutSettings = {
   primaryChannel: 'auto',
   patternMatchThreshold: 0.85,
   sensitivity: 'medium',
-  minDurationMs: 2.0,
+  minDurationMs: 4.0,
   maxDurationMs: 80,
-  crossfadeWindowMs: 6,
+  crossfadeWindowMs: 15,
   restoreHighFreqLoss: true, // Enabled: automatically compensates Wallace spacing loss when dropouts are repaired
   listenDropoutMaskOnly: false,
   monoCompatibilityPhaseLock: true,
@@ -188,14 +188,18 @@ export function analyzeTapeDropouts(
   const dropDbThreshold =
     sens === 'ultra' ? 6.5 : sens === 'high' ? 9.0 : sens === 'medium' ? 12.0 : 16.0;
 
-  const minDurMs = settings.minDurationMs ?? 2.0;
+  const minDurMs = settings.minDurationMs ?? 4.0;
   const maxDurMs = settings.maxDurationMs ?? 80;
   const minSamples = Math.max(8, Math.floor((minDurMs / 1000) * sampleRate));
   const maxSamples = Math.floor((maxDurMs / 1000) * sampleRate);
 
   // Window size for short-term RMS envelope tracking (~3ms window)
   const winSize = Math.max(32, Math.floor(sampleRate * 0.003));
-  const hopSize = Math.max(16, Math.floor(winSize / 2));
+  const rawHopSize = Math.max(16, Math.floor(winSize / 2));
+  // For long files (> 3 min / up to 65+ minutes), cap frames to 60,000 max to keep analysis instantaneous (< 30ms)
+  const maxFrames = 60000;
+  const initialFrames = Math.floor((totalLength - winSize) / rawHopSize);
+  const hopSize = initialFrames > maxFrames ? Math.floor((totalLength - winSize) / maxFrames) : rawHopSize;
   const numFrames = Math.floor((totalLength - winSize) / hopSize);
 
   // Check if material is Mono in 2 Channels (Ampex Full-Track / Studer 2-Track / Multi-Mono)
@@ -221,15 +225,15 @@ export function analyzeTapeDropouts(
   const sideToMidRatio = sumMidSq > 1e-6 ? Math.sqrt(sumSideSq / sumMidSq) : 0;
 
   // Accurate Mono in 2 Channels detection:
-  // On damaged mono tapes with oxide dropouts and azimuth delay, the S/M ratio elevates
-  // to -24 dB .. -18 dB (sideToMidRatio ~0.06 to 0.12) and phase correlation drops to 0.68 - 0.92.
-  // Calibrate thresholds so mono two-track tapes with flaking are correctly identified.
+  // Genuine mono two-track tapes reading on a stereo head have identical audio on L and R,
+  // where Side energy is strictly tape noise / residual bias (S/M <= -26 dB, ratio <= 0.05)
+  // and phase correlation is >= 0.95.
+  // Real stereo mixes have substantial side energy (ratio >= 0.08, S/M >= -22 dB) and must NEVER be forced into cross-mono patching!
   const isAmpexFullTrackCandidate =
-    (baseCorr >= 0.68 && sideToMidRatio <= 0.12) ||
-    sideToMidRatio <= 0.08 ||
-    (baseCorr >= 0.90 && sideToMidRatio <= 0.20);
+    (baseCorr >= 0.95 && sideToMidRatio <= 0.05) ||
+    sideToMidRatio <= 0.035;
   const mode = settings.mode || (isAmpexFullTrackCandidate ? 'ampex_fulltrack_cross' : 'stereo_independent');
-  const isCrossTrack = mode === 'ampex_fulltrack_cross' || mode === 'mono_wander_graft';
+  const isCrossTrack = (mode === 'ampex_fulltrack_cross' || mode === 'mono_wander_graft') && isAmpexFullTrackCandidate;
 
   // Compute broadband RMS envelope and high-frequency envelope (Wallace spacing loss)
   const envL = new Float32Array(numFrames);
@@ -492,9 +496,10 @@ export function analyzeTapeDropouts(
     } else {
       // Stereo independent mode:
       // True tape dropout occurs when a channel abruptly collapses relative to its OWN surrounding baseline (pre & post)
-      // This strictly prevents panning differences or wide stereo instruments from falsely triggering dropouts.
-      const isDropL = dipDbL >= dropDbThreshold && envL[f] < baseL[f] * 0.45;
-      const isDropR = dipDbR >= dropDbThreshold && envR[f] < baseR[f] * 0.45;
+      // AND suffers high-frequency loss (Wallace spacing loss).
+      // This strictly prevents panning differences, vocal sibilants, note decays, or wide stereo instruments from falsely triggering dropouts.
+      const isDropL = dipDbL >= dropDbThreshold && dipHfDbL >= (dropDbThreshold * 0.70) && envL[f] < baseL[f] * 0.35;
+      const isDropR = dipDbR >= dropDbThreshold && dipHfDbR >= (dropDbThreshold * 0.70) && envR[f] < baseR[f] * 0.35;
 
       if (isDropL && isDropR) {
         isDipBoth = true;
@@ -542,9 +547,9 @@ export function analyzeTapeDropouts(
       if (!inDropoutL) {
         inDropoutL = true;
         startFrameL = f;
-        maxDepthDbL = Math.max(dipDbL, lrRatioDb);
+        maxDepthDbL = isMonoMode ? Math.max(dipDbL, lrRatioDb) : dipDbL;
       } else {
-        const d = Math.max(dipDbL, lrRatioDb);
+        const d = isMonoMode ? Math.max(dipDbL, lrRatioDb) : dipDbL;
         if (d > maxDepthDbL) maxDepthDbL = d;
       }
     } else if (inDropoutL) {
@@ -572,9 +577,9 @@ export function analyzeTapeDropouts(
       if (!inDropoutR) {
         inDropoutR = true;
         startFrameR = f;
-        maxDepthDbR = Math.max(dipDbR, rlRatioDb);
+        maxDepthDbR = isMonoMode ? Math.max(dipDbR, rlRatioDb) : dipDbR;
       } else {
-        const d = Math.max(dipDbR, rlRatioDb);
+        const d = isMonoMode ? Math.max(dipDbR, rlRatioDb) : dipDbR;
         if (d > maxDepthDbR) maxDepthDbR = d;
       }
     } else if (inDropoutR) {
@@ -599,7 +604,7 @@ export function analyzeTapeDropouts(
   }
 
   // Merge close fragmented micro-slices into unified, coherent tape dropout events
-  let mergedEvents = mergeCloseDropoutEvents(rawEvents, 30);
+  let mergedEvents = mergeCloseDropoutEvents(rawEvents, 45);
   if (mergedEvents.length > 120) {
     // Keep the most prominent tape dropouts by severity (depth * duration) to guarantee instant UI rendering
     mergedEvents = [...mergedEvents]
@@ -753,7 +758,10 @@ function analyzeSingleChannelDropouts(
   const maxSamples = Math.floor((maxDurMs / 1000) * sampleRate);
 
   const winSize = Math.max(32, Math.floor(sampleRate * 0.003));
-  const hopSize = Math.max(16, Math.floor(winSize / 2));
+  const rawHopSize = Math.max(16, Math.floor(winSize / 2));
+  const maxFrames = 60000;
+  const initialFrames = Math.floor((totalLength - winSize) / rawHopSize);
+  const hopSize = initialFrames > maxFrames ? Math.floor((totalLength - winSize) / maxFrames) : rawHopSize;
   const numFrames = Math.floor((totalLength - winSize) / hopSize);
 
   const env = new Float32Array(numFrames);
@@ -1013,7 +1021,12 @@ export function reconstructTapeDropouts(
   //    Com o canal mestre 100% recuperado, ele é duplicado para a saída:
   //    L = Mestre Restaurado e R = Mestre Restaurado.
   // =========================================================================
-  if (settings.mode === 'mono_wander_graft') {
+  // ESTABILIZADOR MONO COM ENXERTO INTELIGENTE (Canal Mestre & Enxerto)
+  // Cures rapid L/R oscillation and dropouts on mono two-track tapes.
+  // Strictly guarded: only applies if tape is confirmed true mono (dual-mono).
+  // Authentic stereo tapes are strictly processed in stereo_independent mode!
+  // =========================================================================
+  if (settings.mode === 'mono_wander_graft' && analysis.isAmpexFullTrackCandidate) {
     const recPrimary = analysis.channelComparison?.recommendedPrimary || 'L';
     const primaryChIdx = settings.primaryChannel === 'L' ? 0 : settings.primaryChannel === 'R' ? 1 : (recPrimary === 'R' ? 1 : 0);
     const secondaryChIdx = 1 - primaryChIdx;
@@ -1149,7 +1162,7 @@ export function reconstructTapeDropouts(
   // STANDARD MODES: Stereo Independente, Ampex Full-Track Cross, Soma Mono
   // =========================================================================
   const effectiveMode = settings.mode;
-  const isAmpexCross = effectiveMode === 'ampex_fulltrack_cross' || effectiveMode === 'mono_optimized_sum';
+  const isAmpexCross = (effectiveMode === 'ampex_fulltrack_cross' || effectiveMode === 'mono_optimized_sum') && analysis.isAmpexFullTrackCandidate;
   const enforcePhaseLock = settings.monoCompatibilityPhaseLock !== false;
 
   // Anti-Flanger Architecture for Ampex Full-Track Cross & Mono Modes:
@@ -1170,12 +1183,12 @@ export function reconstructTapeDropouts(
     }
   }
 
-  // Pre-merge micro-clusters closer than 35ms on the same channel into unified repair regions
-  const preMergedEvents = mergeCloseDropoutEvents(analysis.events, 35);
+  // Pre-merge micro-clusters closer than 50ms on the same channel into unified repair regions
+  const preMergedEvents = mergeCloseDropoutEvents(analysis.events, 50);
   const sortedEvents = [...preMergedEvents].sort((a, b) => a.timeSeconds - b.timeSeconds);
   let lastRepairedEndL = 0;
   let lastRepairedEndR = 0;
-  const fadeMs = Math.max(8, settings.crossfadeWindowMs || 10);
+  const fadeMs = Math.max(15, settings.crossfadeWindowMs || 15);
   const stdFadeSamples = Math.floor((fadeMs / 1000) * sampleRate);
 
   for (const event of sortedEvents) {
@@ -1189,7 +1202,7 @@ export function reconstructTapeDropouts(
 
     // --- CASE 1: Dropout on Channel L ---
     if (event.channel === 'L') {
-      if (effectiveMode === 'ampex_fulltrack_cross') {
+      if (effectiveMode === 'ampex_fulltrack_cross' && analysis.isAmpexFullTrackCandidate) {
         patchChannelWithOpposite(
           dstL,
           donorR,
@@ -1213,7 +1226,8 @@ export function reconstructTapeDropouts(
           event.depthDb,
           isFlake,
           settings.restoreHighFreqLoss,
-          lastRepairedEndL
+          lastRepairedEndL,
+          stdFadeSamples
         );
         lastRepairedEndL = Math.min(totalLength, endSample + stdFadeSamples);
       }
@@ -1222,7 +1236,7 @@ export function reconstructTapeDropouts(
     }
     // --- CASE 2: Dropout on Channel R ---
     else if (event.channel === 'R') {
-      if (effectiveMode === 'ampex_fulltrack_cross') {
+      if (effectiveMode === 'ampex_fulltrack_cross' && analysis.isAmpexFullTrackCandidate) {
         patchChannelWithOpposite(
           dstR,
           donorL,
@@ -1246,7 +1260,8 @@ export function reconstructTapeDropouts(
           event.depthDb,
           isFlake,
           settings.restoreHighFreqLoss,
-          lastRepairedEndR
+          lastRepairedEndR,
+          stdFadeSamples
         );
         lastRepairedEndR = Math.min(totalLength, endSample + stdFadeSamples);
       }
@@ -1263,7 +1278,8 @@ export function reconstructTapeDropouts(
         event.depthDb,
         isFlake,
         settings.restoreHighFreqLoss,
-        lastRepairedEndL
+        lastRepairedEndL,
+        stdFadeSamples
       );
       repairSingleChannelDropout(
         dstR,
@@ -1273,7 +1289,8 @@ export function reconstructTapeDropouts(
         event.depthDb,
         isFlake,
         settings.restoreHighFreqLoss,
-        lastRepairedEndR
+        lastRepairedEndR,
+        stdFadeSamples
       );
       lastRepairedEndL = Math.min(totalLength, endSample + stdFadeSamples);
       lastRepairedEndR = Math.min(totalLength, endSample + stdFadeSamples);
@@ -1694,7 +1711,7 @@ function patchChannelWithOpposite(
 
     // Fallback if correlation at zero lag is poor (< 0.65)
     if (normCorr < 0.65) {
-      repairSingleChannelDropout(dst, safeStart, safeEnd, sampleRate, depthDb, isFlake, restoreHf, lastRepairedEnd);
+      repairSingleChannelDropout(dst, safeStart, safeEnd, sampleRate, depthDb, isFlake, restoreHf, lastRepairedEnd, actualFadeIn);
       return;
     }
   }
@@ -1813,7 +1830,8 @@ function repairSingleChannelDropout(
   depthDb: number,
   isFlake: boolean,
   restoreHf = false,
-  lastRepairedEnd = 0
+  lastRepairedEnd = 0,
+  crossfadeSamples = 0
 ) {
   const total = dst.length;
   if (start >= total || end <= start) return;
@@ -1824,8 +1842,11 @@ function repairSingleChannelDropout(
   const dur = s1 - s0;
   if (dur <= 0) return;
 
-  const fadeLen = Math.max(16, Math.floor(sampleRate * 0.003)); // 3ms smooth transition
-  const preStart = Math.max(lastRepairedEnd, s0 - fadeLen);
+  // Generous, click-free crossfade window: at least 15ms (e.g. ~660 samples at 44.1kHz)
+  // Sub-audible transition rate prevents any transient clicks or 'estalos' on gain ramps
+  const minFadeSamples = Math.floor(sampleRate * 0.015);
+  const fadeLen = Math.max(minFadeSamples, crossfadeSamples || minFadeSamples);
+  const preStart = Math.max(0, Math.min(s0 - 32, Math.max(lastRepairedEnd, s0 - fadeLen)));
   const postEnd = Math.min(total, s1 + fadeLen);
 
   // Measure RMS of damaged section vs surrounding healthy section
@@ -1854,8 +1875,9 @@ function repairSingleChannelDropout(
   // If there is residual signal in the dropout (even if down by 20 dB):
   if (rmsDamaged > 0.00008 && rmsHealthy > 0.001) {
     const rawRatio = rmsHealthy / Math.max(1e-5, rmsDamaged);
-    // Safe physical gain limit: +12 dB (factor ~4.0) to prevent over-amplifying low-level tape noise or transient clipping
-    const maxSafeGain = Math.min(4.0, Math.pow(10, Math.min(12.0, Math.max(2.0, depthDb)) / 20));
+    // Safe physical gain limit: +6 dB (factor ~2.0)
+    // Guarantees zero clicks, pops or sudden volume bursts while gently restoring physical tape spacing loss
+    const maxSafeGain = Math.min(2.0, Math.pow(10, Math.min(6.0, Math.max(1.5, depthDb)) / 20));
     let effectiveGain = Math.min(rawRatio, maxSafeGain);
 
     // Peak protection: ensure that effectiveGain never boosts any sample into clipping or above healthy peaks
@@ -1864,17 +1886,18 @@ function repairSingleChannelDropout(
       const a = Math.abs(dst[i]);
       if (a > maxDamagedPeak) maxDamagedPeak = a;
     }
-    const maxAllowedPeak = Math.max(0.08, rmsHealthy * 2.5);
+    const maxAllowedPeak = Math.max(0.08, rmsHealthy * 2.0);
     if (maxDamagedPeak * effectiveGain > maxAllowedPeak) {
       effectiveGain = Math.max(1.0, maxAllowedPeak / Math.max(1e-5, maxDamagedPeak));
     }
 
     if (effectiveGain > 1.05) {
-      let prevIn = preStart > 0 ? dst[preStart - 1] : 0;
-      const hfGain = 0.28; // Gentle +2.2 dB high-shelf boost
+      let hpState = dst[preStart];
+      const hfGain = 0.10; // Gentle +0.8 dB high-shelf boost without amplifying tape hiss
+      const alpha = 0.25;
 
-      const tPreLen = Math.max(1, s0 - preStart);
-      const tPostLen = Math.max(1, postEnd - s1);
+      const tPreLen = Math.max(32, s0 - preStart);
+      const tPostLen = Math.max(32, postEnd - s1);
 
       for (let i = preStart; i < postEnd; i++) {
         let w = 1.0;
@@ -1889,24 +1912,34 @@ function repairSingleChannelDropout(
         const mult = 1.0 + (effectiveGain - 1.0) * w;
         let sample = dst[i] * mult;
 
-        if (restoreHf) {
-          // Continuous Wallace spacing loss compensation without threshold discontinuities (eliminates clicks/estalos)
-          const hp = sample - prevIn;
-          prevIn = sample;
-          sample = sample + hp * hfGain * w;
+        if (restoreHf && w > 0) {
+          // Smooth 1-pole high-pass for Wallace spacing loss restoration without DC discontinuities or estalos
+          hpState += alpha * (dst[i] - hpState);
+          const highFreq = dst[i] - hpState;
+          sample += highFreq * hfGain * w;
         }
 
         dst[i] = softTapeLimit(sample);
       }
       return;
     }
+
+    // If effectiveGain <= 1.05, the audio level in this window is already healthy and normal.
+    // Must return immediately to avoid destroying genuine audio with void inpainting!
+    return;
   }
 
-  // --- CASE 2: Complete Void / Total Flake (Zero Residual Signal) ---
-  // In the rare event of complete physical tape oxide shedding (rmsDamaged <= 0.00008),
-  // use smooth bidirectional Hann crossfade from surrounding boundaries.
-  // Smooth reflection without modulo wrap-around clicks or robotic tones.
+  // If surrounding passage is near silence (tape leader, musical pause, fade-out), do not synthesize artificial inpainting bursts
+  if (rmsHealthy <= 0.001) {
+    return;
+  }
+
+  // --- CASE 2: Complete Void / Total Flake (Zero Residual Signal: rmsDamaged <= 0.00008) ---
+  // Smooth bidirectional Hann crossfade from surrounding boundaries with edge tapering to prevent estalos
   const gapLen = s1 - s0;
+  if (gapLen <= 0) return;
+  const xFadeLen = Math.min(Math.floor(gapLen * 0.4), Math.max(32, Math.floor(sampleRate * 0.015)));
+
   for (let i = 0; i < gapLen; i++) {
     const idx = s0 + i;
     const p = (i + 1) / (gapLen + 1);
@@ -1916,7 +1949,17 @@ function repairSingleChannelDropout(
     const postOffset = Math.min(gapLen - 1 - i, Math.max(0, postEnd - s1));
     const sPre = dst[Math.max(0, s0 - 1 - preOffset)];
     const sPost = dst[Math.min(total - 1, s1 + postOffset)];
-    const blended = (1 - w) * sPre + w * sPost;
+    let blended = (1 - w) * sPre + w * sPost;
+
+    // Smoothly blend into authentic boundary samples at the beginning and end of the gap
+    if (i < xFadeLen && s0 > 0) {
+      const taper = 0.5 * (1 - Math.cos(Math.PI * (i / xFadeLen)));
+      blended = dst[s0 - 1] * (1 - taper) + blended * taper;
+    } else if (i > gapLen - 1 - xFadeLen && s1 < total) {
+      const taper = 0.5 * (1 - Math.cos(Math.PI * ((gapLen - 1 - i) / xFadeLen)));
+      blended = dst[s1] * (1 - taper) + blended * taper;
+    }
+
     dst[idx] = softTapeLimit(blended);
   }
 }
@@ -1930,10 +1973,11 @@ function applyMonoDropoutInpainting(
   sampleRate: number,
   settings: TapeDropoutSettings
 ) {
+  const fadeSamples = Math.floor(sampleRate * (Math.max(12, settings.crossfadeWindowMs || 15) / 1000));
   for (const ev of events) {
     const s = Math.floor(ev.timeSeconds * sampleRate);
     const e = Math.min(dst.length, s + Math.floor((ev.durationMs / 1000) * sampleRate));
-    repairSingleChannelDropout(dst, s, e, sampleRate, ev.depthDb, ev.type === 'oxide_flake', settings.restoreHighFreqLoss);
+    repairSingleChannelDropout(dst, s, e, sampleRate, ev.depthDb, ev.type === 'oxide_flake', settings.restoreHighFreqLoss, 0, fadeSamples);
     ev.reconstructed = true;
   }
 }

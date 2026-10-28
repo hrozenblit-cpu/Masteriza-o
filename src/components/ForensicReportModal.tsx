@@ -21,7 +21,7 @@ export function ForensicReportModal({
   if (!isOpen || !report) return null;
 
   const handleCopySummary = () => {
-    const text = `=== RELATÓRIO TÉCNICO DE MASTERIZAÇÃO & ANÁLISE ESPECTRAL ===
+    const text = `=== RELATÓRIO TÉCNICO DE MASTERIZAÇÃO & ANÁLISE ESPECTRAL (AuraTune Studio v3.0) ===
 Arquivo: ${report.filename}
 Data/Hora: ${report.timestamp}
 Diagnóstico Tonal: ${report.verdict}
@@ -71,7 +71,7 @@ ${report.summaryDiagnosis}
             <div>
               <h2 className="text-base font-bold text-white tracking-tight flex items-center gap-2">
                 <span>Relatório Técnico de Masterização & Análise Espectral</span>
-                <span className="text-[10px] font-extrabold px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">v2.0</span>
+                <span className="text-[10px] font-extrabold px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">v3.0</span>
               </h2>
               <div className="flex items-center gap-2 text-xs text-slate-400 mt-0.5">
                 <span>{report.filename}</span>

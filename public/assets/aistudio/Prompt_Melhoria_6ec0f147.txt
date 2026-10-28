@@ -1,0 +1,118 @@
+=============== Prompt Melhoria de Layout ====================
+
+Melhore o layout responsivo do AuraTune Studio, incluindo menu hambúrguer, card superior de importação, área de status, controles dos módulos e toda a barra inferior de reprodução e monitoramento.
+
+Objetivo: aproveitar ao máximo a área útil da tela no desktop e no mobile, com espaçamento equilibrado, boa legibilidade e acesso a todas as funções, preservando a identidade visual e o funcionamento atual.
+
+Antes de implementar, inspecione os componentes, estilos, estados e fluxo de áudio existentes. Faça mudanças pequenas e localizadas, reutilizando a arquitetura atual. Não reescreva a aplicação.
+
+1. Aproveitamento de tela e organização geral
+
+- Reduza margens externas exageradas, grandes espaços vazios e limitações de largura que deixem o sistema desnecessariamente estreito no desktop.
+- Use a largura disponível de forma fluida, com margens menores no celular e espaçamentos proporcionais no desktop.
+- Distribua os controles com equilíbrio, sem esticá-los artificialmente nem afastar ações relacionadas.
+- Organize cards e painéis em colunas quando houver espaço e empilhe-os no mobile.
+- Evite alturas fixas em áreas com conteúdo variável.
+- Textos, botões e controles devem se adaptar sem cortes, sobreposições ou rolagem horizontal da página.
+- Preserve a identidade escura com detalhes em ciano e a hierarquia visual existente.
+
+2. Cabeçalho e menu hambúrguer
+
+- Preserve marca e versão.
+- Corrija o corte horizontal da navegação superior.
+- No mobile, apresente um botão hambúrguer que abra um painel lateral com todos os módulos existentes.
+- No desktop, mantenha a navegação visível enquanto houver espaço; use o menu recolhível quando necessário.
+- Preserve nomes, ícones, ordem, ações e indicação do módulo ativo.
+- Use uma única fonte de dados para gerar os itens de navegação.
+- Permita fechar pelo botão de fechar, clique fora, Escape e seleção de um módulo.
+- Inclua navegação por teclado, identificação acessível, gerenciamento de foco e retorno do foco ao botão de abertura.
+- Abrir ou fechar o menu não pode interromper reprodução nem apagar configurações.
+
+3. Card superior de importação
+
+- Reorganize o “Console de Ingestão de Áudio & Masterização” para ocupar menos altura desnecessária.
+- Preserve seleção de arquivo, arrastar e soltar, união de arquivos Split Pro Tools e processamento em lote.
+- No desktop, distribua as ações e informações aproveitando a largura.
+- No mobile, empilhe as ações e permita quebra de texto nos botões.
+- Preserve todas as informações de formatos, resolução, vídeo, True-Peak e LUFS.
+- Mantenha o comportamento atual quando um arquivo já estiver carregado.
+
+4. Área de status e seleção de módulos
+
+- Ajuste a área que apresenta “Aguardando arquivo de áudio ou digitalização de fita 1/4" para iniciar”.
+- Esse texto deve ficar totalmente legível, com quebra de linha natural e altura adaptável.
+- No mobile, organize status e seletores de módulos em linhas ou blocos distintos.
+- No desktop, distribua-os conforme o espaço disponível, sem comprimir o aviso ou cortar os seletores.
+- Preserve os estados de aguardando, carregando, processando, concluído e erro que já existirem.
+
+5. Barra inferior: reprodução e sinal monitorado
+
+Corrija especialmente o corte no mobile na região do play/pause e de “Sinal monitorado”.
+
+Preserve e reorganize todos os controles existentes:
+- Play/pause, parar e demais ações de transporte.
+- Tempo atual, duração e barra de progresso.
+- Identificação do sinal monitorado e comparação A/B.
+- Medidores de saída digital, LUFS e True-Peak.
+- Controle de volume de monitoramento.
+- Exportação do master.
+
+No desktop:
+- Aproveite a largura disponível para distribuir grupos relacionados.
+- Mantenha os controles alinhados e os textos legíveis.
+- Quando não couberem em uma linha, reorganize em duas linhas antes de ocorrer qualquer corte.
+
+No mobile:
+- Não mantenha todos os controles comprimidos em uma única linha.
+- Organize transporte, tempos e progresso em um grupo; sinal monitorado e A/B em outro; medidores e volume em outro; exportação em uma linha adequada.
+- Permita que a barra de progresso aproveite a largura disponível.
+- Garanta que o nome do sinal monitorado possa quebrar linha sem esconder o A/B.
+- Preserve valores e unidades dos medidores.
+- Mantenha áreas de toque de pelo menos 44 × 44 px.
+- Nenhuma ação pode depender de passar o mouse.
+
+Avalie a fixação da barra inferior:
+- Se permanecer fixa ou aderente, reserve no conteúdo o espaço correspondente à sua altura real, inclusive quando ocupar várias linhas.
+- Respeite as áreas seguras do dispositivo.
+- Em telas de pouca altura ou com teclado virtual aberto, evite que a barra ocupe a maior parte da tela ou impeça acessar o conteúdo. Adapte sua posição quando necessário.
+- O último card e seus botões devem continuar completamente acessíveis.
+
+6. Área final de reprodução e exportação
+
+Ajuste também o card final que contém “Reproduzir”, “Masterizado (A/B)”, seleção de 16-bit/24-bit e “Exportar Master Final WAV (24-bit) + Preset”.
+
+- No desktop, organize os grupos para aproveitar a largura, reduzindo o grande vazio entre reprodução e exportação.
+- No mobile, distribua os grupos em linhas, mantendo a relação entre seleção de resolução e exportação.
+- Permita quebra de texto sem truncar o nome das ações.
+- Preserve estados selecionados, desabilitados, carregamento e progresso.
+- Se houver ações semelhantes nesse card e na barra inferior, preserve seus comportamentos e mantenha o estado sincronizado. Não remova controles sem verificar sua função.
+
+7. Preservação funcional e desempenho
+
+- Não altere algoritmos de áudio, cadeia de processamento, parâmetros, formatos, resolução, taxa de amostragem ou regras de exportação.
+- Preserve arquivos carregados, ajustes, posição de reprodução e estado dos módulos durante mudanças de layout.
+- Não duplique players, instâncias de AudioContext, processadores, listeners ou requisições.
+- Evite desmontar e remontar componentes responsáveis pelo áudio ao abrir o menu ou mudar a largura da tela.
+- Priorize CSS responsivo e os recursos já disponíveis no projeto.
+- Não adicione bibliotecas pesadas para implementar menu ou layout.
+- Use animações leves e respeite a preferência por movimento reduzido.
+- Corrija a origem dos transbordamentos. Não use overflow-x: hidden global para esconder controles cortados.
+- Não substitua funcionalidades reais por simulações.
+
+8. Validação e critérios de aceite
+
+Verifique o layout em 320, 360, 390, 768, 1024, 1440 e 1920 px, incluindo celular na horizontal e zoom de 200%.
+
+Confirme que:
+- Nenhum controle ou texto essencial fica cortado.
+- Não existe rolagem horizontal da página.
+- Todos os módulos continuam acessíveis.
+- O aviso de arquivo e a área “Sinal monitorado” aparecem completos.
+- A barra inferior não encobre o conteúdo final.
+- Play/pause, progresso, A/B, volume, processamento e exportação continuam funcionando.
+- Abrir o menu e redimensionar a janela não interrompem áudio nem apagam ajustes.
+- As alterações não introduzem erros de console ou piora perceptível de desempenho.
+
+Execute o build e os testes disponíveis, incluindo verificações de regressão nos fluxos afetados. Declare claramente o que foi testado e o que não pôde ser validado.
+
+Entregue a implementação e um resumo dos arquivos alterados, das melhorias realizadas e das validações, com capturas do resultado no desktop e no mobile.

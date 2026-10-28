@@ -1,5 +1,5 @@
 import React, { useRef } from 'react';
-import { UploadCloud, Radio, Disc3, Layers, Info, Sparkles, CheckCircle2, Music2, Cpu, FolderDown, FileText, Tag, User, GitFork, X } from 'lucide-react';
+import { UploadCloud, Radio, Disc3, Layers, Info, Sparkles, CheckCircle2, Music2, Cpu, FolderDown, FileText, Tag, User, GitFork, X, Bookmark, RefreshCw } from 'lucide-react';
 import { AudioInputFormat } from '../audio/audioFormatDetector';
 import { buildMasterWavFilename, stripAudioFileExtension } from '../audio/trackNamingHelper';
 import { analyzeSplitStereoFilename, findSplitStereoPair } from '../audio/splitStereoManager';
@@ -33,6 +33,8 @@ interface AudioUploaderProps {
   artistName?: string;
   onUpdateArtistName?: (artist: string) => void;
   targetLufs?: number;
+  currentPresetName?: string;
+  onReanalyze?: () => void;
 }
 
 export function AudioUploader({
@@ -57,6 +59,8 @@ export function AudioUploader({
   artistName = '',
   onUpdateArtistName,
   targetLufs = -14,
+  currentPresetName,
+  onReanalyze,
 }: AudioUploaderProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const partnerFileInputRef = useRef<HTMLInputElement>(null);
@@ -183,7 +187,29 @@ export function AudioUploader({
   };
 
   return (
-    <div className="bg-[#0e1320] border border-slate-800 rounded-xl p-4 md:p-5 flex flex-col gap-4 shadow-lg">
+    <div
+      onDragOver={handleDrag}
+      onDragLeave={handleDrag}
+      onDrop={handleDrop}
+      className={`bg-[#0e1320] border rounded-xl p-4 md:p-5 flex flex-col gap-4 shadow-lg relative transition-all ${
+        isDragOver ? 'border-cyan-400 bg-cyan-950/30 ring-2 ring-cyan-500/30' : 'border-slate-800'
+      }`}
+    >
+      {/* Visual Drop Overlay when dragging a new track over an already loaded session */}
+      {hasAudioLoaded && isDragOver && (
+        <div className="absolute inset-0 z-30 rounded-xl bg-[#090e1a]/95 backdrop-blur-sm border-2 border-dashed border-cyan-400 flex flex-col items-center justify-center gap-2 pointer-events-none p-6 text-center">
+          <div className="p-3.5 rounded-2xl bg-cyan-400/20 text-cyan-300 shadow-lg">
+            <UploadCloud className="w-9 h-9 animate-bounce" />
+          </div>
+          <h4 className="text-base font-bold text-white">
+            Solte o novo arquivo aqui para substituir a música
+          </h4>
+          <p className="text-xs text-slate-300 max-w-md">
+            A sessão anterior será encerrada e o novo áudio será decodificado na taxa nativa e masterizado com seu preset ideal.
+          </p>
+        </div>
+      )}
+
       {/* Header section with status & mode switch */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800/80">
         <div>
@@ -301,17 +327,17 @@ export function AudioUploader({
           onDragLeave={handleDrag}
           onDrop={handleDrop}
           onClick={() => fileInputRef.current?.click()}
-          className={`rounded-xl border-2 p-8 flex flex-col items-center justify-center text-center cursor-pointer transition-all group relative ${
+          className={`rounded-xl border-2 p-4 sm:p-6 lg:p-7 flex flex-col items-center justify-center text-center cursor-pointer transition-all group relative ${
             isDragOver
               ? 'border-cyan-400 bg-cyan-500/10 scale-[1.005]'
               : 'border-dashed border-cyan-500/30 hover:border-cyan-400 bg-[#121828]/50 hover:bg-[#141b2e]'
           }`}
         >
-          <div className="p-4 rounded-2xl bg-cyan-400/10 text-cyan-400 group-hover:scale-105 group-hover:bg-cyan-400 group-hover:text-slate-950 transition-all mb-3 shadow-inner">
-            <UploadCloud className="w-8 h-8" />
+          <div className="p-3 sm:p-3.5 rounded-2xl bg-cyan-400/10 text-cyan-400 group-hover:scale-105 group-hover:bg-cyan-400 group-hover:text-slate-950 transition-all mb-2.5 shadow-inner">
+            <UploadCloud className="w-7 h-7 sm:w-8 sm:h-8" />
           </div>
 
-          <h3 className="text-base font-bold text-white tracking-wide">
+          <h3 className="text-sm sm:text-base font-bold text-white tracking-wide">
             {isAnalyzing ? (
               <span className="flex items-center justify-center gap-2 text-cyan-300">
                 <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-ping inline-block" />
@@ -322,15 +348,15 @@ export function AudioUploader({
             )}
           </h3>
 
-          <p className="text-xs text-slate-400 mt-1.5 max-w-xl leading-relaxed">
+          <p className="text-xs text-slate-400 mt-1 max-w-xl leading-relaxed">
             Suporta <strong className="text-slate-300">WAV, MP3, FLAC, M4A, AAC, AIFF</strong> e vídeos <strong className="text-cyan-300">MP4, MPG4, MOV, WebM</strong>.
-            Totalmente compatível com estúdio em alta resolução até <span className="text-amber-300 font-semibold font-mono">192 kHz / 24-bit</span> e 32-bit float, preservando a taxa nativa de entrada sem resampling forçado.
+            Compatível com estúdio em alta resolução até <span className="text-amber-300 font-semibold font-mono">192 kHz / 24-bit</span> e 32-bit float, preservando a taxa nativa de entrada sem resampling forçado.
           </p>
 
-          <div className="mt-4 flex flex-wrap items-center justify-center gap-3">
+          <div className="mt-3.5 flex flex-wrap items-center justify-center gap-2.5 w-full">
             <button
               type="button"
-              className="px-4 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs tracking-tight transition-all shadow-md shadow-cyan-500/20"
+              className="px-4 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs tracking-tight transition-all shadow-md shadow-cyan-500/20 min-h-[44px] flex items-center justify-center cursor-pointer w-full sm:w-auto"
             >
               Selecionar Arquivo (Áudio ou Vídeo MP4)
             </button>
@@ -345,10 +371,10 @@ export function AudioUploader({
                   splitStereoInputRef.current?.click();
                 }
               }}
-              className="px-4 py-2 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 font-bold text-xs tracking-tight transition-all flex items-center gap-1.5 shadow-sm cursor-pointer"
+              className="px-4 py-2.5 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 font-bold text-xs tracking-tight transition-all flex items-center justify-center gap-1.5 shadow-sm cursor-pointer min-h-[44px] w-full sm:w-auto"
               title="Selecione os dois arquivos .L e .R do Pro Tools para uni-los em um estéreo de 2 canais"
             >
-              <GitFork className="w-3.5 h-3.5 text-emerald-400" />
+              <GitFork className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
               <span>Unir Split Pro Tools (.L e .R)</span>
             </button>
 
@@ -359,17 +385,19 @@ export function AudioUploader({
                   e.stopPropagation();
                   onOpenBatch();
                 }}
-                className="px-4 py-2 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 font-bold text-xs tracking-tight transition-all flex items-center gap-1.5 shadow-sm"
+                className="px-4 py-2.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 font-bold text-xs tracking-tight transition-all flex items-center justify-center gap-1.5 shadow-sm min-h-[44px] w-full sm:w-auto cursor-pointer"
               >
-                <FolderDown className="w-3.5 h-3.5 text-amber-400" />
+                <FolderDown className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                 <span>Processar Fitas / Mídias em Lote</span>
               </button>
             )}
 
-            <span className="text-[11px] font-mono text-slate-500">ou arraste arquivos individuais / em lote aqui</span>
+            <span className="text-[11px] font-mono text-slate-500 block sm:inline w-full sm:w-auto text-center mt-1 sm:mt-0">
+              ou arraste arquivos individuais / em lote aqui
+            </span>
           </div>
 
-          <div className="mt-6 pt-4 border-t border-slate-800/80 grid grid-cols-1 sm:grid-cols-3 gap-4 w-full max-w-2xl text-left">
+          <div className="mt-4 pt-3.5 border-t border-slate-800/80 grid grid-cols-1 sm:grid-cols-3 gap-2.5 sm:gap-4 w-full max-w-3xl text-left">
             <div className="flex items-start gap-2 text-xs text-slate-400">
               <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
               <span><strong>192 kHz / 24-bit Nativo:</strong> Resolução de estúdio master preservada sem conversão destrutiva.</span>
@@ -387,21 +415,24 @@ export function AudioUploader({
       ) : (
         // State 2: High-end hardware telemetry card when audio IS loaded
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5 items-stretch">
-          {/* Active file card (7 cols) */}
-          <div className="lg:col-span-7 p-4 rounded-xl bg-[#12192b] border border-cyan-500/40 flex flex-col justify-between gap-3 shadow-md">
-            <div className="flex items-start justify-between gap-2">
-              <div className="flex items-center gap-2.5">
-                <div className="p-2.5 rounded-lg bg-cyan-500/10 text-cyan-400">
+          {/* Active file card (8 cols on XL, 7 cols on LG) */}
+          <div className="lg:col-span-7 xl:col-span-8 p-4 rounded-xl bg-[#12192b] border border-cyan-500/40 flex flex-col justify-between gap-3 shadow-md">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-1 border-b border-slate-800/60">
+              <div className="flex items-start gap-2.5 min-w-0 flex-1">
+                <div className="p-2.5 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 shrink-0 mt-0.5">
                   <Music2 className="w-5 h-5" />
                 </div>
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-emerald-950/80 text-emerald-300 border border-emerald-500/40">
+                <div className="min-w-0 flex-1">
+                  <h3 className="text-sm sm:text-base font-bold text-white truncate" title={currentTrackTitle}>
+                    {currentTrackTitle}
+                  </h3>
+                  <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                    <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-emerald-950/80 text-emerald-300 border border-emerald-500/40 whitespace-nowrap">
                       MÚSICA CARREGADA
                     </span>
                     {detectedPlatformName && (
                       <span
-                        className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+                        className={`text-[10px] font-mono px-2 py-0.5 rounded border whitespace-nowrap ${
                           (overallAiProbability ?? 0) > 40
                             ? 'text-amber-300 bg-amber-950/50 border-amber-600/30'
                             : 'text-emerald-300 bg-emerald-950/50 border-emerald-500/40'
@@ -412,14 +443,21 @@ export function AudioUploader({
                           : `${detectedPlatformName}`}
                       </span>
                     )}
+                    {currentPresetName && (
+                      <span
+                        className="text-[10px] font-mono px-2 py-0.5 rounded border text-cyan-300 bg-cyan-950/60 border-cyan-500/40 flex items-center gap-1 font-semibold whitespace-nowrap"
+                        title="Preset de masterização selecionado e atuando"
+                      >
+                        <Bookmark className="w-2.5 h-2.5 text-cyan-400" />
+                        <span>Preset: {currentPresetName}</span>
+                      </span>
+                    )}
                   </div>
-                  <h3 className="text-sm font-bold text-white mt-1 truncate max-w-[340px] sm:max-w-[420px]">
-                    {currentTrackTitle}
-                  </h3>
                 </div>
               </div>
 
-              <div className="flex items-center gap-2">
+              {/* Action Buttons with wrapping and guaranteed visible labels */}
+              <div className="flex flex-wrap items-center gap-1.5 shrink-0 justify-start sm:justify-end">
                 <button
                   type="button"
                   onClick={() => {
@@ -429,12 +467,25 @@ export function AudioUploader({
                       splitStereoInputRef.current?.click();
                     }
                   }}
-                  className="text-xs font-semibold text-emerald-400 hover:text-emerald-300 px-2.5 py-1.5 rounded-lg bg-emerald-950/40 hover:bg-emerald-950/70 border border-emerald-800/50 transition-colors shrink-0 flex items-center gap-1.5 cursor-pointer"
+                  className="text-xs font-semibold text-emerald-400 hover:text-emerald-300 px-2.5 py-1.5 rounded-lg bg-emerald-950/40 hover:bg-emerald-950/70 border border-emerald-800/50 transition-colors shrink-0 flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
                   title="Unir dois canais mono (.L e .R) do Pro Tools em estéreo de 2 canais"
                 >
                   <GitFork className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Unir Par Split .L/.R</span>
+                  <span>Unir Split .L/.R</span>
                 </button>
+
+                {onReanalyze && (
+                  <button
+                    type="button"
+                    onClick={onReanalyze}
+                    disabled={isAnalyzing}
+                    className="text-xs font-semibold text-emerald-400 hover:text-emerald-300 px-2.5 py-1.5 rounded-lg bg-emerald-950/40 hover:bg-emerald-950/70 border border-emerald-800/50 transition-colors shrink-0 flex items-center gap-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap"
+                    title="Recalcular triagem forense com as medições acústicas orgânicas"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isAnalyzing ? 'animate-spin' : ''}`} />
+                    <span>Reanalisar</span>
+                  </button>
+                )}
 
                 <button
                   onClick={() => {
@@ -443,9 +494,11 @@ export function AudioUploader({
                     }
                     fileInputRef.current?.click();
                   }}
-                  className="text-xs font-semibold text-cyan-400 hover:text-cyan-300 px-2.5 py-1.5 rounded-lg bg-cyan-950/40 hover:bg-cyan-950/70 border border-cyan-800/50 transition-colors shrink-0 cursor-pointer"
+                  className="text-xs font-semibold text-cyan-300 hover:text-white px-2.5 py-1.5 rounded-lg bg-cyan-950/60 hover:bg-cyan-900/60 border border-cyan-500/50 transition-colors shrink-0 flex items-center gap-1.5 cursor-pointer whitespace-nowrap shadow-sm"
+                  title="Carregar outro arquivo de áudio ou fita"
                 >
-                  Trocar Música
+                  <UploadCloud className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>Trocar Música</span>
                 </button>
               </div>
             </div>
@@ -492,8 +545,8 @@ export function AudioUploader({
             </div>
           </div>
 
-          {/* Export Guarantee Callout (5 cols) */}
-          <div className="lg:col-span-5 p-4 rounded-xl bg-[#0f1627] border border-slate-800 flex flex-col justify-between">
+          {/* Export Guarantee Callout (4 cols on XL, 5 cols on LG) */}
+          <div className="lg:col-span-5 xl:col-span-4 p-4 rounded-xl bg-[#0f1627] border border-slate-800 flex flex-col justify-between">
             <div className="flex items-center gap-2 text-xs font-bold text-emerald-300 pb-2 border-b border-slate-800">
               <CheckCircle2 className="w-4 h-4 text-emerald-400" />
               <span>Fidelidade de Exportação Garantida</span>

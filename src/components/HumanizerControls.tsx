@@ -1,5 +1,5 @@
 import { HumanizerSettings, LoudnessMetrics } from '../types/audio';
-import { Sparkles, Sliders, Waves, Wind, Volume2, RotateCcw, ShieldCheck, Flame, Disc, Radio, Mic, Zap, Gauge, ArrowRight, Bookmark } from 'lucide-react';
+import { Sparkles, Sliders, Waves, Wind, Volume2, RotateCcw, ShieldCheck, Flame, Disc, Radio, Mic, Zap, Gauge, ArrowRight, Bookmark, Film } from 'lucide-react';
 import { OrbanTrebleConsole } from './OrbanTrebleConsole';
 import { OrbanTrebleTelemetry } from '../audio/orbanTrebleEngine';
 
@@ -16,6 +16,7 @@ interface HumanizerControlsProps {
   onAutoCalibrateOrban?: () => void;
   hasAudioLoaded?: boolean;
   onSelectPresetName?: (presetName: string) => void;
+  currentPresetName?: string;
 }
 
 export function HumanizerControls({
@@ -31,10 +32,42 @@ export function HumanizerControls({
   onAutoCalibrateOrban,
   hasAudioLoaded = true,
   onSelectPresetName,
+  currentPresetName,
 }: HumanizerControlsProps) {
 
   const applyPreset = (presetName: string) => {
     switch (presetName) {
+      case 'live_dvd_analog':
+        onSelectPresetName?.('DVD Ao Vivo & Master Analógico');
+        onUpdateSettings({
+          enabled: true,
+          deHarshIntensity: 25,
+          notchFrequencyHz: 3400,
+          notchBandwidthQ: 2.0,
+          tapeWarmth: 35,
+          tubeHarmonics: 25,
+          lowMidBody: 1.2,
+          transientPunch: 75,
+          attackDeSmear: 50,
+          timingJitterMs: 0,
+          flutterWowRate: 0,
+          airExciterGain: 35,
+          airCutoffHz: 15500,
+          stereoCorrelationFix: 60,
+          monoBassCutoffHz: 120,
+          acousticRoomSpread: 50,
+          outputGainDb: 0,
+          orbanHfEnabled: true,
+          orbanHfMode: 'smooth_silk',
+          orbanHfAmount: 50,
+          orbanHfAutoBrillianceDb: 0.0,
+          orbanHfHighShelfGainDb: 0.0,
+          orbanHfThresholdDb: -6.0,
+          orbanHfCrossoverHz: 5500,
+          orbanHfSpeed: 'medium',
+        });
+        break;
+
       case 'mastering_cristalino':
         onSelectPresetName?.('Mastering Cristalino');
         onUpdateSettings({
@@ -293,10 +326,17 @@ export function HumanizerControls({
       {/* Preset Bar with Quick Styles */}
       <div className="flex flex-col gap-2 bg-[#090d16] p-3 rounded-xl border border-slate-800/80">
         <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-          <span className="text-slate-300 font-semibold flex items-center gap-1.5">
-            <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
-            Perfis de Masterização & Fita:
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="text-slate-300 font-semibold flex items-center gap-1.5">
+              <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
+              Perfis de Masterização & Fita:
+            </span>
+            {currentPresetName && (
+              <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 truncate max-w-[220px]">
+                Ativo: {currentPresetName}
+              </span>
+            )}
+          </div>
 
           <div className="flex items-center gap-2">
             {onOpenPresets && (
@@ -332,11 +372,33 @@ export function HumanizerControls({
           </div>
         </div>
 
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 pt-1">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-2 pt-1">
+          {/* Preset 0: DVD Ao Vivo & Master Analógico */}
+          <button
+            onClick={() => applyPreset('live_dvd_analog')}
+            className={`px-3 py-2 text-left rounded-lg transition-all flex flex-col gap-0.5 group cursor-pointer ${
+              currentPresetName === 'DVD Ao Vivo & Master Analógico' || (currentPresetName && currentPresetName.includes('DVD'))
+                ? 'bg-amber-950/70 border-2 border-amber-400 ring-2 ring-amber-500/30'
+                : 'bg-[#12192c] hover:bg-[#18233f] border border-amber-500/40 hover:border-amber-400'
+            }`}
+          >
+            <span className="text-xs font-bold text-amber-300 flex items-center gap-1">
+              <Film className="w-3 h-3 text-amber-400" />
+              DVD Ao Vivo
+            </span>
+            <span className="text-[10px] text-slate-400 group-hover:text-slate-300 leading-tight">
+              Shows, Palco & Banda
+            </span>
+          </button>
+
           {/* Preset 1: Cristalino */}
           <button
             onClick={() => applyPreset('mastering_cristalino')}
-            className="px-3 py-2 text-left rounded-lg bg-[#12192c] hover:bg-[#18233f] border border-cyan-500/30 hover:border-cyan-400/60 transition-all flex flex-col gap-0.5 group"
+            className={`px-3 py-2 text-left rounded-lg transition-all flex flex-col gap-0.5 group cursor-pointer ${
+              currentPresetName === 'Mastering Cristalino' || currentPresetName === 'Mastering Cristalino & Audiófilo'
+                ? 'bg-cyan-950/60 border-2 border-cyan-400 ring-2 ring-cyan-500/30'
+                : 'bg-[#12192c] hover:bg-[#18233f] border border-cyan-500/30 hover:border-cyan-400/60'
+            }`}
           >
             <span className="text-xs font-bold text-cyan-300 flex items-center gap-1">
               💎 Cristalino
@@ -349,7 +411,11 @@ export function HumanizerControls({
           {/* Preset 2: Punch & Calor */}
           <button
             onClick={() => applyPreset('punch_analog')}
-            className="px-3 py-2 text-left rounded-lg bg-[#12192c] hover:bg-[#18233f] border border-slate-700/80 hover:border-amber-400/60 transition-all flex flex-col gap-0.5 group"
+            className={`px-3 py-2 text-left rounded-lg transition-all flex flex-col gap-0.5 group cursor-pointer ${
+              currentPresetName === 'Punch & Calor Analógico' || currentPresetName === 'Punch Analógico & Dinâmica'
+                ? 'bg-amber-950/60 border-2 border-amber-400 ring-2 ring-amber-500/30'
+                : 'bg-[#12192c] hover:bg-[#18233f] border border-slate-700/80 hover:border-amber-400/60'
+            }`}
           >
             <span className="text-xs font-bold text-amber-300 flex items-center gap-1">
               <Flame className="w-3 h-3" />
@@ -363,7 +429,11 @@ export function HumanizerControls({
           {/* Preset 3: Clube & Bass */}
           <button
             onClick={() => applyPreset('club_bass')}
-            className="px-3 py-2 text-left rounded-lg bg-[#12192c] hover:bg-[#18233f] border border-slate-700/80 hover:border-emerald-400/60 transition-all flex flex-col gap-0.5 group"
+            className={`px-3 py-2 text-left rounded-lg transition-all flex flex-col gap-0.5 group cursor-pointer ${
+              currentPresetName === 'Clube & Bass Sub'
+                ? 'bg-emerald-950/60 border-2 border-emerald-400 ring-2 ring-emerald-500/30'
+                : 'bg-[#12192c] hover:bg-[#18233f] border border-slate-700/80 hover:border-emerald-400/60'
+            }`}
           >
             <span className="text-xs font-bold text-emerald-300 flex items-center gap-1">
               <Disc className="w-3 h-3" />
@@ -377,7 +447,11 @@ export function HumanizerControls({
           {/* Preset 4: Vocal Shine */}
           <button
             onClick={() => applyPreset('vocal_shine')}
-            className="px-3 py-2 text-left rounded-lg bg-[#12192c] hover:bg-[#18233f] border border-slate-700/80 hover:border-sky-400/60 transition-all flex flex-col gap-0.5 group"
+            className={`px-3 py-2 text-left rounded-lg transition-all flex flex-col gap-0.5 group cursor-pointer ${
+              currentPresetName === 'Vocal Shine & Ar' || currentPresetName === 'Voz Brilhante & Ar'
+                ? 'bg-sky-950/60 border-2 border-sky-400 ring-2 ring-sky-500/30'
+                : 'bg-[#12192c] hover:bg-[#18233f] border border-slate-700/80 hover:border-sky-400/60'
+            }`}
           >
             <span className="text-xs font-bold text-sky-300 flex items-center gap-1">
               <Mic className="w-3 h-3" />
@@ -391,7 +465,11 @@ export function HumanizerControls({
           {/* Preset 5: Vintage Tape */}
           <button
             onClick={() => applyPreset('vintage_tape')}
-            className="px-3 py-2 text-left rounded-lg bg-[#12192c] hover:bg-[#18233f] border border-slate-700/80 hover:border-rose-400/60 transition-all flex flex-col gap-0.5 group"
+            className={`px-3 py-2 text-left rounded-lg transition-all flex flex-col gap-0.5 group cursor-pointer ${
+              currentPresetName === 'Vintage Tape 1/4"' || (currentPresetName && currentPresetName.includes('Fita 1/4"'))
+                ? 'bg-rose-950/60 border-2 border-rose-400 ring-2 ring-rose-500/30'
+                : 'bg-[#12192c] hover:bg-[#18233f] border border-slate-700/80 hover:border-rose-400/60'
+            }`}
           >
             <span className="text-xs font-bold text-rose-300 flex items-center gap-1">
               <Radio className="w-3 h-3" />
@@ -405,7 +483,11 @@ export function HumanizerControls({
           {/* Preset 6: Otimizador IA */}
           <button
             onClick={() => applyPreset('ai_rescue')}
-            className="px-3 py-2 text-left rounded-lg bg-[#12192c] hover:bg-[#18233f] border border-purple-500/30 hover:border-purple-400/60 transition-all flex flex-col gap-0.5 group"
+            className={`px-3 py-2 text-left rounded-lg transition-all flex flex-col gap-0.5 group cursor-pointer ${
+              currentPresetName === 'Resgate de IA (De-Harsh & Ar)' || (currentPresetName && currentPresetName.includes('IA'))
+                ? 'bg-purple-950/60 border-2 border-purple-400 ring-2 ring-purple-500/30'
+                : 'bg-[#12192c] hover:bg-[#18233f] border border-purple-500/30 hover:border-purple-400/60'
+            }`}
           >
             <span className="text-xs font-bold text-purple-300 flex items-center gap-1">
               <Zap className="w-3 h-3" />

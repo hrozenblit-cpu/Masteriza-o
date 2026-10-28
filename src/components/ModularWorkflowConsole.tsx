@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import {
   Disc,
   ShieldCheck,
@@ -22,7 +22,8 @@ import {
   Volume2,
   Flame,
   Wind,
-  GitFork
+  GitFork,
+  History
 } from 'lucide-react';
 import { TapeAzimuthAnalysis, TapeAzimuthSettings } from '../audio/tapeAzimuthEngine';
 import { TapeDropoutAnalysis, TapeDropoutSettings } from '../audio/tapeDropoutEngine';
@@ -70,6 +71,8 @@ interface ModularWorkflowConsoleProps {
   onChangeBitDepth: (depth: 16 | 24) => void;
   isExporting: boolean;
   isExportingPreMaster: boolean;
+  currentPresetName?: string;
+  onLoadRecallFile?: (file: File) => void;
 }
 
 export function ModularWorkflowConsole({
@@ -102,7 +105,10 @@ export function ModularWorkflowConsole({
   onChangeBitDepth,
   isExporting,
   isExportingPreMaster,
+  currentPresetName,
+  onLoadRecallFile,
 }: ModularWorkflowConsoleProps) {
+  const recallInputRef = useRef<HTMLInputElement>(null);
   const [triageApplied, setTriageApplied] = useState(false);
 
   // Intelligent Material Detection
@@ -314,6 +320,32 @@ export function ModularWorkflowConsole({
               <Sliders className="w-3.5 h-3.5 text-emerald-400" />
               <span>Gravação Atual (Master Direto)</span>
             </button>
+
+            {onLoadRecallFile && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => recallInputRef.current?.click()}
+                  className="px-3 py-2.5 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 bg-amber-950/40 hover:bg-amber-900/60 text-amber-300 border border-amber-600/50 transition-all cursor-pointer shadow-sm"
+                  title="Carregar arquivo .aurapreset ou .json de Recall de Masterização para restabelecer 100% dos parâmetros no áudio atual"
+                >
+                  <History className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Carregar Recall (.aurapreset)</span>
+                </button>
+                <input
+                  ref={recallInputRef}
+                  type="file"
+                  accept=".aurapreset,.json,application/json"
+                  onChange={(e) => {
+                    if (e.target.files && e.target.files[0]) {
+                      onLoadRecallFile(e.target.files[0]);
+                      e.target.value = '';
+                    }
+                  }}
+                  className="hidden"
+                />
+              </>
+            )}
 
             <button
               type="button"
@@ -705,6 +737,11 @@ export function ModularWorkflowConsole({
                   <h3 className="text-sm font-bold text-white">
                     Equalização, Contorno & Timbre Analógico
                   </h3>
+                  {currentPresetName && (
+                    <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 truncate max-w-[200px]" title={`Preset Ativo: ${currentPresetName}`}>
+                      {currentPresetName}
+                    </span>
+                  )}
                 </div>
                 <p className="text-xs text-slate-400 mt-0.5">
                   Eliminação de aspereza digital (De-Harsh), saturação de fita suave e polimento de agudos Orban Optimod.
@@ -959,44 +996,45 @@ export function ModularWorkflowConsole({
       {/* =========================================================================
           FINAL ACTION BAR & FAST EXPORT
           ========================================================================= */}
-      <div className="p-4 md:p-5 rounded-2xl bg-[#0c1220] border border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-4 shadow-xl select-none">
-        <div className="flex items-center gap-3 w-full sm:w-auto">
+      <div className="p-4 sm:p-5 rounded-2xl bg-[#0c1220] border border-slate-800 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 sm:gap-4 shadow-xl select-none">
+        {/* Left: Transport & Listening Signal */}
+        <div className="flex flex-wrap items-center gap-2.5 sm:gap-3 flex-1">
           <button
             type="button"
             onClick={onTogglePlay}
-            className={`p-3 px-5 rounded-xl font-mono text-xs font-bold flex items-center gap-2 transition-all cursor-pointer shadow-md ${
+            className={`py-3 px-5 rounded-xl font-mono text-xs font-bold flex items-center justify-center gap-2 transition-all cursor-pointer shadow-md min-h-[44px] flex-1 sm:flex-initial ${
               isPlaying
                 ? 'bg-emerald-500 text-slate-950 shadow-emerald-500/20'
                 : 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30'
             }`}
           >
-            {isPlaying ? <Pause className="w-4 h-4 fill-slate-950" /> : <Play className="w-4 h-4 fill-cyan-400" />}
+            {isPlaying ? <Pause className="w-4 h-4 fill-slate-950 shrink-0" /> : <Play className="w-4 h-4 fill-cyan-400 shrink-0" />}
             <span>{isPlaying ? 'PAUSAR' : 'REPRODUZIR'}</span>
           </button>
 
           <button
             type="button"
             onClick={onToggleAB}
-            className={`p-3 px-4 rounded-xl font-mono text-xs font-bold flex items-center gap-2 transition-all cursor-pointer border ${
+            className={`py-3 px-4 rounded-xl font-mono text-xs font-bold flex items-center justify-center gap-2 transition-all cursor-pointer border min-h-[44px] flex-1 sm:flex-initial ${
               isCompareOriginal
                 ? 'bg-amber-500/20 text-amber-300 border-amber-500/60 shadow-sm'
                 : 'bg-[#121929] text-slate-300 border-slate-700 hover:text-white'
             }`}
             title="Alterna instantaneamente entre o áudio Masterizado e o Áudio Cru Original"
           >
-            <RotateCcw className="w-4 h-4" />
-            <span>{isCompareOriginal ? 'ÁUDIO CRU (Original)' : 'MASTERIZADO (A/B)'}</span>
+            <RotateCcw className="w-4 h-4 shrink-0" />
+            <span className="truncate">{isCompareOriginal ? 'ÁUDIO CRU (Original)' : 'MASTERIZADO (A/B)'}</span>
           </button>
         </div>
 
-        {/* Master Export Actions */}
-        <div className="flex flex-wrap items-center gap-2.5 w-full sm:w-auto justify-end">
+        {/* Right: Master Resolution & Direct Export */}
+        <div className="flex flex-wrap items-center gap-2.5 sm:gap-3 justify-end shrink-0 pt-2 sm:pt-0 border-t sm:border-t-0 border-slate-800/80">
           {/* Bit depth selector */}
-          <div className="flex items-center bg-[#101726] border border-slate-800 rounded-lg p-0.5 text-xs font-mono">
+          <div className="flex items-center bg-[#101726] border border-slate-800 rounded-xl p-1 text-xs font-mono min-h-[44px] h-[44px]">
             <button
               onClick={() => onChangeBitDepth(16)}
-              className={`px-2.5 py-1 rounded font-bold cursor-pointer transition-colors ${
-                outputBitDepth === 16 ? 'bg-amber-400 text-slate-950 font-bold' : 'text-slate-400 hover:text-white'
+              className={`px-3 py-1.5 rounded-lg font-bold cursor-pointer transition-colors h-full flex items-center ${
+                outputBitDepth === 16 ? 'bg-amber-400 text-slate-950 font-bold shadow-xs' : 'text-slate-400 hover:text-white'
               }`}
               title="16-bit: Compatibilidade total em 100% dos reprodutores e som automotivo"
             >
@@ -1004,8 +1042,8 @@ export function ModularWorkflowConsole({
             </button>
             <button
               onClick={() => onChangeBitDepth(24)}
-              className={`px-2.5 py-1 rounded font-bold cursor-pointer transition-colors ${
-                outputBitDepth === 24 ? 'bg-cyan-400 text-slate-950 font-bold' : 'text-slate-400 hover:text-white'
+              className={`px-3 py-1.5 rounded-lg font-bold cursor-pointer transition-colors h-full flex items-center ${
+                outputBitDepth === 24 ? 'bg-cyan-400 text-slate-950 font-bold shadow-xs' : 'text-slate-400 hover:text-white'
               }`}
               title="24-bit: Master de estúdio audiófilo com máxima resolução"
             >
@@ -1018,10 +1056,12 @@ export function ModularWorkflowConsole({
             onClick={onExportMaster}
             disabled={isExporting}
             title="Exportar Master Final WAV com o Preset de Recall (.aurapreset) correspondente salvo junto"
-            className="py-3 px-6 rounded-xl font-bold text-xs bg-gradient-to-r from-amber-400 via-amber-300 to-yellow-400 hover:from-amber-300 hover:to-yellow-300 text-slate-950 flex items-center gap-2 shadow-lg shadow-amber-500/20 transition-all cursor-pointer disabled:opacity-40"
+            className="py-3 px-5 sm:px-6 rounded-xl font-bold text-xs bg-gradient-to-r from-amber-400 via-amber-300 to-yellow-400 hover:from-amber-300 hover:to-yellow-300 text-slate-950 flex items-center justify-center gap-2 shadow-lg shadow-amber-500/20 transition-all cursor-pointer disabled:opacity-40 min-h-[44px] flex-1 sm:flex-initial"
           >
-            <Download className="w-4 h-4" />
-            <span>{isExporting ? 'Renderizando Master...' : `Exportar Master Final WAV (${outputBitDepth}-bit) + Preset`}</span>
+            <Download className="w-4 h-4 shrink-0" />
+            <span className="leading-tight text-center">
+              {isExporting ? 'Renderizando Master...' : `Exportar Master Final WAV (${outputBitDepth}-bit) + Preset`}
+            </span>
           </button>
         </div>
       </div>

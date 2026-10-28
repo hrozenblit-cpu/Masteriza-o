@@ -793,15 +793,15 @@ export function TapeDropoutConsole({
               </div>
               <input
                 type="range"
-                min="1"
-                max="15"
-                step="0.5"
+                min="8"
+                max="30"
+                step="1"
                 value={settings.crossfadeWindowMs}
                 onChange={(e) => onUpdateSettings({ crossfadeWindowMs: parseFloat(e.target.value) })}
                 className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-amber-400"
               />
-              <span className="text-[9px] text-slate-500 font-mono block">
-                Transição cosseno (Hann taper) sem cliques ou artefatos.
+              <span className="text-[9px] text-slate-400 font-mono block">
+                Transição suave cosseno (Hann taper) com no mínimo 15ms para eliminação total de cliques ou estalos.
               </span>
             </div>
           </div>

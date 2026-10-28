@@ -99,29 +99,41 @@ export function PresetManagerModal({
       try {
         const recall = await parseRecallFile(file);
         if (recall) {
+          const lufs = recall.humanizerSettings?.targetLufs ?? -14;
+          const deHarsh = recall.humanizerSettings?.deHarshIntensity ?? 0;
+          const warmth = recall.humanizerSettings?.tapeWarmth ?? 0;
+          const az = recall.azimuthSettings?.azimuthDelaySamples ? `${recall.azimuthSettings.azimuthDelaySamples} smp` : '0 smp';
+
           const newPreset: UserPreset = {
             id: `recall_${Date.now()}`,
             name: `Recall: ${recall.trackTitle || recall.presetName || 'Master Anterior'}`,
             category: 'user',
             description: `Configurações originais de master da faixa "${recall.trackTitle}" (${new Date(
               recall.exportDate
-            ).toLocaleDateString()})`,
+            ).toLocaleDateString()}) - Alvo: ${lufs} LUFS`,
             createdDate: recall.exportDate,
             settings: recall.humanizerSettings,
             azimuthSettings: recall.azimuthSettings,
+            dropoutSettings: recall.dropoutSettings,
+            denoiseSettings: recall.denoiseSettings,
           };
           saveUserPreset(
             newPreset.name,
             newPreset.settings,
             newPreset.azimuthSettings,
-            newPreset.description
+            newPreset.description,
+            newPreset.dropoutSettings,
+            newPreset.denoiseSettings
           );
           refreshPresets();
           onLoadPreset(newPreset);
           setSaveSuccessMsg(
-            `✓ Recall da faixa "${recall.trackTitle}" importado e aplicado com sucesso! Todos os parâmetros de master foram restabelecidos.`
+            `✓ Recall "${recall.trackTitle}" ATIVADO NA MASTER! [Alvo: ${lufs} LUFS | De-Harsh: ${deHarsh}% | Warmth: ${warmth}% | Azimute: ${az}]. Fechando em instantes...`
           );
-          setTimeout(() => setSaveSuccessMsg(null), 5000);
+          setTimeout(() => {
+            setSaveSuccessMsg(null);
+            onClose();
+          }, 1500);
           return;
         }
       } catch {
@@ -138,6 +150,7 @@ export function PresetManagerModal({
       // Try single track recall first
       const recall = await parseRecallFile(file);
       if (recall) {
+        const lufs = recall.humanizerSettings?.targetLufs ?? -14;
         const newPreset: UserPreset = {
           id: `recall_${Date.now()}`,
           name: `Recall: ${recall.trackTitle || recall.presetName || 'Master Anterior'}`,
@@ -146,17 +159,24 @@ export function PresetManagerModal({
           createdDate: recall.exportDate,
           settings: recall.humanizerSettings,
           azimuthSettings: recall.azimuthSettings,
+          dropoutSettings: recall.dropoutSettings,
+          denoiseSettings: recall.denoiseSettings,
         };
         saveUserPreset(
           newPreset.name,
           newPreset.settings,
           newPreset.azimuthSettings,
-          newPreset.description
+          newPreset.description,
+          newPreset.dropoutSettings,
+          newPreset.denoiseSettings
         );
         refreshPresets();
         onLoadPreset(newPreset);
-        setSaveSuccessMsg(`✓ Recall de master da faixa "${recall.trackTitle}" importado e ativado!`);
-        setTimeout(() => setSaveSuccessMsg(null), 4000);
+        setSaveSuccessMsg(`✓ Recall de master da faixa "${recall.trackTitle}" importado e ATIVADO no som! (${lufs} LUFS)`);
+        setTimeout(() => {
+          setSaveSuccessMsg(null);
+          onClose();
+        }, 1500);
         return;
       }
 

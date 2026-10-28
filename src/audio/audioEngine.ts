@@ -77,8 +77,17 @@ export class AudioEngine {
   private isCompareOriginal: boolean = false;
   private renderDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private isRenderingMaster: boolean = false;
-  private onMasterRenderedCallbacks: Set<(buf: AudioBuffer) => void> = new Set();
+  private onMasterRenderedCallbacks: Set<() => void> = new Set();
   private masterRenderListeners: Set<(buf: AudioBuffer) => void> = new Set();
+
+  // Real-time Mastering DSP Chain Nodes (Instant 0ms audio playback on tracks of ANY length)
+  private dspInputNode: GainNode | null = null;
+  private dspDeHarshNode: BiquadFilterNode | null = null;
+  private dspLowWarmthNode: BiquadFilterNode | null = null;
+  private dspTapeSatNode: WaveShaperNode | null = null;
+  private dspAirExciterNode: BiquadFilterNode | null = null;
+  private dspOrbanShelfNode: BiquadFilterNode | null = null;
+  private dspMasterGainNode: GainNode | null = null;
 
   // Independent Stereo Analysers for true L/R VU Metering and Phase Goniometer
   private splitterNode: ChannelSplitterNode | null = null;
@@ -219,6 +228,96 @@ export class AudioEngine {
     this.analyser.connect(this.monitorGain);
     this.monitorGain.connect(this.dacSafetyLimiter);
     this.dacSafetyLimiter.connect(ctx.destination);
+
+    // Real-Time Mastering DSP Chain (zero latency, instant playback on 65-min files):
+    // (active audio source) -> dspInputNode -> deHarsh -> lowWarmth -> tapeSat -> airExciter -> orbanShelf -> masterGain -> sumBusNode
+    this.dspInputNode = ctx.createGain();
+
+    this.dspDeHarshNode = ctx.createBiquadFilter();
+    this.dspDeHarshNode.type = 'peaking';
+    this.dspDeHarshNode.frequency.setValueAtTime(3400, ctx.currentTime);
+    this.dspDeHarshNode.Q.setValueAtTime(2.5, ctx.currentTime);
+    this.dspDeHarshNode.gain.setValueAtTime(0, ctx.currentTime);
+
+    this.dspLowWarmthNode = ctx.createBiquadFilter();
+    this.dspLowWarmthNode.type = 'lowshelf';
+    this.dspLowWarmthNode.frequency.setValueAtTime(220, ctx.currentTime);
+    this.dspLowWarmthNode.gain.setValueAtTime(0, ctx.currentTime);
+
+    this.dspTapeSatNode = ctx.createWaveShaper();
+    this.dspTapeSatNode.curve = this.createSaturationCurve(40, false) as Float32Array<ArrayBuffer>;
+    this.dspTapeSatNode.oversample = '4x';
+
+    this.dspAirExciterNode = ctx.createBiquadFilter();
+    this.dspAirExciterNode.type = 'highshelf';
+    this.dspAirExciterNode.frequency.setValueAtTime(14500, ctx.currentTime);
+    this.dspAirExciterNode.gain.setValueAtTime(0, ctx.currentTime);
+
+    this.dspOrbanShelfNode = ctx.createBiquadFilter();
+    this.dspOrbanShelfNode.type = 'highshelf';
+    this.dspOrbanShelfNode.frequency.setValueAtTime(6000, ctx.currentTime);
+    this.dspOrbanShelfNode.gain.setValueAtTime(0, ctx.currentTime);
+
+    this.dspMasterGainNode = ctx.createGain();
+    this.dspMasterGainNode.gain.setValueAtTime(1.0, ctx.currentTime);
+
+    this.dspInputNode.connect(this.dspDeHarshNode);
+    this.dspDeHarshNode.connect(this.dspLowWarmthNode);
+    this.dspLowWarmthNode.connect(this.dspTapeSatNode);
+    this.dspTapeSatNode.connect(this.dspAirExciterNode);
+    this.dspAirExciterNode.connect(this.dspOrbanShelfNode);
+    this.dspOrbanShelfNode.connect(this.dspMasterGainNode);
+    this.dspMasterGainNode.connect(this.sumBusNode);
+  }
+
+  public updateRealtimeDspNodes() {
+    if (
+      !this.ctx ||
+      !this.dspDeHarshNode ||
+      !this.dspLowWarmthNode ||
+      !this.dspTapeSatNode ||
+      !this.dspAirExciterNode ||
+      !this.dspOrbanShelfNode ||
+      !this.dspMasterGainNode
+    ) {
+      return;
+    }
+    const ctx = this.ctx;
+    const s = this.currentSettings;
+
+    // 1. De-Harsh Notch
+    this.dspDeHarshNode.frequency.setTargetAtTime(s.notchFrequencyHz || 3400, ctx.currentTime, 0.015);
+    this.dspDeHarshNode.Q.setTargetAtTime(Math.max(1.0, Math.min(6.0, s.notchBandwidthQ || 2.5)), ctx.currentTime, 0.015);
+    const notchGain = s.deHarshBypass ? 0 : -1 * Math.min(3.5, (s.deHarshIntensity || 60) * 0.04);
+    this.dspDeHarshNode.gain.setTargetAtTime(notchGain, ctx.currentTime, 0.015);
+
+    // 2. Low Warmth
+    const lowGain = s.tapeWarmthBypass ? 0 : Math.min(2.0, Math.max(0, s.lowMidBody || 1.2));
+    this.dspLowWarmthNode.gain.setTargetAtTime(lowGain, ctx.currentTime, 0.015);
+
+    // 3. Tape Saturation
+    this.dspTapeSatNode.curve = this.createSaturationCurve(s.tapeWarmth || 40, !!s.tapeWarmthBypass) as Float32Array<ArrayBuffer>;
+
+    // 4. Air Exciter
+    this.dspAirExciterNode.frequency.setTargetAtTime(Math.max(12000, Math.min(16000, s.airCutoffHz || 14500)), ctx.currentTime, 0.015);
+    const airGain = s.airExciterBypass ? 0 : Math.min(2.5, (s.airExciterGain || 50) * 0.035);
+    this.dspAirExciterNode.gain.setTargetAtTime(airGain, ctx.currentTime, 0.015);
+
+    // 5. Orban Treble Shelf
+    const isOrbanBypassed = !!s.orbanHfBypass || s.orbanHfEnabled === false;
+    const rawShelf = s.orbanHfHighShelfGainDb !== undefined ? s.orbanHfHighShelfGainDb : (s.orbanHfAutoBrillianceDb ?? 0.0);
+    const orbanGain = isOrbanBypassed ? 0 : rawShelf;
+    this.dspOrbanShelfNode.frequency.setTargetAtTime(s.orbanHfCrossoverHz || 6000, ctx.currentTime, 0.015);
+    this.dspOrbanShelfNode.gain.setTargetAtTime(orbanGain, ctx.currentTime, 0.015);
+
+    // 6. Master Output & Target LUFS Make-up Gain
+    let totalGainDb = s.outputGainDb || 0;
+    if (s.limitlessEnabled !== false && !s.limitlessBypass && s.targetLufs !== undefined && this.trackLoudnessMetrics) {
+      const deltaDb = s.targetLufs - this.trackLoudnessMetrics.integratedLufs;
+      totalGainDb += Math.max(-12, Math.min(14, deltaDb));
+    }
+    const linearGain = Math.pow(10, totalGainDb / 20);
+    this.dspMasterGainNode.gain.setTargetAtTime(linearGain, ctx.currentTime, 0.015);
   }
 
   public setMasterVolume(val: number) {
@@ -268,7 +367,15 @@ export class AudioEngine {
     this.masteredBuffer = null;
     this.tapeDropoutAnalysis = null;
     this.trackLoudnessMetrics = null;
+    this.tapeDenoiseTelemetry = null;
+    this.stems = [];
+    this.isStemTouchActive = false;
+    this.isCompareOriginal = false;
+    const queued = Array.from(this.onMasterRenderedCallbacks);
     this.onMasterRenderedCallbacks.clear();
+    for (const cb of queued) {
+      try { cb(); } catch {}
+    }
   }
 
   /**
@@ -288,7 +395,15 @@ export class AudioEngine {
     this.pristineRawBuffer = pristine || buffer;
     this.masteredBuffer = null;
     this.tapeDropoutAnalysis = analysis || null;
+    this.tapeDenoiseTelemetry = null;
+    this.stems = [];
+    this.isStemTouchActive = false;
+    this.isCompareOriginal = false;
+    const queued = Array.from(this.onMasterRenderedCallbacks);
     this.onMasterRenderedCallbacks.clear();
+    for (const cb of queued) {
+      try { cb(); } catch {}
+    }
   }
 
   public setRawBuffer(buffer: AudioBuffer) {
@@ -346,7 +461,8 @@ export class AudioEngine {
    */
   public updateSettings(newSettings: Partial<HumanizerSettings>) {
     this.currentSettings = { ...this.currentSettings, ...newSettings };
-    if (this.rawBuffer) {
+    this.updateRealtimeDspNodes();
+    if (this.rawBuffer && this.rawBuffer.duration <= 300) {
       this.scheduleMasterRender();
     }
   }
@@ -357,7 +473,8 @@ export class AudioEngine {
 
   public updateTapeAzimuthSettings(newSettings: Partial<TapeAzimuthSettings>) {
     this.tapeAzimuthSettings = { ...this.tapeAzimuthSettings, ...newSettings };
-    if (this.rawBuffer) {
+    this.updateRealtimeDspNodes();
+    if (this.rawBuffer && this.rawBuffer.duration <= 300) {
       this.scheduleMasterRender();
     }
   }
@@ -368,7 +485,8 @@ export class AudioEngine {
 
   public updateTapeDropoutSettings(newSettings: Partial<TapeDropoutSettings>) {
     this.tapeDropoutSettings = { ...this.tapeDropoutSettings, ...newSettings };
-    if (this.rawBuffer) {
+    this.updateRealtimeDspNodes();
+    if (this.rawBuffer && this.rawBuffer.duration <= 300) {
       this.scheduleMasterRender();
     }
   }
@@ -388,7 +506,8 @@ export class AudioEngine {
 
   public updateTapeDenoiseSettings(newSettings: Partial<SpectralDenoiseSettings>) {
     this.tapeDenoiseSettings = { ...this.tapeDenoiseSettings, ...newSettings };
-    if (this.rawBuffer) {
+    this.updateRealtimeDspNodes();
+    if (this.rawBuffer && this.rawBuffer.duration <= 300) {
       this.scheduleMasterRender();
     }
   }
@@ -433,6 +552,12 @@ export class AudioEngine {
     if (!this.rawBuffer) {
       return;
     }
+    // For long tracks (> 5 min), never schedule background offline renders during live editing.
+    // The real-time WebAudio DSP nodes handle live listening with 0ms latency and 0 RAM overhead.
+    if (this.rawBuffer.duration > 300) {
+      this.updateRealtimeDspNodes();
+      return;
+    }
     if (this.renderDebounceTimer) {
       clearTimeout(this.renderDebounceTimer);
     }
@@ -466,19 +591,24 @@ export class AudioEngine {
     if (!sourceToRender) {
       return null;
     }
+    // For long tracks (> 5 min), never run heavy offline rendering in background during playback/preset tweaks.
+    // Real-time WebAudio DSP handles live playback with 0ms latency and 0 RAM overhead.
+    if (sourceToRender.duration > 300) {
+      this.updateRealtimeDspNodes();
+      return sourceToRender;
+    }
     if (this.isRenderingMaster) {
-      // Re-trigger after current in-flight render completes
+      // Re-trigger fresh render immediately after current in-flight render finishes
       return new Promise((resolve) => {
-        const cb = (buf: AudioBuffer) => {
-          this.onMasterRenderedCallbacks.delete(cb);
-          if (this.currentTrackId === renderTrackId) {
-            resolve(buf);
+        const onPreviousDone = () => {
+          this.onMasterRenderedCallbacks.delete(onPreviousDone);
+          if (this.currentTrackId === renderTrackId && (this.pristineRawBuffer || this.rawBuffer)) {
+            this.triggerMasterRender().then(resolve).catch(() => resolve(null));
           } else {
-            // Track changed while waiting! Render the new track instead of returning stale audio
-            this.triggerMasterRender().then(resolve);
+            resolve(null);
           }
         };
-        this.onMasterRenderedCallbacks.add(cb);
+        this.onMasterRenderedCallbacks.add(onPreviousDone);
       });
     }
 
@@ -499,11 +629,6 @@ export class AudioEngine {
         this.startSourceWithBuffer(rendered, curTime, true);
       }
 
-      for (const cb of this.onMasterRenderedCallbacks) {
-        cb(rendered);
-      }
-      this.onMasterRenderedCallbacks.clear();
-
       for (const listener of this.masterRenderListeners) {
         try {
           listener(rendered);
@@ -515,6 +640,12 @@ export class AudioEngine {
       return rendered;
     } finally {
       this.isRenderingMaster = false;
+      // Drain queued render callbacks so the waiting render can execute immediately
+      const queued = Array.from(this.onMasterRenderedCallbacks);
+      this.onMasterRenderedCallbacks.clear();
+      for (const cb of queued) {
+        try { cb(); } catch (e) { console.error(e); }
+      }
     }
   }
 
@@ -545,17 +676,23 @@ export class AudioEngine {
    * If master is not ready yet, plays rawBuffer immediately and hot-swaps to master when ready.
    */
   public play(offsetSeconds: number = 0) {
+    const ctx = this.getAudioContext();
+    if (ctx && ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
+
+    const isLongTrack = (this.rawBuffer?.duration || 0) > 300;
     const activeBuf = this.isCompareOriginal
       ? (this.pristineRawBuffer || this.rawBuffer!)
-      : (this.masteredBuffer || this.rawBuffer!);
+      : (!isLongTrack && this.masteredBuffer ? this.masteredBuffer : (this.rawBuffer!));
 
     if (activeBuf) {
       this.startSourceWithBuffer(activeBuf, offsetSeconds, false);
       this.isPlaying = true;
     }
 
-    // If master buffer is not ready yet, render it in background and hot-swap seamlessly
-    if (!this.masteredBuffer && this.rawBuffer) {
+    // For short tracks only (<= 300s): if master buffer is not ready yet, render it in background and hot-swap
+    if (!this.masteredBuffer && this.rawBuffer && !isLongTrack) {
       const playTrackId = this.currentTrackId;
       this.triggerMasterRender().then((mastered) => {
         if (mastered && this.currentTrackId === playTrackId && this.isPlaying && !this.isCompareOriginal) {
@@ -573,17 +710,18 @@ export class AudioEngine {
       this.resetTrack(buffer);
     }
 
+    const isLongTrack = ((buffer || this.rawBuffer)?.duration || 0) > 300;
     const activeBuf = this.isCompareOriginal
       ? (this.pristineRawBuffer || this.rawBuffer || buffer)
-      : (this.masteredBuffer || this.rawBuffer || buffer);
+      : (!isLongTrack && this.masteredBuffer ? this.masteredBuffer : (this.rawBuffer || buffer));
 
     if (activeBuf) {
       this.startSourceWithBuffer(activeBuf, offsetSeconds, false);
       this.isPlaying = true;
     }
 
-    // If master buffer is not ready yet, render it in background and hot-swap seamlessly
-    if (!this.masteredBuffer && (this.rawBuffer || buffer)) {
+    // For short tracks only (<= 300s): if master buffer is not ready yet, render it in background and hot-swap
+    if (!this.masteredBuffer && (this.rawBuffer || buffer) && !isLongTrack) {
       const playTrackId = this.currentTrackId;
       this.triggerMasterRender().then((mastered) => {
         if (mastered && this.currentTrackId === playTrackId && this.isPlaying && !this.isCompareOriginal) {
@@ -705,7 +843,22 @@ export class AudioEngine {
     }
 
     newSrc.connect(newGain);
-    newGain.connect(this.sumBusNode);
+
+    // Dynamic Real-time Audio Routing:
+    // 1. If comparing original (Dry): bypass real-time DSP and connect directly to sumBusNode.
+    // 2. If buffer is an offline pre-rendered master: connect directly to sumBusNode (no double-processing).
+    // 3. If playing rawBuffer in Master mode (e.g. long files > 5min or instant preview):
+    //    route through real-time WebAudio DSP chain (de-harsh, warmth, tape sat, air, orban, master gain).
+    const isPlayingRawInMaster =
+      !this.isCompareOriginal &&
+      (!this.masteredBuffer || buffer === this.rawBuffer || buffer === this.pristineRawBuffer);
+
+    if (isPlayingRawInMaster && this.dspInputNode) {
+      this.updateRealtimeDspNodes();
+      newGain.connect(this.dspInputNode);
+    } else {
+      newGain.connect(this.sumBusNode);
+    }
 
     this.allActiveSources.add(newSrc);
     this.allActiveGains.add(newGain);

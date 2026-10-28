@@ -28,7 +28,7 @@ import {
   TapeDropoutMode,
   DEFAULT_DROPOUT_SETTINGS
 } from './audio/tapeDropoutEngine';
-import { UserPreset, getAllPresets } from './audio/presetManager';
+import { UserPreset, getAllPresets, getPresetForAudioAnalysis } from './audio/presetManager';
 import { autoSaveManager, SUBFOLDER_RECOVERED, SUBFOLDER_MASTERED } from './audio/autoSaveManager';
 import {
   generateTrackRecall,
@@ -56,7 +56,7 @@ import {
 } from './audio/splitStereoManager';
 import { PendingSplitMonoState } from './components/AudioUploader';
 import { SplitStereoModal } from './components/SplitStereoModal';
-import { Sparkles, Layers, Cpu, ArrowRight, Activity, CheckCircle2, Gauge, Disc, Bookmark, FolderDown, History, ShieldCheck, Waves, AlertTriangle, X, GitFork } from 'lucide-react';
+import { Sparkles, Layers, Cpu, ArrowRight, Activity, CheckCircle2, Gauge, Disc, Bookmark, FolderDown, History, ShieldCheck, Waves, AlertTriangle, X, GitFork, RefreshCw } from 'lucide-react';
 
 export default function App() {
   // Navigation
@@ -175,6 +175,9 @@ export default function App() {
     displayName: string,
     detectedFormat: AudioInputFormat
   ) => {
+    // Reset batch audition mode and A/B comparison so this new track is loaded cleanly
+    setEditingBatchIndex(null);
+    setIsCompareOriginal(false);
     audioEngine.stop(true);
     setIsPlaying(false);
     setPlaybackTime(0);
@@ -250,7 +253,7 @@ export default function App() {
     const safeDropoutSettings: TapeDropoutSettings = {
       ...tapeDropoutSettings,
       enabled: hasDropouts || (!isCleanModern && isDualMono && isWanderOrDefect),
-      mode: isCleanModern ? 'stereo_independent' : safeDropoutMode,
+      mode: !isDualMono ? 'stereo_independent' : safeDropoutMode,
     };
     setTapeDropoutSettings(safeDropoutSettings);
     audioEngine.updateTapeDropoutSettings(safeDropoutSettings);
@@ -274,44 +277,51 @@ export default function App() {
     await new Promise((r) => setTimeout(r, 10));
     const orbanAnalysis = audioEngine.getOrbanTrebleTelemetry(audioBuffer);
     setOrbanTelemetry(orbanAnalysis);
-    if (orbanAnalysis) {
-      setHumanizerSettings((prev) => {
-        // Detecta se o áudio presente necessita do processador de agudos (fita abafada, estridência/sibilância ou ajuste de brilho)
-        const audioNeedsTreble = Boolean(
-          orbanAnalysis.needsProcessing ||
-          orbanAnalysis.isDarkTape ||
-          orbanAnalysis.isHarshRecording ||
-          Math.abs(orbanAnalysis.recommendedBrillianceDb) >= 0.5
-        );
 
-        // Trava manual do usuário: só é respeitada se o usuário tiver explicitamente acionado o botão/trava de bypass
-        const userExplicitlyDisabled = Boolean(prev.orbanHfUserOverrideLock && (prev.orbanHfBypass || !prev.orbanHfEnabled));
-        const userExplicitlyEnabled = Boolean(prev.orbanHfUserOverrideLock && !prev.orbanHfBypass && prev.orbanHfEnabled);
+    // 1. Identificação inteligente do Preset correspondente à fonte analisada (IA, Fita Vintage, Fita Moderna, etc.)
+    const recommendedPreset = getPresetForAudioAnalysis(analysis, {
+      isDarkTape: orbanAnalysis?.isDarkTape,
+      hasDropouts,
+      hasAzimuthError: hasAzimuthLag,
+      isDualMono,
+    });
+    setCurrentGlobalPresetName(recommendedPreset.name);
 
-        // Regra de negócio: a desabilitação só deve ocorrer ou por não ser necessário no presente áudio ou se o usuário desabilita-lo
-        const shouldEnable = userExplicitlyEnabled
-          ? true
-          : userExplicitlyDisabled
-          ? false
-          : audioNeedsTreble;
+    // Detecta se o áudio presente necessita do processador de agudos (fita abafada, estridência/sibilância ou ajuste de brilho)
+    const audioNeedsTreble = Boolean(
+      orbanAnalysis?.needsProcessing ||
+      orbanAnalysis?.isDarkTape ||
+      orbanAnalysis?.isHarshRecording ||
+      Math.abs(orbanAnalysis?.recommendedBrillianceDb ?? 0) >= 0.5
+    );
 
-        const updated = {
-          ...prev,
-          orbanHfEnabled: shouldEnable,
-          orbanHfBypass: !shouldEnable,
-          orbanHfUserOverrideLock: prev.orbanHfUserOverrideLock ?? false,
-          orbanHfMode: orbanAnalysis.recommendedMode,
-          orbanHfAmount: orbanAnalysis.isDarkTape ? 65 : 50,
-          orbanHfAutoBrillianceDb: orbanAnalysis.recommendedBrillianceDb,
-          orbanHfHighShelfGainDb: orbanAnalysis.recommendedBrillianceDb,
-          orbanHfThresholdDb: orbanAnalysis.recommendedThresholdDb,
-          orbanHfCrossoverHz: orbanAnalysis.recommendedCrossoverHz,
-          orbanHfSpeed: orbanAnalysis.recommendedSpeed,
-        };
-        audioEngine.updateSettings(updated);
-        return updated;
-      });
-    }
+    // Trava manual do usuário: só é respeitada se o usuário tiver explicitamente acionado o botão/trava de bypass
+    const userExplicitlyDisabled = Boolean(humanizerSettings.orbanHfUserOverrideLock && (humanizerSettings.orbanHfBypass || !humanizerSettings.orbanHfEnabled));
+    const userExplicitlyEnabled = Boolean(humanizerSettings.orbanHfUserOverrideLock && !humanizerSettings.orbanHfBypass && humanizerSettings.orbanHfEnabled);
+
+    const shouldEnableOrban = userExplicitlyEnabled
+      ? true
+      : userExplicitlyDisabled
+      ? false
+      : audioNeedsTreble;
+
+    // Constrói os parâmetros com base no Preset identificado + calibração de agudos
+    const settingsToApply: HumanizerSettings = {
+      ...recommendedPreset.settings,
+      orbanHfEnabled: shouldEnableOrban,
+      orbanHfBypass: !shouldEnableOrban,
+      orbanHfUserOverrideLock: humanizerSettings.orbanHfUserOverrideLock ?? false,
+      orbanHfMode: orbanAnalysis?.recommendedMode || recommendedPreset.settings.orbanHfMode || 'smooth_silk',
+      orbanHfAmount: orbanAnalysis?.isDarkTape ? 65 : (recommendedPreset.settings.orbanHfAmount || 50),
+      orbanHfAutoBrillianceDb: orbanAnalysis?.recommendedBrillianceDb ?? recommendedPreset.settings.orbanHfAutoBrillianceDb,
+      orbanHfHighShelfGainDb: orbanAnalysis?.recommendedBrillianceDb ?? recommendedPreset.settings.orbanHfHighShelfGainDb,
+      orbanHfThresholdDb: orbanAnalysis?.recommendedThresholdDb ?? recommendedPreset.settings.orbanHfThresholdDb,
+      orbanHfCrossoverHz: orbanAnalysis?.recommendedCrossoverHz ?? recommendedPreset.settings.orbanHfCrossoverHz,
+      orbanHfSpeed: orbanAnalysis?.recommendedSpeed ?? recommendedPreset.settings.orbanHfSpeed,
+    };
+
+    setHumanizerSettings(settingsToApply);
+    audioEngine.updateSettings(settingsToApply);
 
     if (tapeAzimuthSettings.autoAlignOnLoad) {
       const isGhost = azimuth.isGhostChannelDetected;
@@ -319,6 +329,7 @@ export default function App() {
       const safeBalance = isGhost ? 0.0 : Math.max(-4.5, Math.min(4.5, -azimuth.levelDiffDb));
       const autoAzimuth: TapeAzimuthSettings = {
         ...tapeAzimuthSettings,
+        ...(recommendedPreset.azimuthSettings || {}),
         enabled: true,
         azimuthDelaySamples: isGhost ? 0 : azimuth.azimuthOffsetSamples,
         balanceDb: safeBalance,
@@ -329,28 +340,20 @@ export default function App() {
       audioEngine.updateTapeAzimuthSettings(autoAzimuth);
     }
 
-    // Preload buffer and trigger master rendering with single, clean mastering chain
-    setAnalysisStatus('Renderizando áudio master com cadeia de processamento...');
-    await audioEngine.loadRawBuffer(audioBuffer).then((rendered) => {
-      if (rendered) {
-        masterBufferRef.current = rendered;
-      }
-    });
-
-    // Auto-tune de-harsh only for confirmed AI generative artifacts (Suno / Udio).
-    // Genuine analog tape transfers are NEVER notched or distorted by default.
-    if (analysis.dominantPlatform.platform === 'suno') {
-      setHumanizerSettings((prev) => ({
-        ...prev,
-        deHarshIntensity: 45,
-        notchFrequencyHz: 3400,
-      }));
-    } else if (analysis.dominantPlatform.platform === 'udio') {
-      setHumanizerSettings((prev) => ({
-        ...prev,
-        deHarshIntensity: 50,
-        notchFrequencyHz: 4200,
-      }));
+    // Preload buffer: For tracks > 5 min, use instantaneous zero-delay real-time DSP
+    const isLongTrack = audioBuffer.duration > 300;
+    if (isLongTrack) {
+      setAnalysisStatus(`Ativando DSP em tempo real instantâneo para áudio longo (${Math.round(audioBuffer.duration / 60)} min)...`);
+      audioEngine.resetTrack(audioBuffer, audioBuffer);
+      audioEngine.updateSettings(settingsToApply);
+      masterBufferRef.current = audioBuffer;
+    } else {
+      setAnalysisStatus(`Renderizando áudio master com preset "${recommendedPreset.name}"...`);
+      await audioEngine.loadRawBuffer(audioBuffer).then((rendered) => {
+        if (rendered) {
+          masterBufferRef.current = rendered;
+        }
+      });
     }
 
     const dropoutNotice = dropouts.totalDropouts > 0
@@ -367,7 +370,7 @@ export default function App() {
       : `Azimute: ${azimuth.azimuthOffsetUs > 0 ? '+' : ''}${azimuth.azimuthOffsetUs.toFixed(1)} µs | Balanço: ${azimuth.levelDiffDb > 0 ? '+' : ''}${azimuth.levelDiffDb.toFixed(1)} dB`;
 
     setExportNotice(
-      `Áudio carregado: ${detectedFormat.sampleRate.toLocaleString()} Hz · ${detectedFormat.bitDepth}-bit (${detectedFormat.codec}). ${azimuthNotice}${dropoutNotice}.${masterWarning}`
+      `Áudio carregado: ${detectedFormat.sampleRate.toLocaleString()} Hz · ${detectedFormat.bitDepth}-bit (${detectedFormat.codec}). Preset "${recommendedPreset.name}" selecionado e atuando na masterização. ${azimuthNotice}${dropoutNotice}.${masterWarning}`
     );
     setTimeout(() => setExportNotice(null), isPreviouslyMastered ? 10000 : 7000);
   };
@@ -380,6 +383,8 @@ export default function App() {
       audioEngine.wipeCurrentTrack();
       masterBufferRef.current = null;
       rawBufferRef.current = null;
+      setEditingBatchIndex(null);
+      setIsCompareOriginal(false);
       setIsPlaying(false);
       setPlaybackTime(0);
       setDuration(0);
@@ -456,6 +461,8 @@ export default function App() {
       audioEngine.wipeCurrentTrack();
       masterBufferRef.current = null;
       rawBufferRef.current = null;
+      setEditingBatchIndex(null);
+      setIsCompareOriginal(false);
       setIsPlaying(false);
       setPlaybackTime(0);
       setDuration(0);
@@ -515,6 +522,41 @@ export default function App() {
     }
   };
 
+  const handleReanalyzeForensics = async () => {
+    const activeBuf = rawBufferRef.current || masterBufferRef.current;
+    if (!activeBuf) return;
+    setIsAnalyzing(true);
+    setAnalysisStatus('Reanalisando triagem forense com novo modelo acústico...');
+    try {
+      const analysis = await analyzeAudioForensics(activeBuf, currentTrackTitle);
+      setAnalysisResult(analysis);
+
+      // Intelligent Preset Selection: route to factory_live_dvd_analog or appropriate preset
+      const suggestedPreset = getPresetForAudioAnalysis(analysis);
+      if (suggestedPreset && !humanizerSettings.orbanHfUserOverrideLock) {
+        setCurrentGlobalPresetName(suggestedPreset.name);
+        setHumanizerSettings(suggestedPreset.settings);
+        audioEngine.updateSettings(suggestedPreset.settings);
+        if (suggestedPreset.azimuthSettings) {
+          setTapeAzimuthSettings(suggestedPreset.azimuthSettings);
+          audioEngine.updateTapeAzimuthSettings(suggestedPreset.azimuthSettings);
+        }
+      }
+
+      setExportNotice(
+        `✓ Diagnóstico atualizado: ${analysis.dominantPlatform.name} (${analysis.overallAiProbability.toFixed(1)}% IA) - ${analysis.verdict}!`
+      );
+      setTimeout(() => setExportNotice(null), 6000);
+    } catch (err) {
+      console.error(err);
+      setAppErrorNotice('Erro ao reanalisar o áudio.');
+      setTimeout(() => setAppErrorNotice(null), 5000);
+    } finally {
+      setIsAnalyzing(false);
+      setAnalysisStatus(null);
+    }
+  };
+
   const handleMultipleFilesUpload = async (files: FileList) => {
     if (files.length >= 2) {
       const pair = findSplitStereoPair(files);
@@ -523,6 +565,41 @@ export default function App() {
         return;
       }
     }
+    // Populate batch queue with dropped or selected multiple files for a new clean batch session
+    setBatchQueue((prev) => {
+      const allDone = prev.length > 0 && prev.every((it) => it.status === 'done');
+      const baseQueue = allDone ? [] : prev;
+      const newItems: BatchItem[] = [];
+      const defaultPresetName = currentGlobalPresetName || 'Digitalização Fita 1/4" (Anos 50-70)';
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        if (
+          !file.type.includes('audio') &&
+          !file.type.includes('video') &&
+          !file.name.match(/\.(wav|mp3|flac|m4a|aac|ogg|aiff|aif|mp4|mpg4|mov|m4v|webm|mkv)$/i)
+        ) {
+          continue;
+        }
+        const parsedMeta = parseTrackMetadata(file.name, baseQueue.length + i + 1);
+        newItems.push({
+          id: `batch_${Date.now()}_${i}_${Math.random().toString(36).substring(2, 6)}`,
+          file,
+          title: file.name,
+          trackNumber: parsedMeta.trackNumber,
+          songTitle: parsedMeta.songTitle,
+          artist: parsedMeta.artist,
+          sizeBytes: file.size,
+          status: 'pending',
+          presetName: defaultPresetName,
+          customHumanizerSettings: { ...humanizerSettings },
+          customAzimuthSettings: { ...tapeAzimuthSettings },
+          isCustomized: false,
+        });
+      }
+      return [...baseQueue, ...newItems];
+    });
+    setEditingBatchIndex(null);
     setIsBatchModalOpen(true);
   };
 
@@ -578,8 +655,10 @@ export default function App() {
   const handleLoadPreset = (preset: UserPreset) => {
     setCurrentGlobalPresetName(preset.name);
 
-    // User Override Lock: só preserva o bypass se o usuário tiver explicitamente travado o módulo manualmente
-    const isExplicitlyLocked = Boolean(humanizerSettings.orbanHfUserOverrideLock);
+    const isRecall = preset.id.startsWith('recall_') || preset.name.toLowerCase().includes('recall');
+    // Trava de bypass manual do usuário: só é preservada para presets normais de fábrica se o usuário travou. Para recalls, restaura 100% dos parâmetros salvos!
+    const isExplicitlyLocked = !isRecall && Boolean(humanizerSettings.orbanHfUserOverrideLock);
+
     const settingsToApply: HumanizerSettings = {
       ...preset.settings,
       ...(isExplicitlyLocked
@@ -588,7 +667,9 @@ export default function App() {
             orbanHfEnabled: humanizerSettings.orbanHfEnabled,
             orbanHfUserOverrideLock: true,
           }
-        : {}),
+        : {
+            orbanHfUserOverrideLock: false,
+          }),
     };
 
     setHumanizerSettings(settingsToApply);
@@ -599,6 +680,16 @@ export default function App() {
       audioEngine.updateTapeAzimuthSettings(preset.azimuthSettings);
     }
 
+    if (preset.dropoutSettings) {
+      setTapeDropoutSettings(preset.dropoutSettings);
+      audioEngine.updateTapeDropoutSettings(preset.dropoutSettings);
+    }
+
+    if (preset.denoiseSettings) {
+      setTapeDenoiseSettings(preset.denoiseSettings);
+      audioEngine.updateTapeDenoiseSettings(preset.denoiseSettings);
+    }
+
     if (editingBatchIndex !== null) {
       setBatchQueue((prev) =>
         prev.map((it, idx) =>
@@ -607,19 +698,38 @@ export default function App() {
                 ...it,
                 presetId: preset.id,
                 presetName: preset.name,
-                customHumanizerSettings: { ...preset.settings },
+                customHumanizerSettings: { ...settingsToApply },
                 customAzimuthSettings: preset.azimuthSettings
                   ? { ...preset.azimuthSettings }
                   : it.customAzimuthSettings,
-                isCustomized: false,
+                customDropoutSettings: preset.dropoutSettings || it.customDropoutSettings,
+                customDenoiseSettings: preset.denoiseSettings || it.customDenoiseSettings,
+                isCustomized: true,
               }
             : it
         )
       );
     }
 
-    setExportNotice(`✓ Preset "${preset.name}" carregado com sucesso!`);
-    setTimeout(() => setExportNotice(null), 4000);
+    // Garante que o áudio master seja re-renderizado para faixas curtas
+    const targetBuf = rawBufferRef.current || masterBufferRef.current;
+    if (targetBuf && targetBuf.duration <= 300) {
+      audioEngine.triggerMasterRender().then((rendered) => {
+        if (rendered) {
+          masterBufferRef.current = rendered;
+        }
+      });
+    }
+    // E SEMPRE atualiza os nós DSP em tempo real para resposta instantânea na reprodução
+    audioEngine.updateRealtimeDspNodes();
+
+    const lufsVal = settingsToApply.targetLufs ? `${settingsToApply.targetLufs.toFixed(1)} LUFS` : '-14.0 LUFS';
+    setExportNotice(
+      isRecall
+        ? `✓ ${preset.name} CARREGADO E ATUANDO NA MASTER! [Alvo: ${lufsVal} | De-Harsh: ${settingsToApply.deHarshIntensity}% | Warmth: ${settingsToApply.tapeWarmth}%]`
+        : `✓ Preset "${preset.name}" carregado e atuando na masterização! [Alvo: ${lufsVal}]`
+    );
+    setTimeout(() => setExportNotice(null), 5000);
   };
 
   // Batch Track Audition & Navigation Engine
@@ -685,6 +795,9 @@ export default function App() {
       setTapeAzimuthAnalysis(azimuth);
 
       // Restore specific preset or settings for this track
+      const trackPresetName = item.presetName || 'Digitalização Fita 1/4" (Anos 50-70)';
+      setCurrentGlobalPresetName(trackPresetName);
+
       if (item.customHumanizerSettings) {
         setHumanizerSettings(item.customHumanizerSettings);
         audioEngine.updateSettings(item.customHumanizerSettings);
@@ -775,19 +888,25 @@ export default function App() {
       const orbanAnalysis = audioEngine.getOrbanTrebleTelemetry(preRestoredBuffer);
       setOrbanTelemetry(orbanAnalysis);
 
-      // Preload buffer and trigger master rendering with fully restored audio
-      await (hasDropouts
-        ? audioEngine.loadDropoutRestoredBuffer(preRestoredBuffer, initialDropoutAnalysis, buffer)
-        : audioEngine.loadRawBuffer(buffer)
-      ).then((rendered) => {
-        if (rendered) {
-          masterBufferRef.current = rendered;
-        }
-      });
+      // Preload buffer: For long files (> 5 min), use real-time WebAudio DSP immediately
+      const isLongTrack = buffer.duration > 300;
+      if (isLongTrack) {
+        audioEngine.resetTrack(preRestoredBuffer, buffer);
+        masterBufferRef.current = preRestoredBuffer;
+      } else {
+        await (hasDropouts
+          ? audioEngine.loadDropoutRestoredBuffer(preRestoredBuffer, initialDropoutAnalysis, buffer)
+          : audioEngine.loadRawBuffer(buffer)
+        ).then((rendered) => {
+          if (rendered) {
+            masterBufferRef.current = rendered;
+          }
+        });
+      }
 
       setActiveTab('mastering');
       setPlaybackTime(0);
-      audioEngine.playBuffer(preRestoredBuffer, 0);
+      audioEngine.play(0);
       setIsPlaying(true);
 
       setExportNotice(`🎧 Ouvindo faixa ${index + 1} de ${batchQueue.length}: "${effectiveSongTitle || item.title}"`);
@@ -943,6 +1062,7 @@ export default function App() {
     const selected = allPresets.find((p) => p.id === presetIdOrName || p.name === presetIdOrName);
     if (!selected) return;
 
+    setCurrentGlobalPresetName(selected.name);
     setHumanizerSettings(selected.settings);
     audioEngine.updateSettings(selected.settings);
 
@@ -962,11 +1082,17 @@ export default function App() {
               customAzimuthSettings: selected.azimuthSettings
                 ? { ...selected.azimuthSettings }
                 : it.customAzimuthSettings,
-              isCustomized: false,
+              isCustomized: true,
             }
           : it
       )
     );
+
+    audioEngine.triggerMasterRender().then((rendered) => {
+      if (rendered) {
+        masterBufferRef.current = rendered;
+      }
+    });
   };
 
   // Export Azimuth Corrected Archival Preservation WAV
@@ -1689,7 +1815,11 @@ export default function App() {
         humanizerSettings,
         tapeAzimuthSettings,
         audioFormat || undefined,
-        currentGlobalPresetName
+        currentGlobalPresetName,
+        undefined,
+        undefined,
+        tapeDropoutSettings,
+        tapeDenoiseSettings
       );
       const recallBlob = recallToBlob(recallData);
       const recallFilename = buildRecallFilename({
@@ -1814,7 +1944,11 @@ export default function App() {
         humanizerSettings,
         tapeAzimuthSettings,
         audioFormat || undefined,
-        currentGlobalPresetName
+        currentGlobalPresetName,
+        undefined,
+        undefined,
+        tapeDropoutSettings,
+        tapeDenoiseSettings
       );
       const recallBlob = recallToBlob(recallData);
       const recallFilename = buildRecallFilename({
@@ -1853,20 +1987,82 @@ export default function App() {
     try {
       const recall = await parseRecallFile(file);
       if (recall) {
-        setHumanizerSettings({ ...recall.humanizerSettings });
-        setTapeAzimuthSettings({ ...recall.azimuthSettings });
-        audioEngine.updateSettings(recall.humanizerSettings);
-        audioEngine.updateTapeAzimuthSettings(recall.azimuthSettings);
-        setCurrentGlobalPresetName(recall.presetName || 'Recall de Masterização');
+        // 1. Restaura Equalização, De-Harsh, Warmth, Orban HF e Limitless
+        const restoredHumanizer: HumanizerSettings = {
+          ...recall.humanizerSettings,
+          // Garante que travas manuais de bypass não impeçam a aplicação exata do recall
+          orbanHfUserOverrideLock: false,
+        };
+        setHumanizerSettings(restoredHumanizer);
+        audioEngine.updateSettings(restoredHumanizer);
+
+        // 2. Restaura alinhamento de azimute
+        if (recall.azimuthSettings) {
+          setTapeAzimuthSettings(recall.azimuthSettings);
+          audioEngine.updateTapeAzimuthSettings(recall.azimuthSettings);
+        }
+
+        // 3. Restaura configurações de dropouts de fita
+        if (recall.dropoutSettings) {
+          setTapeDropoutSettings(recall.dropoutSettings);
+          audioEngine.updateTapeDropoutSettings(recall.dropoutSettings);
+        }
+
+        // 4. Restaura redutor de ruído espectral
+        if (recall.denoiseSettings) {
+          setTapeDenoiseSettings(recall.denoiseSettings);
+          audioEngine.updateTapeDenoiseSettings(recall.denoiseSettings);
+        }
+
+        const presetDisplayName = `Recall: ${recall.trackTitle || recall.presetName || 'Master Anterior'}`;
+        setCurrentGlobalPresetName(presetDisplayName);
+
+        // 5. Se estivermos navegando/editando uma faixa da fila de lote, atualiza as configurações personalizadas dela
+        if (editingBatchIndex !== null) {
+          setBatchQueue((prev) =>
+            prev.map((it, idx) =>
+              idx === editingBatchIndex
+                ? {
+                    ...it,
+                    presetId: recall.presetId || 'imported_recall',
+                    presetName: presetDisplayName,
+                    customHumanizerSettings: { ...restoredHumanizer },
+                    customAzimuthSettings: recall.azimuthSettings
+                      ? { ...recall.azimuthSettings }
+                      : it.customAzimuthSettings,
+                    customDropoutSettings: recall.dropoutSettings || it.customDropoutSettings,
+                    customDenoiseSettings: recall.denoiseSettings || it.customDenoiseSettings,
+                    isCustomized: true,
+                  }
+                : it
+            )
+          );
+        }
+
+        // 6. Atualização do motor de áudio (Renderização master para faixas curtas + Nós DSP em tempo real)
+        const targetBuf = rawBufferRef.current || masterBufferRef.current;
+        if (targetBuf && targetBuf.duration <= 300) {
+          audioEngine.triggerMasterRender().then((rendered) => {
+            if (rendered) {
+              masterBufferRef.current = rendered;
+            }
+          });
+        }
+        // SEMPRE atualiza os nós DSP em tempo real para escuta imediata
+        audioEngine.updateRealtimeDspNodes();
+
+        const lufsVal = restoredHumanizer.targetLufs ? `${restoredHumanizer.targetLufs.toFixed(1)} LUFS` : '-14.0 LUFS';
+        const azVal = recall.azimuthSettings?.azimuthDelaySamples ? `${recall.azimuthSettings.azimuthDelaySamples} smp` : '0 smp';
         setExportNotice(
-          `✓ Recall de Masterização aplicado com sucesso: "${recall.trackTitle}"! Todos os parâmetros de master foram restabelecidos no áudio atual.`
+          `✓ Recall de Masterização "${recall.trackTitle}" ATIVADO E ATUANDO NO ÁUDIO! [Alvo: ${lufsVal} | De-Harsh: ${restoredHumanizer.deHarshIntensity}% | Warmth: ${restoredHumanizer.tapeWarmth}% | Azimute: ${azVal}]. Todos os controles foram sincronizados.`
         );
-        setTimeout(() => setExportNotice(null), 6000);
+        setTimeout(() => setExportNotice(null), 7000);
       } else {
-        setExportNotice('Arquivo de recall inválido ou corrompido.');
-        setTimeout(() => setExportNotice(null), 4000);
+        setExportNotice('Arquivo de recall inválido ou não reconhecido. Use arquivos .aurapreset ou .json gerados pelo AuraTune.');
+        setTimeout(() => setExportNotice(null), 5000);
       }
-    } catch {
+    } catch (err) {
+      console.error('Falha ao processar arquivo de recall:', err);
       setExportNotice('Falha ao processar arquivo de recall.');
       setTimeout(() => setExportNotice(null), 4000);
     }
@@ -1899,6 +2095,7 @@ export default function App() {
         isExportingZip={isExportingZip}
         hasAudioLoaded={!!masterBufferRef.current}
         outputBitDepth={exportBitDepth}
+        onLoadRecallFile={handleDirectLoadRecall}
       />
 
       {/* Export notification toast */}
@@ -1942,7 +2139,7 @@ export default function App() {
       )}
 
       {/* Main Container */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 md:px-8 py-5 flex flex-col gap-5">
+      <main className="flex-1 max-w-[1600px] w-full mx-auto px-3 sm:px-6 lg:px-8 py-4 sm:py-5 flex flex-col gap-4 sm:gap-5 pb-44 sm:pb-36">
         {/* Source File Ingestion & Format Specs */}
         <AudioUploader
           currentTrackTitle={currentTrackTitle}
@@ -1966,13 +2163,15 @@ export default function App() {
           onUpdateArtistName={handleUpdateArtistName}
           targetLufs={humanizerSettings.targetLufs}
           analysisStatus={analysisStatus}
+          currentPresetName={currentGlobalPresetName}
+          onReanalyze={handleReanalyzeForensics}
         />
 
         {/* Real-time DSP Processing & Listening Route Status Banner */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 rounded-xl bg-[#0b101d] border border-slate-800 text-xs shadow-xs">
-          <div className="flex items-center gap-3">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 p-3 sm:p-3.5 rounded-xl bg-[#0b101d] border border-slate-800 text-xs shadow-xs">
+          <div className="flex items-start sm:items-center gap-2.5 sm:gap-3 min-w-0">
             <div
-              className={`w-2.5 h-2.5 rounded-full ${
+              className={`w-2.5 h-2.5 rounded-full shrink-0 mt-1 sm:mt-0 ${
                 !masterBufferRef.current
                   ? 'bg-slate-600'
                   : !isCompareOriginal
@@ -1980,7 +2179,7 @@ export default function App() {
                   : 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.8)]'
               }`}
             />
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 min-w-0">
               {masterBufferRef.current ? (
                 <>
                   <span className="text-slate-200 font-semibold">
@@ -1998,56 +2197,68 @@ export default function App() {
                     </span>
                   )}
                   {analysisResult && (
-                    <span className="text-slate-400 font-mono text-[11px]">
-                      · {analysisResult.overallAiProbability.toFixed(1)}% IA ({analysisResult.dominantPlatform.name})
+                    <span className="text-slate-400 font-mono text-[11px] inline-flex items-center gap-1.5">
+                      <span className={analysisResult.overallAiProbability > 40 ? 'text-amber-400' : 'text-emerald-400 font-semibold'}>
+                        · {analysisResult.overallAiProbability.toFixed(1)}% IA ({analysisResult.dominantPlatform.name})
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleReanalyzeForensics}
+                        disabled={isAnalyzing}
+                        className="ml-1 text-[10px] text-cyan-400 hover:text-cyan-300 underline font-sans cursor-pointer flex items-center gap-0.5"
+                        title="Recalcular triagem acústica com o novo classificador orgânico"
+                      >
+                        <RefreshCw className={`w-2.5 h-2.5 ${isAnalyzing ? 'animate-spin' : ''}`} />
+                        <span>[Reanalisar]</span>
+                      </button>
                     </span>
                   )}
                 </>
               ) : (
-                <span className="text-slate-400">
+                <span className="text-slate-300 leading-relaxed">
                   Aguardando arquivo de áudio ou digitalização de fita 1/4" para iniciar.
                 </span>
               )}
             </div>
           </div>
 
-          <div className="flex items-center gap-2 self-end sm:self-auto">
+          <div className="flex items-center gap-1.5 sm:gap-2 overflow-x-auto pb-1 sm:pb-0 w-full lg:w-auto shrink-0 scrollbar-none">
             <button
               onClick={() => setActiveTab('modular')}
-              className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+              className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap min-h-[38px] ${
                 activeTab === 'modular'
                   ? 'bg-gradient-to-r from-amber-500/25 via-cyan-500/25 to-blue-500/25 text-white border border-cyan-400 shadow-md shadow-cyan-500/20'
                   : 'bg-[#111726] text-slate-300 hover:text-white border border-slate-700'
               }`}
               title="Fluxo Modular Inteligente: Triagem Automática, Restauração de Fita, Equalização e Masterização em Blocos"
             >
-              <Layers className="w-3.5 h-3.5 text-cyan-400" />
+              <Layers className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
               <span>⚡ Fluxo Modular</span>
             </button>
 
             <button
               onClick={() => setActiveTab('azimuth')}
-              className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-semibold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap min-h-[38px] ${
                 activeTab === 'azimuth'
                   ? 'bg-amber-500/25 text-amber-300 border border-amber-500/60'
                   : 'bg-[#111726] text-slate-300 hover:text-white border border-slate-700'
               }`}
             >
-              <Disc className="w-3.5 h-3.5 text-amber-400" />
+              <Disc className="w-3.5 h-3.5 text-amber-400 shrink-0" />
               <span>Azimute 1/4"</span>
             </button>
 
             <button
               onClick={() => setActiveTab('dropouts')}
-              className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-semibold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap min-h-[38px] ${
                 activeTab === 'dropouts'
                   ? 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/60'
                   : 'bg-[#111726] text-slate-300 hover:text-white border border-slate-700'
               }`}
               title="Detecção e correção de dropouts de fita analógica (Ampex Mono Full-Track em Studer A80)"
             >
-              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Dropouts & Ampex</span>
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              <span>Dropouts</span>
               {tapeDropoutAnalysis && tapeDropoutAnalysis.totalDropouts > 0 && (
                 <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-emerald-500/30 text-emerald-300 font-bold">
                   {tapeDropoutAnalysis.totalDropouts}
@@ -2057,15 +2268,15 @@ export default function App() {
 
             <button
               onClick={() => setActiveTab('denoise')}
-              className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-semibold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap min-h-[38px] ${
                 activeTab === 'denoise'
                   ? 'bg-purple-500/25 text-purple-300 border border-purple-500/60'
                   : 'bg-[#111726] text-slate-300 hover:text-white border border-slate-700'
               }`}
               title="Redutor de Ruído Espectral NoNoise / RX (Hiss, Ronco e Subtração Multi-Banda)"
             >
-              <Waves className="w-3.5 h-3.5 text-purple-400" />
-              <span>Denoise NoNoise / RX</span>
+              <Waves className="w-3.5 h-3.5 text-purple-400 shrink-0" />
+              <span>Denoise</span>
               {tapeDenoiseTelemetry && (
                 <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-purple-500/30 text-purple-300 font-bold">
                   {tapeDenoiseTelemetry.hissNoiseFloorDb.toFixed(0)}dB
@@ -2073,19 +2284,19 @@ export default function App() {
               )}
             </button>
 
-            <span className="text-slate-500 text-[11px]">|</span>
+            <span className="text-slate-600 text-[11px] hidden sm:inline">|</span>
 
             <button
               onClick={handleToggleAB}
               disabled={!masterBufferRef.current}
-              className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+              className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap min-h-[38px] disabled:opacity-40 disabled:cursor-not-allowed ${
                 !isCompareOriginal
                   ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/50 hover:bg-emerald-500/30 shadow-xs'
                   : 'bg-amber-500/20 text-amber-300 border border-amber-500/50 hover:bg-amber-500/30 shadow-xs'
               }`}
               title="Clique para alternar o sinal de áudio A/B entre o áudio cru original e o master de estúdio"
             >
-              <Sparkles className="w-3.5 h-3.5" />
+              <Sparkles className="w-3.5 h-3.5 shrink-0" />
               <span>
                 {!isCompareOriginal
                   ? '✨ MASTER TRATADO'
@@ -2265,6 +2476,8 @@ export default function App() {
             onChangeBitDepth={(depth) => setExportBitDepth(depth)}
             isExporting={isExporting}
             isExportingPreMaster={isExportingPreMaster}
+            currentPresetName={currentGlobalPresetName}
+            onLoadRecallFile={handleDirectLoadRecall}
           />
         )}
 
@@ -2351,6 +2564,7 @@ export default function App() {
             onAutoCalibrateOrban={handleAutoCalibrateOrban}
             hasAudioLoaded={!!masterBufferRef.current}
             onSelectPresetName={(name) => setCurrentGlobalPresetName(name)}
+            currentPresetName={currentGlobalPresetName}
           />
         )}
 
@@ -2387,14 +2601,26 @@ export default function App() {
             {/* Acoustic Matrix & Artifacts Inspection */}
             {analysisResult && (
               <div className="bg-[#0e1320] border border-slate-800 rounded-xl p-4 md:p-5 flex flex-col gap-3">
-                <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
+                <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-800/80">
                   <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
                     <Cpu className="w-4 h-4 text-cyan-400" />
                     Diagnóstico Acústico de Precisão & Espectro
                   </h3>
-                  <span className="text-[11px] font-mono text-slate-400">
-                    5 Parâmetros de Áudio Mapeados
-                  </span>
+                  <div className="flex items-center gap-3">
+                    <span className="text-[11px] font-mono text-slate-400">
+                      5 Parâmetros de Áudio Mapeados
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleReanalyzeForensics}
+                      disabled={isAnalyzing}
+                      className="px-2.5 py-1 rounded-lg text-xs font-mono font-bold bg-cyan-950/60 hover:bg-cyan-900/60 border border-cyan-500/40 text-cyan-300 flex items-center gap-1.5 cursor-pointer transition-all disabled:opacity-50"
+                      title="Recalcular classificação com as regras acústicas orgânicas"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${isAnalyzing ? 'animate-spin' : ''}`} />
+                      <span>Atualizar Diagnóstico</span>
+                    </button>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 pt-1">
@@ -2463,6 +2689,7 @@ export default function App() {
         outputBitDepth={exportBitDepth}
         targetLufs={humanizerSettings.targetLufs ?? -14.0}
         targetCeilingDb={humanizerSettings.targetCeilingDb ?? -1.0}
+        currentPresetName={currentGlobalPresetName}
       />
 
       {/* Preset Manager Modal (User custom presets + Factory profiles) */}

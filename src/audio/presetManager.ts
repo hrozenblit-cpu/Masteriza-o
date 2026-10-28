@@ -1,5 +1,7 @@
-import { HumanizerSettings } from '../types/audio';
+import { HumanizerSettings, ForensicAnalysisResult } from '../types/audio';
 import { TapeAzimuthSettings } from './tapeAzimuthEngine';
+import { TapeDropoutSettings } from './tapeDropoutEngine';
+import { SpectralDenoiseSettings } from './spectralDenoiseEngine';
 
 export interface UserPreset {
   id: string;
@@ -9,6 +11,8 @@ export interface UserPreset {
   createdDate: string;
   settings: HumanizerSettings;
   azimuthSettings?: TapeAzimuthSettings;
+  dropoutSettings?: TapeDropoutSettings;
+  denoiseSettings?: SpectralDenoiseSettings;
 }
 
 const STORAGE_KEY = 'auratune_custom_presets_v1';
@@ -278,7 +282,177 @@ export const FACTORY_PRESETS: UserPreset[] = [
       orbanHfSpeed: 'fast',
     },
   },
+  {
+    id: 'factory_ai_rescue',
+    name: 'Resgate de IA (De-Harsh & Ar)',
+    category: 'factory',
+    description: 'Calibrado especificamente para faixas geradas por IA (Suno, Udio): remove aspereza metálica e sibilância (notch dinâmico), amplia ar estéreo e injeta dinâmica e calor de fita.',
+    createdDate: '2026-09-27',
+    settings: {
+      enabled: true,
+      deHarshIntensity: 75,
+      notchFrequencyHz: 3400,
+      notchBandwidthQ: 3.0,
+      tapeWarmth: 60,
+      tubeHarmonics: 45,
+      lowMidBody: 1.8,
+      transientPunch: 75,
+      attackDeSmear: 65,
+      timingJitterMs: 10,
+      flutterWowRate: 35,
+      airExciterGain: 45,
+      airCutoffHz: 15000,
+      stereoCorrelationFix: 80,
+      monoBassCutoffHz: 150,
+      acousticRoomSpread: 50,
+      outputGainDb: 0,
+      limitlessEnabled: true,
+      targetLufs: -14.0,
+      targetCeilingDb: -1.0,
+      clipperDrive: 55,
+      lowEndWeight: 75,
+      transientSpeed: 'punchy',
+      autoMatchLoudness: true,
+      orbanHfEnabled: true,
+      orbanHfMode: 'smooth_silk',
+      orbanHfAmount: 60,
+      orbanHfAutoBrillianceDb: -0.5,
+      orbanHfHighShelfGainDb: -0.5,
+      orbanHfThresholdDb: -6.5,
+      orbanHfCrossoverHz: 5500,
+      orbanHfSpeed: 'fast',
+    },
+  },
+  {
+    id: 'factory_live_dvd_analog',
+    name: 'DVD Ao Vivo & Master Analógico',
+    category: 'factory',
+    description: 'Calibrado para DVDs de shows ao vivo e gravações analógicas: preserva a energia da plateia, dinâmicas de palco, impacto de bateria e equilíbrio tonal cristalino sem notch filters ou de-harsh agressivo.',
+    createdDate: '2026-09-27',
+    settings: {
+      enabled: true,
+      deHarshIntensity: 25,
+      notchFrequencyHz: 3400,
+      notchBandwidthQ: 2.0,
+      tapeWarmth: 35,
+      tubeHarmonics: 25,
+      lowMidBody: 1.2,
+      transientPunch: 75,
+      attackDeSmear: 50,
+      timingJitterMs: 0,
+      flutterWowRate: 0,
+      airExciterGain: 35,
+      airCutoffHz: 15500,
+      stereoCorrelationFix: 60,
+      monoBassCutoffHz: 120,
+      acousticRoomSpread: 50,
+      outputGainDb: 0,
+      limitlessEnabled: true,
+      targetLufs: -14.0,
+      targetCeilingDb: -1.0,
+      clipperDrive: 50,
+      lowEndWeight: 75,
+      transientSpeed: 'punchy',
+      autoMatchLoudness: true,
+      orbanHfEnabled: true,
+      orbanHfMode: 'broadcast_optimod',
+      orbanHfAmount: 45,
+      orbanHfAutoBrillianceDb: 0.0,
+      orbanHfHighShelfGainDb: 0.0,
+      orbanHfThresholdDb: -6.0,
+      orbanHfCrossoverHz: 6000,
+      orbanHfSpeed: 'fast',
+    },
+    azimuthSettings: {
+      enabled: true,
+      azimuthDelaySamples: 0,
+      balanceDb: 0,
+      invertPhaseL: false,
+      invertPhaseR: false,
+      listenInMono: false,
+      autoAlignOnLoad: true,
+    },
+  },
 ];
+
+/**
+ * Intelligent Preset Selector based on Spectral Forensics & Audio Characteristics
+ * Selects and tailors the ideal mastering preset for the identified source material.
+ */
+export function getPresetForAudioAnalysis(
+  analysis: ForensicAnalysisResult | null | undefined,
+  context?: {
+    isDarkTape?: boolean;
+    hasDropouts?: boolean;
+    hasAzimuthError?: boolean;
+    isDualMono?: boolean;
+  }
+): UserPreset {
+  const all = getAllPresets();
+
+  // 1. AI Generative Music (Suno, Udio, Diffusion artifacts) - Requires verified AI score >= 55%
+  const isSuno = analysis?.dominantPlatform?.platform === 'suno';
+  const isUdio = analysis?.dominantPlatform?.platform === 'udio';
+  const isAi = (analysis?.overallAiProbability ?? 0) >= 55 && (isSuno || isUdio);
+
+  if (isAi) {
+    const aiRescuePreset = all.find((p) => p.id === 'factory_ai_rescue') || FACTORY_PRESETS[6];
+    // Fine-tune notch frequency according to the specific platform identified
+    const tailoredNotch = isUdio ? 4200 : 3400;
+    const tailoredDeHarsh = isUdio ? 80 : (analysis?.metrics?.nyquistCutoffHz && analysis.metrics.nyquistCutoffHz <= 16500 ? 75 : 65);
+    const tailoredAirCutoff = isUdio ? 17000 : 15500;
+
+    return {
+      ...aiRescuePreset,
+      settings: {
+        ...aiRescuePreset.settings,
+        notchFrequencyHz: tailoredNotch,
+        deHarshIntensity: tailoredDeHarsh,
+        airCutoffHz: tailoredAirCutoff,
+      },
+    };
+  }
+
+  // 2. Live DVD & Concert Recordings
+  const domName = analysis?.dominantPlatform?.name?.toLowerCase() || '';
+  const fileName = analysis?.filename?.toLowerCase() || '';
+  const isLiveOrDvd =
+    domName.includes('dvd') ||
+    domName.includes('vivo') ||
+    domName.includes('live') ||
+    domName.includes('show') ||
+    domName.includes('concerto') ||
+    fileName.includes('dvd') ||
+    fileName.includes('live') ||
+    fileName.includes('vivo') ||
+    fileName.includes('show');
+
+  if (isLiveOrDvd) {
+    const livePreset = all.find((p) => p.id === 'factory_live_dvd_analog') || FACTORY_PRESETS[7] || FACTORY_PRESETS[1];
+    return livePreset;
+  }
+
+  // 3. Analog Tape Transfers & Vintage Recordings
+  const isAnalog =
+    analysis?.dominantPlatform?.platform === 'human_analog' ||
+    Boolean(context?.hasDropouts || context?.hasAzimuthError || context?.isDarkTape || context?.isDualMono);
+
+  if (isAnalog) {
+    if (context?.isDarkTape || context?.hasDropouts) {
+      // Vintage tape (50s-70s) needing low-mid body and high-frequency opening
+      const vintagePreset = all.find((p) => p.id === 'factory_tape_1_4_vintage') || FACTORY_PRESETS[0];
+      return vintagePreset;
+    } else {
+      // Modern 1/4" tape (80s-2000s)
+      const modernPreset = all.find((p) => p.id === 'factory_tape_1_4_modern') || FACTORY_PRESETS[1];
+      return modernPreset;
+    }
+  }
+
+  // 4. Clean Acoustic / Modern Digital Master
+  const audiophilePreset = all.find((p) => p.id === 'factory_mastering_cristalino') || FACTORY_PRESETS[2];
+  return audiophilePreset;
+}
 
 export function getSavedUserPresets(): UserPreset[] {
   try {
@@ -302,7 +476,9 @@ export function saveUserPreset(
   name: string,
   settings: HumanizerSettings,
   azimuthSettings?: TapeAzimuthSettings,
-  description?: string
+  description?: string,
+  dropoutSettings?: TapeDropoutSettings,
+  denoiseSettings?: SpectralDenoiseSettings
 ): UserPreset {
   const currentList = getSavedUserPresets();
   const newPreset: UserPreset = {
@@ -313,6 +489,8 @@ export function saveUserPreset(
     createdDate: new Date().toISOString().split('T')[0],
     settings: { ...settings },
     azimuthSettings: azimuthSettings ? { ...azimuthSettings } : undefined,
+    dropoutSettings: dropoutSettings ? { ...dropoutSettings } : undefined,
+    denoiseSettings: denoiseSettings ? { ...denoiseSettings } : undefined,
   };
 
   const updated = [newPreset, ...currentList.filter(p => p.name.toLowerCase() !== newPreset.name.toLowerCase())];

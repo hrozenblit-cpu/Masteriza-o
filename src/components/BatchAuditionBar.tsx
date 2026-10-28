@@ -77,7 +77,7 @@ export function BatchAuditionBar({
             <Bookmark className="w-3 h-3 text-cyan-400 shrink-0" />
             <span className="text-[10px] text-slate-400 font-mono uppercase">Preset:</span>
             <select
-              value={currentTrack.presetId || currentTrack.presetName}
+              value={currentTrack.presetId || allPresets.find((p) => p.name === currentTrack.presetName)?.id || allPresets[0]?.id}
               onChange={(e) => onChangeTrackPreset(e.target.value)}
               className="bg-transparent text-xs font-semibold text-cyan-300 focus:outline-none cursor-pointer truncate max-w-[180px]"
             >
