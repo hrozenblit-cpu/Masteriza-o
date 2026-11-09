@@ -21,7 +21,9 @@ export interface SpectralDenoiseSettings {
   thresholdOffsetDb: number;      // -10 dB to +10 dB fine threshold offset.
   smoothingMs: number;            // 15 to 80 ms temporal smoothing to avoid musical noise / watery artifacts.
   noiseProfileType: 'auto_learned' | 'tape_hiss_type1' | 'tape_hiss_type2' | 'studio_master_15ips' | 'hum_60hz' | 'hum_50hz';
-  humNotchFilter: 'none' | '60hz_us_br' | '50hz_eu'; // Ground loop notch at 50/60Hz + harmonics
+  humNotchFilter: 'none' | '60hz_us_br' | '50hz_eu'; // Ground loop notch at 50/60Hz + harmonics with controlled depth
+  rumbleFilter: 'none' | 'subsonic_18hz' | 'subsonic_28hz' | 'dynamic_rx' | 'wind_rumble_40hz' | 'wind_rumble_45hz' | 'deep_65hz'; // Anti-Sopro Grave & Subsonic Rumble filter
+  bassPreserveRatio?: number;     // 0.0 to 1.0 (default 1.0: blindagem total de graves - bumbo e baixo 100% protegidos)
   listenNoiseDeltaOnly: boolean;  // Solo the removed noise (NoNoise / RX style)
   learnedNoiseBands?: number[];   // 64-band noise floor profile in dB
 }
@@ -30,15 +32,18 @@ export interface NoiseAnalysisTelemetry {
   estimatedSnrDb: number;         // Overall signal-to-noise ratio in dB
   hissNoiseFloorDb: number;       // High-frequency tape hiss baseline (e.g. -54 dBFS)
   humLevelDb: number;             // 50/60Hz AC ground-loop baseline
+  rumbleLevelDb: number;          // Nível de sopro grave / rumble sub-sônico (<45Hz) em dBFS
   recommendedReductionDb: number; // Adaptive recommendation
   noiseTypeDetected: string;
   hasHumDetected: boolean;
-  hasNoiseDetected: boolean;      // Verdadeiro quando ruído de fita ou ronco analógico foi detectado
+  hasRumbleDetected: boolean;     // Sopro grave / vento / rumble mecânico detectado
+  hasNoiseDetected: boolean;      // Verdadeiro quando ruído de fita, ronco 50/60Hz ou sopro grave foi detectado
   quietestSegmentStartSec: number;
   quietestSegmentDurationSec: number;
   noiseProfileBands: number[];    // 64 bands representing noise power from 20 Hz to 22 kHz
   recommendedNoiseProfileType: SpectralDenoiseSettings['noiseProfileType'];
   recommendedHumNotch: SpectralDenoiseSettings['humNotchFilter'];
+  recommendedRumbleFilter: SpectralDenoiseSettings['rumbleFilter'];
 }
 
 export const DEFAULT_DENOISE_SETTINGS: SpectralDenoiseSettings = {
@@ -48,6 +53,8 @@ export const DEFAULT_DENOISE_SETTINGS: SpectralDenoiseSettings = {
   smoothingMs: 35,
   noiseProfileType: 'studio_master_15ips',
   humNotchFilter: 'none',
+  rumbleFilter: 'dynamic_rx',    // Padrão iZotope RX: 100% dinâmico, zero perda musical e zero vazamento no delta
+  bassPreserveRatio: 1.0,        // Blindagem total contra perda de bumbo e contrabaixo
   listenNoiseDeltaOnly: false,
 };
 
@@ -188,18 +195,72 @@ function fastIFFT1024(real: Float32Array, imag: Float32Array): void {
 }
 
 /**
- * High-Q 2nd-order IIR Biquad Notch Filter for ground-loop AC hum removal.
- * Operates in-place in ~3ms without transcendental function overhead.
+ * Precision Parametric Peaking Notch Filter for Ground-Loop AC Hum Removal.
+ * Operates with an ultra-narrow bandwidth (Q = 50, ~1.2 Hz wide) and a controlled
+ * attenuation depth (-16 dB on fundamental, -12 dB on harmonics) instead of an
+ * infinite-null cut (-infinity dB).
+ *
+ * This suppresses the steady electrical hum below the tape hiss floor while PRESERVING
+ * 100% of the kick drum, bass guitar notes, and acoustic body at or near 50/60 Hz.
  */
-function applyBiquadNotch(data: Float32Array, notchFreq: number, sampleRate: number, q: number = 30): void {
-  if (notchFreq >= sampleRate * 0.49) return;
+function applyParametricHumNotch(
+  data: Float32Array,
+  notchFreq: number,
+  sampleRate: number,
+  depthDb: number = -16,
+  q: number = 50
+): void {
+  if (notchFreq <= 10 || notchFreq >= sampleRate * 0.49) return;
+  const A = Math.pow(10, depthDb / 40); // Amplitude ratio for peaking cut
   const w0 = (2 * Math.PI * notchFreq) / sampleRate;
-  const alpha = Math.sin(w0) / (2 * q);
   const cosw0 = Math.cos(w0);
+  const sinw0 = Math.sin(w0);
+  const alpha = sinw0 / (2 * q);
 
-  const b0 = 1;
+  const b0 = 1 + alpha * A;
   const b1 = -2 * cosw0;
-  const b2 = 1;
+  const b2 = 1 - alpha * A;
+  const a0 = 1 + alpha / A;
+  const a1 = -2 * cosw0;
+  const a2 = 1 - alpha / A;
+
+  const nb0 = b0 / a0;
+  const nb1 = b1 / a0;
+  const nb2 = b2 / a0;
+  const na1 = a1 / a0;
+  const na2 = a2 / a0;
+
+  let x1 = 0;
+  let x2 = 0;
+  let y1 = 0;
+  let y2 = 0;
+  const len = data.length;
+
+  for (let i = 0; i < len; i++) {
+    const x0 = data[i];
+    const y0 = nb0 * x0 + nb1 * x1 + nb2 * x2 - na1 * y1 - na2 * y2;
+    x2 = x1;
+    x1 = x0;
+    y2 = y1;
+    y1 = y0;
+    data[i] = y0;
+  }
+}
+
+/**
+ * Transparent 2nd-order (12 dB/octave) Butterworth High-Pass Filter.
+ * Used for sub-acoustic protection (18 Hz) without excessive phase rotation or transient blur in the bass.
+ */
+function applyBiquadHighpass(data: Float32Array, cutoffHz: number, sampleRate: number, q: number = 0.7071): void {
+  if (cutoffHz <= 5 || cutoffHz >= sampleRate * 0.45) return;
+  const w0 = (2 * Math.PI * cutoffHz) / sampleRate;
+  const cosw0 = Math.cos(w0);
+  const sinw0 = Math.sin(w0);
+  const alpha = sinw0 / (2 * q);
+
+  const b0 = (1 + cosw0) / 2;
+  const b1 = -(1 + cosw0);
+  const b2 = (1 + cosw0) / 2;
   const a0 = 1 + alpha;
   const a1 = -2 * cosw0;
   const a2 = 1 - alpha;
@@ -225,6 +286,35 @@ function applyBiquadNotch(data: Float32Array, notchFreq: number, sampleRate: num
     y1 = y0;
     data[i] = y0;
   }
+}
+
+/**
+ * Ultra-precise Goertzel single-frequency energy detector.
+ * Immune to FFT bin smearing, exact down to 0.1 Hz at ANY sample rate (44.1k, 48k, 96k).
+ */
+export function measureGoertzelPowerDb(
+  data: Float32Array,
+  targetFreq: number,
+  sampleRate: number,
+  startSample: number,
+  numSamples: number
+): number {
+  const safeSamples = Math.min(numSamples, data.length - startSample);
+  if (safeSamples < 256 || targetFreq <= 0 || targetFreq >= sampleRate * 0.49) return -96;
+  const omega = (2 * Math.PI * targetFreq) / sampleRate;
+  const coeff = 2 * Math.cos(omega);
+  let s0 = 0;
+  let s1 = 0;
+  let s2 = 0;
+  for (let i = 0; i < safeSamples; i++) {
+    const x = data[startSample + i];
+    s0 = x + coeff * s1 - s2;
+    s2 = s1;
+    s1 = s0;
+  }
+  const power = (s1 * s1 + s2 * s2 - coeff * s1 * s2) / (safeSamples * safeSamples);
+  const rms = Math.sqrt(Math.max(1e-12, 2 * power));
+  return Math.round(20 * Math.log10(rms) * 10) / 10;
 }
 
 /**
@@ -337,20 +427,20 @@ export function learnNoiseProfileFromBuffer(
       const rms = Math.sqrt(sumSq / Math.max(1, count));
 
       // 1. Digital black rejection: Anything < -96 dBFS (< 0.000015) is digital computer silence
-      // 2. Program rejection: Anything > -24 dBFS (> 0.063) is active loud music
-      if (rms < 0.000015 || rms > 0.063) return null;
+      // 2. Program rejection: Anything > -46 dBFS (> 0.005) is active musical program, NEVER background noise!
+      if (rms < 0.000015 || rms > 0.005) return null;
 
       const crestFactor = maxPeak / (rms + 1e-12);
-      // Pure noise has crest factor < 4.2. Music transients / drum hits exceed 5.5
-      if (crestFactor > 5.8) return null;
+      // Pure noise has crest factor < 4.0. Music transients / beats exceed 4.5
+      if (crestFactor > 4.6) return null;
 
       const rmsDb = 20 * Math.log10(rms);
-      // Real tape hiss and hum sits between -80 dBFS and -35 dBFS
-      const hasAnalogNoise = rmsDb >= -80 && rmsDb <= -35;
+      // Real tape hiss, room tone and hum sits strictly between -85 dBFS and -48 dBFS
+      const hasAnalogNoise = rmsDb >= -85 && rmsDb <= -48;
 
       let score = -rmsDb; // Lower RMS is cleaner background noise
-      if (isTail) score += 20; // High priority to outro / tail where pure runout noise sits!
-      else if (isHead) score += 12; // Lead-in tape pre-roll
+      if (isTail && hasAnalogNoise) score += 20; // High priority to outro / tail ONLY if it contains true analog noise floor!
+      else if (isHead && hasAnalogNoise) score += 12; // Lead-in tape pre-roll
       if (crestFactor < 3.2) score += 8; // Ultra-steady stationary noise
 
       return { pos, rms, crestFactor, score, isTail, hasAnalogNoise };
@@ -532,43 +622,83 @@ export function learnNoiseProfileFromBuffer(
 }
 
 /**
- * Analyzes audio buffer to detect tape hiss and ground-loop hum telemetry
+ * Analyzes audio buffer to detect tape hiss, AC ground hum (50Hz/60Hz), and sopro grave/subsonic rumble
  */
 export function analyzeTapeNoise(audioBuffer: AudioBuffer): NoiseAnalysisTelemetry {
   const channelData = audioBuffer.getChannelData(0);
   const totalLength = audioBuffer.length;
+  const sampleRate = audioBuffer.sampleRate;
 
   const learned = learnNoiseProfileFromBuffer(audioBuffer);
   const noiseProfileBands = learned.profileBands;
   const hissNoiseFloorDb = learned.hissNoiseFloorDb;
 
-  // Measure 60Hz and 50Hz ground-loop hum and harmonics vs adjacent baseline
-  let hum60Db = -96;
-  let hum50Db = -96;
-  let hum120Db = -96;
-  let hum100Db = -96;
-  let sub35Db = -96;
-  let mid75Db = -96;
+  const evalStart = Math.max(0, Math.floor(learned.startSec * sampleRate));
+  const evalLen = Math.min(totalLength - evalStart, Math.max(4096, Math.floor(learned.durationSec * sampleRate)));
 
+  // 1. Direct Goertzel measurements for AC Ground Loop Hum (immune to FFT bin quantization at 48k/44.1k/96k)
+  const g60 = measureGoertzelPowerDb(channelData, 60.0, sampleRate, evalStart, evalLen);
+  const g120 = measureGoertzelPowerDb(channelData, 120.0, sampleRate, evalStart, evalLen);
+  const g180 = measureGoertzelPowerDb(channelData, 180.0, sampleRate, evalStart, evalLen);
+  const side60Low = measureGoertzelPowerDb(channelData, 44.0, sampleRate, evalStart, evalLen);
+  const side60High = measureGoertzelPowerDb(channelData, 76.0, sampleRate, evalStart, evalLen);
+  const base60 = (side60Low + side60High) * 0.5;
+
+  const g50 = measureGoertzelPowerDb(channelData, 50.0, sampleRate, evalStart, evalLen);
+  const g100 = measureGoertzelPowerDb(channelData, 100.0, sampleRate, evalStart, evalLen);
+  const g150 = measureGoertzelPowerDb(channelData, 150.0, sampleRate, evalStart, evalLen);
+  const side50Low = measureGoertzelPowerDb(channelData, 36.0, sampleRate, evalStart, evalLen);
+  const side50High = measureGoertzelPowerDb(channelData, 68.0, sampleRate, evalStart, evalLen);
+  const base50 = (side50Low + side50High) * 0.5;
+
+  // 2. Direct Goertzel measurements for Sopro Grave & Subsonic Rumble (< 45 Hz)
+  const gRumble24 = measureGoertzelPowerDb(channelData, 24.0, sampleRate, evalStart, evalLen);
+  const gRumble32 = measureGoertzelPowerDb(channelData, 32.0, sampleRate, evalStart, evalLen);
+  const gRumble42 = measureGoertzelPowerDb(channelData, 42.0, sampleRate, evalStart, evalLen);
+  const rumbleLevelDb = Math.max(gRumble24, gRumble32, gRumble42);
+  const midRef160 = measureGoertzelPowerDb(channelData, 160.0, sampleRate, evalStart, evalLen);
+
+  // Fallback / Corroboration from Bark Critical Bands
+  let bark60 = -96;
+  let bark50 = -96;
   for (let b = 0; b < CRITICAL_BAND_CENTERS_HZ.length; b++) {
     const f = CRITICAL_BAND_CENTERS_HZ[b];
-    if (Math.abs(f - 60) < 12) hum60Db = noiseProfileBands[b];
-    if (Math.abs(f - 50) < 12) hum50Db = noiseProfileBands[b];
-    if (Math.abs(f - 120) < 15) hum120Db = noiseProfileBands[b];
-    if (Math.abs(f - 100) < 15) hum100Db = noiseProfileBands[b];
-    if (Math.abs(f - 35) < 12) sub35Db = noiseProfileBands[b];
-    if (Math.abs(f - 75) < 12) mid75Db = noiseProfileBands[b];
+    if (Math.abs(f - 60) < 15) bark60 = Math.max(bark60, noiseProfileBands[b]);
+    if (Math.abs(f - 50) < 15) bark50 = Math.max(bark50, noiseProfileBands[b]);
   }
-  const humLevelDb = Math.max(hum60Db, hum50Db);
-  const neighborBaseline = Math.max(sub35Db, mid75Db);
 
-  // A genuine AC ground-loop hum is a prominent sinusoidal line tone:
-  // - Sits at an audible level (> -68 dBFS)
-  // - Is at least +5.5 dB above neighboring sub frequencies (35Hz/75Hz), OR
-  // - Accompanied by its 2nd harmonic (120Hz for 60Hz, 100Hz for 50Hz)
-  const isSpike60 = hum60Db > -68 && (hum60Db > neighborBaseline + 5.5 || hum120Db > neighborBaseline + 4.0);
-  const isSpike50 = hum50Db > -68 && (hum50Db > neighborBaseline + 5.5 || hum100Db > neighborBaseline + 4.0);
+  const effective60 = Math.max(g60, bark60);
+  const effective50 = Math.max(g50, bark50);
+  const humLevelDb = Math.max(effective60, effective50);
+
+  // Physical criteria for genuine AC ground loop hum (ronco elétrico de 50Hz/60Hz):
+  // 1. Must be stationary and within realistic low-level electrical hum limits: -74 dBFS to -48 dBFS.
+  //    Signals > -46 dBFS (such as -29.1 dBFS) are ACTIVE MUSICAL INSTRUMENTS (bass guitar, kick drum), NOT ground hum!
+  // 2. Must be measured during quiet background/silence (broadband noise floor <= -48 dBFS).
+  // 3. Must be elevated (+4 dB) above flanking sidebands with matching low-level harmonics.
+  const isQuietBackground = learned.broadbandNoiseFloorDb <= -48.0;
+
+  const isRealisticHumRange60 = effective60 >= -74.0 && effective60 <= -48.0;
+  const isRealisticHumRange50 = effective50 >= -74.0 && effective50 <= -48.0;
+
+  const isSpike60 =
+    isQuietBackground &&
+    isRealisticHumRange60 &&
+    effective60 > base60 + 4.0 &&
+    (g120 > base60 + 2.5 || (g120 >= -74.0 && g120 <= -52.0));
+
+  const isSpike50 =
+    isQuietBackground &&
+    isRealisticHumRange50 &&
+    effective50 > base50 + 4.0 &&
+    (g100 > base50 + 2.5 || (g100 >= -74.0 && g100 <= -52.0));
+
   const hasHumDetected = isSpike60 || isSpike50;
+
+  // Sopro Grave / Rumble detection:
+  // Subsonic energy (<45Hz) higher than -62 dBFS and at least +2 dB above 160Hz mid baseline, OR higher than -54 dBFS
+  const hasRumbleDetected =
+    rumbleLevelDb > -62.0 && (rumbleLevelDb > midRef160 + 2.0 || rumbleLevelDb > -54.0);
 
   // Overall track RMS to estimate SNR
   let sumSq = 0;
@@ -587,21 +717,34 @@ export function analyzeTapeNoise(audioBuffer: AudioBuffer): NoiseAnalysisTelemet
   let noiseTypeDetected = 'Hiss Suave de Estúdio 15 ips (Studer/Ampex)';
   let recommendedNoiseProfileType: SpectralDenoiseSettings['noiseProfileType'] = 'auto_learned';
   let recommendedHumNotch: SpectralDenoiseSettings['humNotchFilter'] = 'none';
+  let recommendedRumbleFilter: SpectralDenoiseSettings['rumbleFilter'] = 'dynamic_rx';
 
-  const hasNoiseDetected = hasHumDetected || hissNoiseFloorDb > -75.0;
+  // Sopro grave / rumble recommendation (Padrão iZotope RX: protege 100% dos graves musicais e zero vazamento no delta!)
+  recommendedRumbleFilter = 'dynamic_rx';
+
+  const hasNoiseDetected = hasHumDetected || hasRumbleDetected || hissNoiseFloorDb > -75.0;
 
   if (hasHumDetected) {
-    if (hum60Db > hum50Db) {
+    if (effective60 >= effective50) {
       recommendedNoiseProfileType = 'auto_learned';
       recommendedHumNotch = '60hz_us_br';
-      recommendedReductionDb = Math.min(14.0, Math.max(9.0, (hum60Db + 70) * 0.25 + 8.5));
-      noiseTypeDetected = `Ronco AC 60 Hz (${hum60Db.toFixed(1)} dBFS) + Hiss de Fita (${hissNoiseFloorDb.toFixed(1)} dBFS)`;
+      recommendedReductionDb = Math.min(14.0, Math.max(9.0, (effective60 + 70) * 0.25 + 8.5));
+      noiseTypeDetected = `Ronco AC 60 Hz (${effective60.toFixed(1)} dBFS)${
+        hasRumbleDetected ? ` + Sopro Grave (${rumbleLevelDb.toFixed(1)} dBFS)` : ''
+      } + Hiss (${hissNoiseFloorDb.toFixed(1)} dBFS)`;
     } else {
       recommendedNoiseProfileType = 'auto_learned';
       recommendedHumNotch = '50hz_eu';
-      recommendedReductionDb = Math.min(14.0, Math.max(9.0, (hum50Db + 70) * 0.25 + 8.5));
-      noiseTypeDetected = `Ronco AC 50 Hz (${hum50Db.toFixed(1)} dBFS) + Hiss de Fita (${hissNoiseFloorDb.toFixed(1)} dBFS)`;
+      recommendedReductionDb = Math.min(14.0, Math.max(9.0, (effective50 + 70) * 0.25 + 8.5));
+      noiseTypeDetected = `Ronco AC 50 Hz (${effective50.toFixed(1)} dBFS)${
+        hasRumbleDetected ? ` + Sopro Grave (${rumbleLevelDb.toFixed(1)} dBFS)` : ''
+      } + Hiss (${hissNoiseFloorDb.toFixed(1)} dBFS)`;
     }
+  } else if (hasRumbleDetected) {
+    recommendedNoiseProfileType = 'auto_learned';
+    recommendedHumNotch = 'none';
+    recommendedReductionDb = Math.min(11.0, Math.max(8.0, (rumbleLevelDb + 65) * 0.25 + 7.5));
+    noiseTypeDetected = `Sopro Grave / Rumble de Palco (${rumbleLevelDb.toFixed(1)} dBFS) + Hiss (${hissNoiseFloorDb.toFixed(1)} dBFS)`;
   } else if (hissNoiseFloorDb < -75.0) {
     recommendedReductionDb = 0;
     recommendedNoiseProfileType = 'studio_master_15ips';
@@ -633,15 +776,18 @@ export function analyzeTapeNoise(audioBuffer: AudioBuffer): NoiseAnalysisTelemet
     estimatedSnrDb,
     hissNoiseFloorDb,
     humLevelDb,
+    rumbleLevelDb,
     recommendedReductionDb,
     noiseTypeDetected,
     hasHumDetected,
+    hasRumbleDetected,
     hasNoiseDetected,
     quietestSegmentStartSec: learned.startSec,
     quietestSegmentDurationSec: learned.durationSec,
     noiseProfileBands,
     recommendedNoiseProfileType,
     recommendedHumNotch,
+    recommendedRumbleFilter,
   };
 }
 
@@ -652,16 +798,30 @@ export function analyzeTapeNoise(audioBuffer: AudioBuffer): NoiseAnalysisTelemet
  * Overlap-Add with constant-overlap normalization.
  * Runs in ~40-80ms for an entire song.
  */
-function createAudioBufferSafe(numChannels: number, length: number, sampleRate: number): AudioBuffer {
+export function createAudioBufferSafe(numChannels: number, length: number, sampleRate: number): AudioBuffer {
   if (typeof AudioBuffer !== 'undefined') {
     try {
-      return new AudioBuffer({ numberOfChannels: numChannels, length, sampleRate });
+      return new AudioBuffer({ numberOfChannels: Math.max(1, numChannels), length: Math.max(1, length), sampleRate });
     } catch {
       // fallback
     }
   }
-  const offline = new OfflineAudioContext(numChannels, 1, sampleRate);
-  return offline.createBuffer(numChannels, length, sampleRate);
+  try {
+    const offline = new OfflineAudioContext(Math.max(1, numChannels), 1, sampleRate);
+    return offline.createBuffer(Math.max(1, numChannels), Math.max(1, length), sampleRate);
+  } catch {
+    // fallback
+  }
+  if (typeof window !== 'undefined') {
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+    if (AudioCtx) {
+      try {
+        const ctx = new AudioCtx();
+        return ctx.createBuffer(Math.max(1, numChannels), Math.max(1, length), sampleRate);
+      } catch {}
+    }
+  }
+  throw new Error('Não foi possível instanciar AudioBuffer no navegador.');
 }
 
 export function processBufferWithSpectralDenoise(
@@ -687,7 +847,12 @@ export function processBufferWithSpectralDenoise(
     noiseBands = getStandardTapeNoiseProfile(settings.noiseProfileType);
   }
 
-  const reductionLinear = Math.pow(10, -Math.abs(settings.reductionDb) / 20); // e.g. -9 dB = 0.3548
+  // Ensure at least 9.0 dB reduction during Delta Solo so the extracted noise is always audible
+  const safeReductionDb = settings.listenNoiseDeltaOnly
+    ? Math.max(9.0, Math.abs(settings.reductionDb || 0))
+    : Math.abs(settings.reductionDb || 0);
+
+  const reductionLinear = Math.pow(10, -safeReductionDb / 20); // e.g. -9 dB = 0.3548
   const thresholdLinear = Math.pow(10, (settings.thresholdOffsetDb || 0) / 20);
 
   // Map 512 FFT frequency bins to critical Bark band noise amplitudes
@@ -720,11 +885,71 @@ export function processBufferWithSpectralDenoise(
   const hopSec = HOP_SIZE / sampleRate;
   const releaseCoeff = Math.exp(-hopSec / Math.max(0.008, (settings.smoothingMs || 35) / 1000));
   const attackCoeff = Math.exp(-hopSec / 0.008);
+  const bassAttackCoeff = Math.exp(-hopSec / 0.002);
 
-  // Hum notch frequencies
+  // Precomputed frequency bin tables for maximum speed (zero Math.pow/log10/exp in inner loops)
+  const binNoiseThresh = new Float32Array(halfFft + 1);
+  const binNoiseThreshSq = new Float32Array(halfFft + 1);
+  const isBassBin = new Uint8Array(halfFft + 1);
+  const isRumbleCut = new Uint8Array(halfFft + 1);
+  const rumbleRollOff = new Float32Array(halfFft + 1);
+  const isHumBin = new Uint8Array(halfFft + 1);
+  const humTargetLinear = new Float32Array(halfFft + 1);
+  const humMagThresh = Math.pow(10, -48 / 20) * normFactor; // -48 dBFS threshold in linear FFT magnitude
+
+  const rFilter = settings.rumbleFilter || 'dynamic_rx';
+  let rumbleCutoff = 0;
+  if (rFilter === 'subsonic_18hz') rumbleCutoff = 18.0;
+  else if (rFilter === 'subsonic_28hz') rumbleCutoff = 28.0;
+  else if (rFilter === 'wind_rumble_40hz' || rFilter === 'wind_rumble_45hz') rumbleCutoff = 40.0;
+  else if (rFilter === 'deep_65hz') rumbleCutoff = 65.0;
+
+  const bassCutoff = rumbleCutoff > 0 ? rumbleCutoff : 22.0;
+
   const isHum60 = settings.humNotchFilter === '60hz_us_br';
   const isHum50 = settings.humNotchFilter === '50hz_eu';
-  const humHarmonics = isHum60 ? [60, 120, 180, 240] : isHum50 ? [50, 100, 150, 200] : [];
+  const humHarmonics = isHum60
+    ? [
+        { freq: 60, depthLinear: Math.pow(10, -16 / 20) },
+        { freq: 120, depthLinear: Math.pow(10, -12 / 20) },
+        { freq: 180, depthLinear: Math.pow(10, -10 / 20) },
+      ]
+    : isHum50
+    ? [
+        { freq: 50, depthLinear: Math.pow(10, -16 / 20) },
+        { freq: 100, depthLinear: Math.pow(10, -12 / 20) },
+        { freq: 150, depthLinear: Math.pow(10, -10 / 20) },
+      ]
+    : [];
+
+  for (let k = 0; k <= halfFft; k++) {
+    const f = k * binHz;
+    const nth = binNoiseLinear[k] * 1.55;
+    binNoiseThresh[k] = nth;
+    binNoiseThreshSq[k] = nth * nth;
+
+    isBassBin[k] = (f >= bassCutoff && f < 240) ? 1 : 0;
+
+    if (rumbleCutoff > 0 && f < rumbleCutoff) {
+      isRumbleCut[k] = 1;
+      rumbleRollOff[k] = Math.max(0.001, Math.pow(f / rumbleCutoff, 2));
+    } else {
+      isRumbleCut[k] = 0;
+      rumbleRollOff[k] = 1.0;
+    }
+
+    humTargetLinear[k] = 1.0;
+    isHumBin[k] = 0;
+    if (humHarmonics.length > 0) {
+      for (const hum of humHarmonics) {
+        if (Math.abs(f - hum.freq) < 2.5) {
+          isHumBin[k] = 1;
+          humTargetLinear[k] = hum.depthLinear;
+          break;
+        }
+      }
+    }
+  }
 
   const numHops = Math.floor((totalLength - FFT_SIZE) / HOP_SIZE);
 
@@ -759,23 +984,57 @@ export function processBufferWithSpectralDenoise(
         const r = frameReal[k];
         const im = frameImag[k];
         const mag = Math.sqrt(r * r + im * im);
-        const noiseFloor = binNoiseLinear[k];
+        const noiseThresh = binNoiseThresh[k];
 
-        // Rayleigh noise peak margin (~1.55x average noise floor to prevent false flutter)
-        const noiseThresh = noiseFloor * 1.55;
         let targetGain = reductionLinear;
 
         if (mag > noiseThresh) {
           // Wiener / Power Spectral Subtraction
-          const diff = (mag * mag) - (noiseThresh * noiseThresh);
-          const rawGain = Math.sqrt(diff / (mag * mag));
+          const magSq = mag * mag;
+          const diff = magSq - binNoiseThreshSq[k];
+          const rawGain = Math.sqrt(diff / magSq);
           targetGain = Math.max(reductionLinear, Math.min(1.0, rawGain));
         }
 
-        // Fast attack on musical transients (>0.65) / smooth decay for zero chirping/musical noise
+        // 1. Anti-Sopro Grave & Subsonic Rumble Shaping:
+        if (isRumbleCut[k] === 1) {
+          targetGain = Math.min(targetGain, rumbleRollOff[k]);
+        } else if (rFilter === 'dynamic_rx' && k * binHz < 45.0) {
+          const snr = mag / (binNoiseLinear[k] + 1e-9);
+          if (snr < 2.0) {
+            targetGain = Math.min(targetGain, reductionLinear);
+          }
+        }
+
+        // 2. Psychoacoustic Bass Shield: Protect audible musical bass (from rumbleCutoff up to 240 Hz):
+        // Kick drum fundamentals (50-80 Hz), bass guitar notes (40-200 Hz), body.
+        if (isBassBin[k] === 1) {
+          const snr = mag / (binNoiseLinear[k] + 1e-9);
+          if (snr >= 1.5) {
+            targetGain = 1.0; // 100% dry musical bass preserved (never leaks into delta!)
+          } else if (snr > 1.1) {
+            const t = (snr - 1.1) * 2.5; // (snr - 1.1) / 0.4
+            const smoothT = t * t * (3 - 2 * t);
+            targetGain = targetGain + (1.0 - targetGain) * smoothT;
+          }
+        }
+
+        // 3. Dynamic AC Hum Notch (50Hz / 60Hz and harmonics):
+        // Only attenuate steady electrical hum in quiet pauses/silence (< -48 dBFS).
+        // Whenever an active musical note or kick drum plays (> -46 dBFS), pin targetGain to 1.0!
+        if (isHumBin[k] === 1) {
+          if (mag <= humMagThresh) {
+            targetGain = Math.min(targetGain, humTargetLinear[k]);
+          } else {
+            targetGain = 1.0;
+          }
+        }
+
+        // Transient speed envelope
+        const binAttack = isBassBin[k] === 1 ? bassAttackCoeff : (targetGain > 0.65 ? attackCoeff : releaseCoeff);
+
         if (targetGain > prevGains[k]) {
-          const coeff = targetGain > 0.65 ? attackCoeff : releaseCoeff;
-          prevGains[k] = targetGain + (prevGains[k] - targetGain) * coeff;
+          prevGains[k] = targetGain + (prevGains[k] - targetGain) * binAttack;
         } else {
           prevGains[k] = targetGain + (prevGains[k] - targetGain) * releaseCoeff;
         }
@@ -809,18 +1068,11 @@ export function processBufferWithSpectralDenoise(
       tempCleaned[i] = norm > 1e-4 ? synthBuffer[i] / norm : src[i];
     }
 
-    // Apply high-Q ground loop biquad notch filter to cleaned audio
-    if (humHarmonics.length > 0) {
-      for (const humFreq of humHarmonics) {
-        applyBiquadNotch(tempCleaned, humFreq, sampleRate, 30);
-      }
-    }
-
     for (let i = 0; i < totalLength; i++) {
       const cleaned = tempCleaned[i];
       if (settings.listenNoiseDeltaOnly) {
-        // Solo subtracted hiss and hum amplified 2.0x for clear auditory inspection
-        const delta = (src[i] - cleaned) * 2.0;
+        // Solo subtracted hiss, hum, and rumble with +20 dB clean gain (10.0x) for unmistakable audibility
+        const delta = (src[i] - cleaned) * 10.0;
         dst[i] = Math.max(-1.0, Math.min(1.0, delta));
       } else {
         dst[i] = Math.max(-1.0, Math.min(1.0, cleaned));

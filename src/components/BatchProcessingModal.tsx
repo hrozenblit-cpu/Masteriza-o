@@ -52,7 +52,8 @@ import {
   FolderCheckResult,
   FolderConflictAction,
   SUBFOLDER_RECOVERED,
-  SUBFOLDER_MASTERED
+  SUBFOLDER_PRESETS,
+  formatMasteredSubfolder
 } from '../audio/autoSaveManager';
 import { audioEngine } from '../audio/audioEngine';
 import { getAllPresets, UserPreset, getPresetForAudioAnalysis } from '../audio/presetManager';
@@ -110,6 +111,7 @@ export interface BatchItem {
   // Per-track preset & mastering settings
   presetId?: string;
   presetName?: string;
+  presetSelectionReason?: string;
   isCustomized?: boolean;
   customHumanizerSettings?: HumanizerSettings;
   customAzimuthSettings?: TapeAzimuthSettings;
@@ -288,9 +290,13 @@ export function BatchProcessingModal({
         );
         const isCleanModern = !hasDropouts && !hasTapeHiss && !hasAzimuthError && dropoutAnalysis.tapeHealthScore === 100;
 
+        // Stereo SÓ QUANDO os canais são genuinamente diferentes!
         const isDualMono =
           azimuthAnalysis.channelConfiguration === 'dual_mono' ||
-          (dropoutAnalysis.isAmpexFullTrackCandidate && azimuthAnalysis.sideToMidDb <= -26.0);
+          azimuthAnalysis.channelConfiguration === 'single_mono' ||
+          (dropoutAnalysis.isAmpexFullTrackCandidate &&
+           azimuthAnalysis.sideToMidDb <= -24.0 &&
+           azimuthAnalysis.phaseCorrelationAfter >= 0.965);
 
         const isWanderOrDefect =
           isDualMono &&
@@ -298,7 +304,8 @@ export function BatchProcessingModal({
             dropoutAnalysis.channelComparison?.isSevereWanderDetected ||
             hasDropouts);
 
-        const safeDropoutMode: TapeDropoutMode = isDualMono && !isCleanModern
+        // Na recuperação, estéreo SÓ quando os canais são diferentes!
+        const safeDropoutMode: TapeDropoutMode = isDualMono
           ? (tapeDropoutSettings.mode === 'mono_wander_graft' || isWanderOrDefect
               ? 'mono_wander_graft'
               : 'ampex_fulltrack_cross')
@@ -332,6 +339,13 @@ export function BatchProcessingModal({
           hasDropouts,
           hasAzimuthError,
           isDualMono,
+          hasHumDetected: noiseAnalysis.hasHumDetected,
+          hasRumbleDetected: noiseAnalysis.hasRumbleDetected,
+          hissNoiseFloorDb: noiseAnalysis.hissNoiseFloorDb,
+          integratedLufs: loudnessAnalysis.integratedLufs,
+          dynamicCrestFactorDb: loudnessAnalysis.crestFactorDb,
+          durationSeconds: audioBuffer.duration,
+          titleOrFilename: item.title,
         });
 
         let itemHumanizer: HumanizerSettings = {
@@ -360,6 +374,7 @@ export function BatchProcessingModal({
                   initialLufs: loudnessAnalysis.integratedLufs,
                   presetId: recommendedPreset.id,
                   presetName: recommendedPreset.name,
+                  presetSelectionReason: recommendedPreset.selectionReason,
                   overallAiProbability: forensicAnalysis.overallAiProbability,
                   dominantPlatformName: forensicAnalysis.dominantPlatform.name,
                   isVintageAnalogTape: forensicAnalysis.dominantPlatform.platform === 'human_analog',
@@ -382,6 +397,7 @@ export function BatchProcessingModal({
                     enabled: hasTapeHiss && !isCleanModern,
                     noiseProfileType: noiseAnalysis.recommendedNoiseProfileType,
                     humNotchFilter: noiseAnalysis.recommendedHumNotch,
+                    rumbleFilter: noiseAnalysis.recommendedRumbleFilter,
                     reductionDb: noiseAnalysis.recommendedReductionDb,
                     learnedNoiseBands: noiseAnalysis.noiseProfileBands,
                   },
@@ -636,22 +652,27 @@ export function BatchProcessingModal({
           Math.abs(autoAzimuthAnalysis.levelDiffDb) >= 0.35;
         const isCleanModern = !hasDropouts && !hasAzimuthError && (item.tapeHealthScore ?? 100) === 100;
 
+        // Stereo SÓ QUANDO os canais são genuinamente diferentes!
         const isDualMono =
           item.isDualMono !== undefined
             ? item.isDualMono
             : (autoAzimuthAnalysis.channelConfiguration === 'dual_mono' ||
-               (item.isAmpexCandidate && autoAzimuthAnalysis.sideToMidDb <= -26.0));
+               autoAzimuthAnalysis.channelConfiguration === 'single_mono' ||
+               (item.isAmpexCandidate &&
+                autoAzimuthAnalysis.sideToMidDb <= -24.0 &&
+                autoAzimuthAnalysis.phaseCorrelationAfter >= 0.965));
 
         const itemDropoutMode = item.customDropoutSettings?.mode;
         const isWanderOrDefect = isDualMono && hasDropouts;
 
+        // Na recuperação, estéreo SÓ quando os canais são diferentes!
         const safeDropoutMode: TapeDropoutMode = itemDropoutMode
           ? itemDropoutMode
-          : isDualMono && !isCleanModern
+          : isDualMono
           ? (tapeDropoutSettings.mode === 'mono_wander_graft' || isWanderOrDefect
               ? 'mono_wander_graft'
               : 'ampex_fulltrack_cross')
-          : (tapeDropoutSettings.mode || 'stereo_independent');
+          : 'stereo_independent';
 
         const trackDropoutSettings: TapeDropoutSettings = item.customDropoutSettings || {
           ...tapeDropoutSettings,
@@ -757,6 +778,7 @@ export function BatchProcessingModal({
             enabled: hasNoise,
             noiseProfileType: noiseTel.recommendedNoiseProfileType,
             humNotchFilter: noiseTel.recommendedHumNotch,
+            rumbleFilter: noiseTel.recommendedRumbleFilter,
             reductionDb: noiseTel.recommendedReductionDb,
             learnedNoiseBands: noiseTel.noiseProfileBands,
           };
@@ -849,7 +871,9 @@ export function BatchProcessingModal({
             targetLufs: trackHumanizer.targetLufs ?? -14,
             suffix: fileSuffix,
           });
-          const subfolderMast = separateSubfolders ? SUBFOLDER_MASTERED : undefined;
+          const subfolderMast = separateSubfolders
+            ? formatMasteredSubfolder(trackHumanizer.targetLufs ?? -14)
+            : undefined;
           batchBlobs.push({ filename: masterFileName, blob: masterBlob, subfolder: subfolderMast });
 
           if (directDiskActive) {
@@ -871,7 +895,7 @@ export function BatchProcessingModal({
           }
         }
 
-        // Mode 3: Save Recall Preset (.aurapreset) for this track in the EXACT SAME FOLDER
+        // Mode 3: Save Recall Preset (.aurapreset) inside [Recuperados]/[Presets]
         if (saveRecallPresets) {
           const trackRecall = generateTrackRecall(
             item.title,
@@ -894,12 +918,12 @@ export function BatchProcessingModal({
             targetLufs: trackHumanizer.targetLufs ?? -14,
             suffix: fileSuffix,
           });
-          const subfolderMast = separateSubfolders ? SUBFOLDER_MASTERED : undefined;
-          batchBlobs.push({ filename: recallFileName, blob: recallBlob, subfolder: subfolderMast });
+          const subfolderPreset = separateSubfolders ? SUBFOLDER_PRESETS : undefined;
+          batchBlobs.push({ filename: recallFileName, blob: recallBlob, subfolder: subfolderPreset });
 
           if (directDiskActive) {
             await autoSaveManager.saveProcessedFile(recallBlob, recallFileName, {
-              subfolder: subfolderMast,
+              subfolder: subfolderPreset,
               parentSubfolder: targetSubfolder,
               disableDownloadFallback: true,
             });
@@ -941,12 +965,12 @@ export function BatchProcessingModal({
       );
       const sessionRecallBlob = recallToBlob(sessionRecall);
       const sessionRecallFileName = `${targetSubfolder}_Sessao_Recall.aurapreset`;
-      const subfolderMast = separateSubfolders ? SUBFOLDER_MASTERED : undefined;
-      batchBlobs.push({ filename: sessionRecallFileName, blob: sessionRecallBlob, subfolder: subfolderMast });
+      const subfolderPreset = separateSubfolders ? SUBFOLDER_PRESETS : undefined;
+      batchBlobs.push({ filename: sessionRecallFileName, blob: sessionRecallBlob, subfolder: subfolderPreset });
 
       if (directDiskActive) {
         await autoSaveManager.saveProcessedFile(sessionRecallBlob, sessionRecallFileName, {
-          subfolder: subfolderMast,
+          subfolder: subfolderPreset,
           parentSubfolder: targetSubfolder,
           disableDownloadFallback: true,
         });
@@ -957,10 +981,13 @@ export function BatchProcessingModal({
 
     // Save output files / ZIP package
     if (batchBlobs.length > 0) {
+      const currentTargetLufs = humanizerSettings?.targetLufs ?? -14;
+      const masteredFolderStr = formatMasteredSubfolder(currentTargetLufs);
+
       if (directDiskActive) {
         // Individual WAVs and Presets were saved directly into subfolder on disk!
         const subNotice = separateSubfolders
-          ? ` com as subpastas automáticas "${SUBFOLDER_RECOVERED}" (áudios intermediários restaurados) e "${SUBFOLDER_MASTERED}" (áudio final masterizado + presets .aurapreset)`
+          ? ` com as subpastas automáticas "${SUBFOLDER_RECOVERED}" (áudios intermediários restaurados), "${SUBFOLDER_PRESETS}" (presets de recall .aurapreset) e "${masteredFolderStr}" (áudios finais masterizados)`
           : '';
         setDirSelectMsg(
           `✓ Lote finalizado com sucesso! Todos os ${batchBlobs.length} arquivos foram gravados diretamente na pasta "${outputDirName}/${targetSubfolder}/"${subNotice} no seu computador.`
@@ -971,7 +998,7 @@ export function BatchProcessingModal({
           const zipBlob = await autoSaveManager.createZipPackage(batchBlobs, targetSubfolder);
           const zipRes = await autoSaveManager.saveZipFile(zipBlob, `${targetSubfolder}.zip`);
           const subNotice = separateSubfolders
-            ? ` estruturado com as subpastas "${SUBFOLDER_RECOVERED}" e "${SUBFOLDER_MASTERED}".`
+            ? ` estruturado com as subpastas "${SUBFOLDER_RECOVERED}", "${SUBFOLDER_PRESETS}" e "${masteredFolderStr}".`
             : ' organizado na subpasta.';
           if (zipRes.savedToDiskDirectly) {
             setDirSelectMsg(
@@ -1101,8 +1128,11 @@ export function BatchProcessingModal({
                     <span className="px-1.5 py-0.5 rounded bg-emerald-950/70 border border-emerald-500/40 text-emerald-300 font-bold" title="Áudios intermediários restaurados (dropouts, azimute, sem master)">
                       📁 [Recuperados]
                     </span>
-                    <span className="px-1.5 py-0.5 rounded bg-cyan-950/70 border border-cyan-500/40 text-cyan-300 font-bold" title="Áudio final masterizado + presets de recall (.aurapreset)">
-                      📁 [-LUFS]
+                    <span className="px-1.5 py-0.5 rounded bg-amber-950/70 border border-amber-500/40 text-amber-300 font-bold" title="Presets de recall (.aurapreset) salvos dentro da pasta de recuperados">
+                      📁 [Recuperados]/[Presets]
+                    </span>
+                    <span className="px-1.5 py-0.5 rounded bg-cyan-950/70 border border-cyan-500/40 text-cyan-300 font-bold" title="Áudio final masterizado conforme valor de LUFS alvo">
+                      📁 {formatMasteredSubfolder(humanizerSettings?.targetLufs ?? -14)}
                     </span>
                   </div>
                 )}
@@ -1149,7 +1179,7 @@ export function BatchProcessingModal({
                   />
                   <span className="text-[11px] text-emerald-300 font-semibold flex items-center gap-1">
                     <FolderDown className="w-3.5 h-3.5 text-emerald-400" />
-                    Subpastas: [Recuperados] e [-LUFS]
+                    Subpastas: [Recuperados] (c/ [Presets]) e {formatMasteredSubfolder(humanizerSettings?.targetLufs ?? -14)}
                   </span>
                 </label>
 
@@ -1521,7 +1551,10 @@ export function BatchProcessingModal({
                             )}
 
                             {/* Preset Selector Dropdown for each track */}
-                            <div className="flex items-center gap-1 bg-[#090e1c] px-2 py-0.5 rounded border border-slate-700/80 text-[10px]">
+                            <div
+                              className="flex items-center gap-1 bg-[#090e1c] px-2 py-0.5 rounded border border-slate-700/80 text-[10px]"
+                              title={item.presetSelectionReason || 'Preset de masterização aplicado a esta faixa'}
+                            >
                               <Bookmark className="w-3 h-3 text-cyan-400 shrink-0" />
                               <span className="text-slate-400 font-mono">Preset:</span>
                               <select
@@ -1529,7 +1562,7 @@ export function BatchProcessingModal({
                                 onChange={(e) => handleTrackPresetChange(item.id, e.target.value)}
                                 disabled={isProcessingBatch}
                                 className="bg-transparent text-[11px] font-semibold text-cyan-300 focus:outline-none cursor-pointer truncate max-w-[170px]"
-                                title="Preset de masterização aplicado a esta faixa"
+                                title={item.presetSelectionReason || 'Preset de masterização aplicado a esta faixa'}
                               >
                                 {allPresets.map((p) => (
                                   <option key={p.id} value={p.id} className="bg-[#0b101d] text-slate-200">

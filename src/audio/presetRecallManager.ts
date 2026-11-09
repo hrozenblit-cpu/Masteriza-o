@@ -1,7 +1,7 @@
 import { HumanizerSettings } from '../types/audio';
 import { TapeAzimuthSettings } from './tapeAzimuthEngine';
-import { TapeDropoutSettings } from './tapeDropoutEngine';
-import { SpectralDenoiseSettings } from './spectralDenoiseEngine';
+import { TapeDropoutSettings, DEFAULT_DROPOUT_SETTINGS } from './tapeDropoutEngine';
+import { SpectralDenoiseSettings, DEFAULT_DENOISE_SETTINGS } from './spectralDenoiseEngine';
 import { AudioInputFormat } from './audioFormatDetector';
 import { BatchItem } from '../components/BatchProcessingModal';
 
@@ -135,6 +135,31 @@ export async function parseRecallFile(file: File): Promise<TrackMasterRecall | n
         autoAlignOnLoad: true,
       };
 
+      // Retrocompatibilidade inteligente para presets legados (v1.0):
+      // Se o preset não tem dropout (exportado de versão anterior), deduz pelo azimute:
+      // Se activeChannel é 'both' e listenInMono é false, o preset é comprovadamente ESTÉREO!
+      let dropoutSettings: TapeDropoutSettings | undefined = data.dropoutSettings;
+      if (!dropoutSettings) {
+        const isStereoPreset =
+          azimuthSettings.activeChannel === 'both' &&
+          !azimuthSettings.listenInMono &&
+          azimuthSettings.channelModeOverride !== 'force_dual_mono';
+        dropoutSettings = {
+          ...DEFAULT_DROPOUT_SETTINGS,
+          enabled: false,
+          mode: isStereoPreset ? 'stereo_independent' : 'ampex_fulltrack_cross',
+        };
+      }
+
+      // Se o preset não tem denoise (exportado de versão anterior), define padrão transparente:
+      let denoiseSettings: SpectralDenoiseSettings | undefined = data.denoiseSettings;
+      if (!denoiseSettings) {
+        denoiseSettings = {
+          ...DEFAULT_DENOISE_SETTINGS,
+          enabled: false,
+        };
+      }
+
       return {
         version: '1.0',
         app: 'AuraTune Studio Mastering',
@@ -145,8 +170,8 @@ export async function parseRecallFile(file: File): Promise<TrackMasterRecall | n
         isCustomized: data.isCustomized,
         humanizerSettings,
         azimuthSettings,
-        dropoutSettings: data.dropoutSettings,
-        denoiseSettings: data.denoiseSettings,
+        dropoutSettings,
+        denoiseSettings,
         audioFormat: data.audioFormat,
         notes: data.notes,
       };

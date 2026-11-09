@@ -204,8 +204,8 @@ export function AudioPlayerBar({
   currentPresetName,
 }: AudioPlayerBarProps) {
 
-  // Monitor Listening Fader: Default 0.90 (-1.0 dB True-Peak Safe Headroom for USB Audio Interfaces & DACs)
-  const [volume, setVolume] = useState(0.90);
+  // Monitor Listening Fader: Default 0.70 (-3.1 dB True-Peak Safe Headroom for USB Audio Interfaces & DACs)
+  const [volume, setVolume] = useState(0.70);
   const [isMuted, setIsMuted] = useState(false);
 
   // Handle monitor listening volume change

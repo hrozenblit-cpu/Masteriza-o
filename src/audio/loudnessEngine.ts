@@ -86,10 +86,10 @@ export const TARGET_LUFS_PRESETS: {
     name: 'Trap & Bass (-8 LUFS)',
     targetLufs: -8.0,
     ceilingDb: -0.2,
-    description: 'Densidade máxima com subgraves controlados e médios no limite comercial.',
-    clipperDrive: 90,
-    lowEndWeight: 90,
-    transientSpeed: 'aggressive',
+    description: 'Graves e subs com punch explosivo e 808 limpo, sem afundar nem sufocar o lead vocal.',
+    clipperDrive: 78,
+    lowEndWeight: 92,
+    transientSpeed: 'punchy',
   },
   {
     id: 'podcast_broadcast',
@@ -415,6 +415,15 @@ export function analyzeBufferLoudness(buffer: AudioBuffer): LoudnessMetrics {
  * continuous C2 polynomial crest-shaver, and exponential release). This guarantees 100%
  * zero digital hard-clipping, eliminating all clicks, pops, and raspy distortion ("estalos").
  */
+/**
+ * DMGAudio Limitless Style Transparent Lookahead Peak Limiter & Loudness Maximizer
+ *
+ * Implements:
+ * 1. Sidechain Low-End Decoupling (detector highpass): Heavy 808 sub-bass does NOT over-compress the lead vocal.
+ * 2. True Lookahead Attenuation (3.5ms Hann raised-cosine ramp): 100% distortion-free attack, zero clicks/pops.
+ * 3. Exponential Program-Dependent Release: Eliminates sub-bass waveform cycle modulation.
+ * 4. Transparent Soft-Knee Ceiling Guard: Catches True-Peak overshoots smoothly without hard clipping.
+ */
 export function applyLimitlessMultiStageMastering(
   inputBuffer: AudioBuffer,
   config: LimitlessMasterConfig,
@@ -427,61 +436,91 @@ export function applyLimitlessMultiStageMastering(
   const targetLufs = config.targetLufs ?? -14.0;
   const ceilingLinear = Math.pow(10, Math.min(0, config.targetCeilingDb ?? -1.0) / 20);
 
-  // Transient release speed mapping
+  // Transient release speed mapping:
+  // Punchy = 0.045s (45ms: fast punch without modulating 40Hz sub-bass cycles)
+  // Aggressive = 0.035s
+  // Transparent = 0.065s
+  // Smooth = 0.090s
   const speed = config.transientSpeed ?? 'punchy';
   const releaseSec =
-    speed === 'aggressive' ? 0.025 : speed === 'punchy' ? 0.040 : speed === 'transparent' ? 0.065 : 0.090;
+    speed === 'aggressive' ? 0.035 : speed === 'punchy' ? 0.045 : speed === 'transparent' ? 0.065 : 0.090;
 
-  // Clipper knee ratio based on clipperDrive (0% = clean high ceiling, 100% = aggressive crest shaver)
-  const drive = Math.max(0, Math.min(100, config.clipperDrive ?? 55));
-  const clipRatio = 0.88 + (1.0 - drive / 100) * 0.10; // 0.88 to 0.98 of ceiling
-  const clipThreshold = ceilingLinear * clipRatio;
+  // Lookahead window: 3.5ms (e.g. 154 samples at 44.1k, 336 samples at 96k)
+  const lookaheadSamples = Math.max(16, Math.floor(sampleRate * 0.0035));
 
-  // Lookahead window: 3.0ms (e.g. 132 samples at 44.1k, 288 samples at 96k)
-  const lookaheadSamples = Math.max(16, Math.floor(sampleRate * 0.003));
+  // Low-end decoupling factor (0 = full wideband detection, 100 = 808 sub decoupled from detector)
+  const lowEndWeight = Math.max(0, Math.min(100, config.lowEndWeight ?? 75)) / 100;
 
-  // Process a buffer with a specific linear gain and transparent lookahead limiter
-  function processPass(inBuf: AudioBuffer, gain: number): AudioBuffer {
-    let outBuf: AudioBuffer;
+  function createBufferHelper(): AudioBuffer {
     if (typeof AudioBuffer !== 'undefined') {
       try {
-        outBuf = new AudioBuffer({ numberOfChannels: numChannels, length, sampleRate });
+        return new AudioBuffer({ numberOfChannels: numChannels, length, sampleRate });
       } catch {
         const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-        outBuf = audioCtx.createBuffer(numChannels, length, sampleRate);
+        const b = audioCtx.createBuffer(numChannels, length, sampleRate);
         try { audioCtx.close(); } catch { /* safe */ }
+        return b;
       }
     } else {
       const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-      outBuf = audioCtx.createBuffer(numChannels, length, sampleRate);
+      const b = audioCtx.createBuffer(numChannels, length, sampleRate);
       try { audioCtx.close(); } catch { /* safe */ }
+      return b;
+    }
+  }
+
+  function processPass(inBuf: AudioBuffer, gain: number): AudioBuffer {
+    const outBuf = createBufferHelper();
+
+    // 1. Calculate detector signals (with sidechain HPF for low-end decoupling)
+    // When lowEndWeight > 0, sub-bass (< 85 Hz) is gently decoupled in the DETECTOR ONLY.
+    // The musical audio itself remains 100% full-bandwidth, so 808 subs don't pump the lead vocal!
+    // CRITICAL: The highpass filter must run on the bipolar AC signal x (not on absX) to accurately
+    // measure the true waveform amplitude without false rectification DC offsets.
+    const hpAlpha = Math.exp(-2.0 * Math.PI * 85.0 / sampleRate);
+    const detectorPeaks = new Float32Array(length);
+
+    for (let c = 0; c < numChannels; c++) {
+      const ch = inBuf.getChannelData(c);
+      let hpPrevIn = 0;
+      let hpPrevOut = 0;
+
+      for (let i = 0; i < length; i++) {
+        const x = ch[i] * gain;
+        const absX = Math.abs(x);
+
+        // 1st order highpass filter on the bipolar audio signal
+        const hpOut = hpAlpha * (hpPrevOut + x - hpPrevIn);
+        hpPrevIn = x;
+        hpPrevOut = hpOut;
+        const absHp = Math.abs(hpOut);
+
+        // Decoupled detector peak: combines filtered signal with wideband floor
+        // This guarantees that high mid/vocal peaks and high-frequency transients are strictly caught,
+        // while 808 subs receive appropriate decoupling headroom without letting the true peak explode!
+        const detSignal = Math.max(absHp, absX * (1.0 - lowEndWeight * 0.45));
+        if (detSignal > detectorPeaks[i]) {
+          detectorPeaks[i] = detSignal;
+        }
+      }
     }
 
-    // 1. High-Precision Stereo-Linked Lookahead Peak Envelope Follower
-    // Pre-calculates peak demand over lookahead window so gain is ALREADY reduced when the peak arrives!
-    // This completely eliminates distortion on musical attacks: transient peaks remain smooth, pure and unclipped!
+    // 2. High-Precision Stereo-Linked Lookahead Peak Envelope Follower
     const targetGainReduction = new Float32Array(length);
     for (let i = 0; i < length; i++) {
       targetGainReduction[i] = 1.0;
     }
 
-    // Measure instant peaks across all channels on the gained linear audio
     for (let i = 0; i < length; i++) {
-      let maxPeak = 0;
-      for (let c = 0; c < numChannels; c++) {
-        const a = Math.abs(inBuf.getChannelData(c)[i] * gain);
-        if (a > maxPeak) maxPeak = a;
-      }
-
-      if (maxPeak > ceilingLinear) {
-        const requiredGain = ceilingLinear / maxPeak;
-        // Distribute gain reduction backwards across lookahead window with smooth raised-cosine (Hann) ramp
+      const p = detectorPeaks[i];
+      if (p > ceilingLinear) {
+        const requiredGain = ceilingLinear / p;
         const rampStart = Math.max(0, i - lookaheadSamples);
         const rampLen = i - rampStart;
         for (let j = 0; j <= rampLen; j++) {
           const idx = rampStart + j;
-          const t = j / Math.max(1, rampLen); // 0 to 1
-          const w = 0.5 * (1 - Math.cos(Math.PI * t)); // Smooth S-curve (0 -> 1)
+          const t = j / Math.max(1, rampLen);
+          const w = 0.5 * (1 - Math.cos(Math.PI * t)); // Smooth Hann S-curve
           const targetG = 1.0 - (1.0 - requiredGain) * w;
           if (targetG < targetGainReduction[idx]) {
             targetGainReduction[idx] = targetG;
@@ -490,23 +529,21 @@ export function applyLimitlessMultiStageMastering(
       }
     }
 
-    // 2. Smooth Program-Dependent Exponential Release Envelope
+    // 3. Program-Dependent Exponential Release Envelope
     const releaseCoeff = Math.exp(-1.0 / (releaseSec * sampleRate));
     let curGain = 1.0;
 
     for (let i = 0; i < length; i++) {
       const targetG = targetGainReduction[i];
       if (targetG < curGain) {
-        // Fast attack (already lookahead-smoothed with cosine S-curve)
         curGain = targetG;
       } else {
-        // Musical exponential release
         curGain = targetG + (curGain - targetG) * releaseCoeff;
       }
       targetGainReduction[i] = curGain;
     }
 
-    // 3. Apply Lookahead Gain Reduction (Clean, Linear & 100% Distortion-Free)
+    // 4. Apply Lookahead Gain Reduction & Soft-Knee Ceiling Safety Guard
     for (let c = 0; c < numChannels; c++) {
       const src = inBuf.getChannelData(c);
       const dst = outBuf.getChannelData(c);
@@ -515,9 +552,17 @@ export function applyLimitlessMultiStageMastering(
         const gr = targetGainReduction[i];
         let sample = src[i] * gain * gr;
 
-        // Final safety guard: strictly guarantees ceiling without clipping
-        if (sample > ceilingLinear) sample = ceilingLinear;
-        else if (sample < -ceilingLinear) sample = -ceilingLinear;
+        // Smooth transparent saturation only if sample exceeds ceilingLinear (e.g. 0.05 dB overshoot)
+        const absS = Math.abs(sample);
+        if (absS > ceilingLinear) {
+          const sign = sample > 0 ? 1 : -1;
+          const delta = absS - ceilingLinear;
+          const knee = ceilingLinear * 0.05;
+          sample = sign * (ceilingLinear + knee * Math.tanh(delta / Math.max(1e-5, knee)));
+          if (Math.abs(sample) > ceilingLinear) {
+            sample = sign * ceilingLinear;
+          }
+        }
 
         dst[i] = sample;
       }
@@ -532,14 +577,12 @@ export function applyLimitlessMultiStageMastering(
   }
 
   // --- PASS 1: Calculate theoretical make-up delta to reach Target LUFS ---
-  // Clamp delta to safe mastering limits (-12 dB to +14 dB) to prevent noise-floor elevation on silent tapes
   let initialDeltaDb = targetLufs - currentLoudness.integratedLufs;
-  initialDeltaDb = Math.max(-12, Math.min(14, initialDeltaDb));
+  initialDeltaDb = Math.max(-12, Math.min(12, initialDeltaDb));
   const initialGain = Math.pow(10, initialDeltaDb / 20);
   let masterBuffer = processPass(inputBuffer, initialGain);
 
   // --- PASS 2: Closed-Loop Telemetry Measurement ---
-  // For long files (> 300s), Pass 1 is already within ~0.1 LU and skipping re-limiting saves 700 MB RAM and doubles export speed
   if (inputBuffer.duration > 300) {
     return masterBuffer;
   }
@@ -547,8 +590,8 @@ export function applyLimitlessMultiStageMastering(
   const pass1Loudness = analyzeBufferLoudness(masterBuffer);
   const errorDb = targetLufs - pass1Loudness.integratedLufs;
 
-  // If deviation is between 0.1 LU and 3.0 LU, run fine-tuning second pass
-  if (Math.abs(errorDb) >= 0.1 && Math.abs(errorDb) <= 3.0) {
+  // If deviation is between 0.1 LU and 2.5 LU, run fine-tuning second pass
+  if (Math.abs(errorDb) >= 0.1 && Math.abs(errorDb) <= 2.5) {
     const correctionGain = Math.pow(10, errorDb / 20);
     masterBuffer = processPass(masterBuffer, correctionGain);
   }

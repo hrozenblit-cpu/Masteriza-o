@@ -192,7 +192,10 @@ export function TapeDenoiseConsole({
             type="button"
             onClick={() => {
               const nextDelta = !settings.listenNoiseDeltaOnly;
-              onUpdateSettings({ listenNoiseDeltaOnly: nextDelta, enabled: true });
+              onUpdateSettings({
+                listenNoiseDeltaOnly: nextDelta,
+                enabled: true,
+              });
               if (isCompareOriginal && onToggleCompareOriginal) onToggleCompareOriginal();
             }}
             className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
@@ -200,10 +203,10 @@ export function TapeDenoiseConsole({
                 ? 'bg-purple-500/30 text-purple-200 border border-purple-500/80 ring-1 ring-purple-500/40 shadow-xs animate-pulse'
                 : 'bg-[#101524] text-slate-400 hover:text-slate-200 border border-slate-800'
             }`}
-            title="THE RX / NoNoise FEATURE: Ouça exclusivamente o ruído e hiss que estão sendo extraídos. Se ouvir vocais ou instrumentos aqui, reduza o limiar!"
+            title="PADRÃO iZOTOPE RX / NoNoise: Ouça exclusivamente o hiss de fita, ronco de rede AC e sopro que estão sendo extraídos. Com a nova blindagem psicoacústica de graves ativa, bumbo e contrabaixo permanecem 100% protegidos na música e não vazam para esta máscara!"
           >
             <Headphones className="w-3.5 h-3.5 text-purple-400" />
-            <span>🎧 MÁSCARA DELTA (Ouvir Ruído Removido)</span>
+            <span>🎧 MÁSCARA DELTA (Ruído Removido)</span>
           </button>
         </div>
       </div>
@@ -287,29 +290,49 @@ export function TapeDenoiseConsole({
           </div>
 
           {/* Noise Telemetry Metrics */}
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
             <div className="p-2.5 rounded-lg bg-[#101728] border border-slate-800 flex flex-col">
               <span className="text-[10px] font-mono text-slate-400 uppercase">Piso de Hiss</span>
               <span className="text-sm font-mono font-bold text-amber-300 mt-0.5">
                 {telemetry ? `${telemetry.hissNoiseFloorDb.toFixed(1)} dBFS` : '-64.0 dBFS'}
               </span>
-              <span className="text-[9px] text-slate-500 font-mono mt-0.5">Ruído de altas freq.</span>
+              <span className="text-[9px] text-slate-500 font-mono mt-0.5">Ruído de agudos</span>
             </div>
 
             <div className="p-2.5 rounded-lg bg-[#101728] border border-slate-800 flex flex-col">
-              <span className="text-[10px] font-mono text-slate-400 uppercase">Relação Sinal/Ruído</span>
-              <span className="text-sm font-mono font-bold text-emerald-300 mt-0.5">
-                {telemetry ? `${telemetry.estimatedSnrDb.toFixed(1)} dB` : '42.0 dB'}
+              <span className="text-[10px] font-mono text-slate-400 uppercase">Ronco 50/60Hz</span>
+              <span className={`text-sm font-mono font-bold mt-0.5 ${telemetry?.hasHumDetected ? 'text-rose-400' : 'text-emerald-300'}`}>
+                {telemetry
+                  ? telemetry.hasHumDetected
+                    ? `${telemetry.humLevelDb.toFixed(1)} dBFS`
+                    : 'Limpo (< -74)'
+                  : '-'}
               </span>
-              <span className="text-[9px] text-slate-500 font-mono mt-0.5">SNR Dinâmico</span>
+              <span className="text-[9px] text-slate-500 font-mono mt-0.5">
+                {telemetry?.hasHumDetected ? 'Rede AC detectada' : 'Sem loop de terra'}
+              </span>
             </div>
 
             <div className="p-2.5 rounded-lg bg-[#101728] border border-slate-800 flex flex-col">
-              <span className="text-[10px] font-mono text-slate-400 uppercase">Redução Sugerida</span>
+              <span className="text-[10px] font-mono text-slate-400 uppercase">Sopro Grave</span>
+              <span className={`text-sm font-mono font-bold mt-0.5 ${telemetry?.hasRumbleDetected ? 'text-amber-400' : 'text-emerald-300'}`}>
+                {telemetry
+                  ? telemetry.hasRumbleDetected
+                    ? `${telemetry.rumbleLevelDb.toFixed(1)} dBFS`
+                    : 'Limpo (< -62)'
+                  : '-'}
+              </span>
+              <span className="text-[9px] text-slate-500 font-mono mt-0.5">
+                {telemetry?.hasRumbleDetected ? 'Rumble / Vento <45Hz' : 'Sub-graves limpos'}
+              </span>
+            </div>
+
+            <div className="p-2.5 rounded-lg bg-[#101728] border border-slate-800 flex flex-col">
+              <span className="text-[10px] font-mono text-slate-400 uppercase">Redução</span>
               <span className="text-sm font-mono font-bold text-cyan-300 mt-0.5">
                 {telemetry ? `${telemetry.recommendedReductionDb.toFixed(1)} dB` : '8.5 dB'}
               </span>
-              <span className="text-[9px] text-slate-500 font-mono mt-0.5">Zero artefatos</span>
+              <span className="text-[9px] text-slate-500 font-mono mt-0.5">Sugerida</span>
             </div>
           </div>
 
@@ -447,7 +470,7 @@ export function TapeDenoiseConsole({
 
               <button
                 type="button"
-                onClick={() => onUpdateSettings({ noiseProfileType: 'hum_60hz', enabled: true })}
+                onClick={() => onUpdateSettings({ noiseProfileType: 'hum_60hz', humNotchFilter: '60hz_us_br', enabled: true })}
                 className={`p-2.5 rounded-lg border text-left flex flex-col gap-0.5 transition-all cursor-pointer ${
                   settings.noiseProfileType === 'hum_60hz'
                     ? 'bg-rose-500/20 border-rose-500 text-rose-200 ring-1 ring-rose-500/40'
@@ -460,7 +483,7 @@ export function TapeDenoiseConsole({
 
               <button
                 type="button"
-                onClick={() => onUpdateSettings({ noiseProfileType: 'hum_50hz', enabled: true })}
+                onClick={() => onUpdateSettings({ noiseProfileType: 'hum_50hz', humNotchFilter: '50hz_eu', enabled: true })}
                 className={`p-2.5 rounded-lg border text-left flex flex-col gap-0.5 transition-all cursor-pointer ${
                   settings.noiseProfileType === 'hum_50hz'
                     ? 'bg-rose-500/20 border-rose-500 text-rose-200 ring-1 ring-rose-500/40'
@@ -486,6 +509,132 @@ export function TapeDenoiseConsole({
                   {settings.learnedNoiseBands ? 'Impressão da sua fita' : 'Requer clicar em Aprender'}
                 </span>
               </button>
+            </div>
+          </div>
+
+          {/* Dedicated Hardware Filters: Hum Notch and Sopro Grave / Rumble */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t border-slate-800/80">
+            {/* 1. Ground Loop AC Hum Notch Filter */}
+            <div className="space-y-1.5 p-3 rounded-lg bg-[#0d1322] border border-slate-800">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                  <Zap className="w-3.5 h-3.5 text-amber-400" />
+                  Filtro AC (Hum / Ronco Elétrico)
+                </span>
+                {telemetry?.hasHumDetected && (
+                  <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/40 animate-pulse">
+                    Detectado: {telemetry.humLevelDb.toFixed(1)} dB
+                  </span>
+                )}
+              </div>
+              <p className="text-[10px] text-slate-400 leading-tight">
+                Notch paramétrico estreito (Q=50) com profundidade controlada (-16dB): elimina o zumbido sem perfurar o bumbo e contrabaixo.
+              </p>
+              <div className="grid grid-cols-3 gap-1.5 pt-1">
+                <button
+                  type="button"
+                  onClick={() => onUpdateSettings({ humNotchFilter: 'none' })}
+                  className={`py-1.5 px-2 rounded-md text-[11px] font-bold border transition-all cursor-pointer ${
+                    settings.humNotchFilter === 'none'
+                      ? 'bg-slate-700 border-slate-500 text-white shadow-xs'
+                      : 'bg-[#131929] border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  Desligado
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onUpdateSettings({ humNotchFilter: '60hz_us_br', enabled: true })}
+                  className={`py-1.5 px-2 rounded-md text-[11px] font-bold border transition-all cursor-pointer ${
+                    settings.humNotchFilter === '60hz_us_br'
+                      ? 'bg-rose-500/25 border-rose-500 text-rose-200 ring-1 ring-rose-500/40 shadow-xs'
+                      : 'bg-[#131929] border-slate-800 text-slate-300 hover:border-slate-700'
+                  }`}
+                  title="Filtro seletivo de 60 Hz e harmônicos (120/180 Hz) para padrão Brasil e EUA"
+                >
+                  60 Hz (BR/EUA)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onUpdateSettings({ humNotchFilter: '50hz_eu', enabled: true })}
+                  className={`py-1.5 px-2 rounded-md text-[11px] font-bold border transition-all cursor-pointer ${
+                    settings.humNotchFilter === '50hz_eu'
+                      ? 'bg-rose-500/25 border-rose-500 text-rose-200 ring-1 ring-rose-500/40 shadow-xs'
+                      : 'bg-[#131929] border-slate-800 text-slate-300 hover:border-slate-700'
+                  }`}
+                  title="Filtro seletivo de 50 Hz e harmônicos (100/150 Hz) para padrão Europa / DVD"
+                >
+                  50 Hz (EU/DVD)
+                </button>
+              </div>
+            </div>
+
+            {/* 2. Anti-Sopro Grave & Subsonic Rumble Filter */}
+            <div className="space-y-1.5 p-3 rounded-lg bg-[#0d1322] border border-slate-800">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                  <Waves className="w-3.5 h-3.5 text-cyan-400" />
+                  Anti-Sopro Grave (Rumble)
+                </span>
+                {telemetry?.hasRumbleDetected && (
+                  <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 animate-pulse">
+                    Detectado: {telemetry.rumbleLevelDb.toFixed(1)} dB
+                  </span>
+                )}
+              </div>
+              <p className="text-[10px] text-slate-400 leading-tight">
+                Blindagem acústica: suprime sopro de ar e motor sem cortar o peso natural de bumbo e contrabaixo.
+              </p>
+              <div className="grid grid-cols-4 gap-1 pt-1">
+                <button
+                  type="button"
+                  onClick={() => onUpdateSettings({ rumbleFilter: 'none' })}
+                  className={`py-1.5 px-1 rounded-md text-[10px] font-bold text-center border transition-all cursor-pointer ${
+                    settings.rumbleFilter === 'none'
+                      ? 'bg-slate-700 border-slate-500 text-white'
+                      : 'bg-[#131929] border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                  title="Sem filtro de sopro/rumble"
+                >
+                  Bypass
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onUpdateSettings({ rumbleFilter: 'dynamic_rx', enabled: true })}
+                  className={`py-1.5 px-1 rounded-md text-[10px] font-bold text-center border transition-all cursor-pointer ${
+                    (settings.rumbleFilter || 'dynamic_rx') === 'dynamic_rx'
+                      ? 'bg-purple-500/30 border-purple-400 text-purple-200 ring-1 ring-purple-500/50 shadow-xs'
+                      : 'bg-[#131929] border-slate-800 text-slate-300 hover:border-slate-700'
+                  }`}
+                  title="Padrão iZotope RX (100% Dinâmico): atenua o sopro contínuo nas pausas sem tocar nos graves quando os instrumentos tocam (ZERO vazamento na máscara delta!)"
+                >
+                  ★ Dinâmico RX
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onUpdateSettings({ rumbleFilter: 'subsonic_18hz', enabled: true })}
+                  className={`py-1.5 px-1 rounded-md text-[10px] font-bold text-center border transition-all cursor-pointer ${
+                    settings.rumbleFilter === 'subsonic_18hz'
+                      ? 'bg-cyan-500/25 border-cyan-500 text-cyan-200 ring-1 ring-cyan-500/40 shadow-xs'
+                      : 'bg-[#131929] border-slate-800 text-slate-300 hover:border-slate-700'
+                  }`}
+                  title="Corte sub-acústico infra-sônico 18 Hz zero-fase: blindagem espectral ativa contra vazamento de notas no delta"
+                >
+                  18 Hz Sub
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onUpdateSettings({ rumbleFilter: 'subsonic_28hz', enabled: true })}
+                  className={`py-1.5 px-1 rounded-md text-[10px] font-bold text-center border transition-all cursor-pointer ${
+                    settings.rumbleFilter === 'subsonic_28hz'
+                      ? 'bg-cyan-500/25 border-cyan-500 text-cyan-200 ring-1 ring-cyan-500/40 shadow-xs'
+                      : 'bg-[#131929] border-slate-800 text-slate-300 hover:border-slate-700'
+                  }`}
+                  title="Filtro fita 28 Hz zero-fase para fitas 1/4 pol: atenua o motor nas pausas com proteção dinâmica de notas musicais"
+                >
+                  28 Hz Fita
+                </button>
+              </div>
             </div>
           </div>
 

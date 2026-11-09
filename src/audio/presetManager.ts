@@ -69,6 +69,56 @@ export const FACTORY_PRESETS: UserPreset[] = [
     },
   },
   {
+    id: 'factory_trap_bass',
+    name: 'Trap & Bass (-8 LUFS)',
+    category: 'factory',
+    description: 'Mastering de alta energia comercial: graves e subs com punch explosivo, sub-bass 808 firme e vocal principal 100% preservado e nítido sem afundamento.',
+    createdDate: '2026-11-09',
+    settings: {
+      enabled: true,
+      deHarshIntensity: 15,          // De-harsh sutil: protege médios e corpo da voz principal
+      notchFrequencyHz: 4200,        // Frequência fora do corpo do vocal lead
+      notchBandwidthQ: 4.0,
+      tapeWarmth: 48,
+      tubeHarmonics: 38,
+      lowMidBody: 1.8,
+      transientPunch: 95,            // Máximo ataque para bumbo (kick) e caixa (snare)
+      attackDeSmear: 75,
+      timingJitterMs: 0,
+      flutterWowRate: 0,
+      airExciterGain: 40,
+      airCutoffHz: 15000,
+      stereoCorrelationFix: 80,
+      monoBassCutoffHz: 90,          // Subgrave e 808 centralizados em mono (90 Hz) para punch máximo
+      acousticRoomSpread: 35,
+      outputGainDb: 0.5,
+      limitlessEnabled: true,
+      targetLufs: -8.0,
+      targetCeilingDb: -0.2,
+      clipperDrive: 78,
+      lowEndWeight: 92,
+      transientSpeed: 'punchy',
+      autoMatchLoudness: true,
+      orbanHfEnabled: true,
+      orbanHfMode: 'modern_air',
+      orbanHfAmount: 40,
+      orbanHfAutoBrillianceDb: 0.5,
+      orbanHfHighShelfGainDb: 0.5,
+      orbanHfThresholdDb: -3.5,
+      orbanHfCrossoverHz: 6500,
+      orbanHfSpeed: 'fast',
+    },
+    azimuthSettings: {
+      enabled: true,
+      azimuthDelaySamples: 0,
+      balanceDb: 0,
+      invertPhaseL: false,
+      invertPhaseR: false,
+      listenInMono: false,
+      autoAlignOnLoad: true,
+    },
+  },
+  {
     id: 'factory_tape_1_4_modern',
     name: 'Master Fita Rolo 1/4" (Anos 80-2000)',
     category: 'factory',
@@ -375,35 +425,169 @@ export const FACTORY_PRESETS: UserPreset[] = [
   },
 ];
 
+export interface PresetAnalysisContext {
+  isDarkTape?: boolean;
+  hasDropouts?: boolean;
+  hasAzimuthError?: boolean;
+  isDualMono?: boolean;
+  hasHumDetected?: boolean;
+  hasRumbleDetected?: boolean;
+  hissNoiseFloorDb?: number;
+  integratedLufs?: number;
+  dynamicCrestFactorDb?: number;
+  durationSeconds?: number;
+  transientSmearIndex?: number;
+  stereoCorrelationIndex?: number;
+  nyquistCutoffHz?: number;
+  vocalHarshness?: number;
+  titleOrFilename?: string;
+}
+
+export interface RecommendedPresetResult extends UserPreset {
+  selectionReason: string;
+  categoryTag: string;
+}
+
 /**
- * Intelligent Preset Selector based on Spectral Forensics & Audio Characteristics
+ * Intelligent Preset Selector based on Spectral Forensics, Acoustic Dynamics & Genre Context
  * Selects and tailors the ideal mastering preset for the identified source material.
  */
 export function getPresetForAudioAnalysis(
   analysis: ForensicAnalysisResult | null | undefined,
-  context?: {
-    isDarkTape?: boolean;
-    hasDropouts?: boolean;
-    hasAzimuthError?: boolean;
-    isDualMono?: boolean;
-  }
-): UserPreset {
+  context?: PresetAnalysisContext
+): RecommendedPresetResult {
   const all = getAllPresets();
 
-  // 1. AI Generative Music (Suno, Udio, Diffusion artifacts) - Requires verified AI score >= 55%
+  const domName = (analysis?.dominantPlatform?.name || '').toLowerCase();
+  const fileName = (context?.titleOrFilename || analysis?.filename || '').toLowerCase();
+  const crest = context?.dynamicCrestFactorDb ?? analysis?.metrics?.dynamicCrestFactorDb ?? 14.0;
+  const duration = context?.durationSeconds ?? analysis?.metrics?.durationSeconds ?? 180;
+  const hissDb = context?.hissNoiseFloorDb ?? -75.0;
+
+  // 1. Live DVD & Concert / Palco ao Vivo
+  // Checked first to prevent live recordings from ever being misclassified as AI!
+  const hasLiveKeywords =
+    fileName.includes('dvd') ||
+    fileName.includes('vivo') ||
+    fileName.includes('live') ||
+    fileName.includes('show') ||
+    fileName.includes('concerto') ||
+    fileName.includes('turne') ||
+    fileName.includes('tour') ||
+    fileName.includes('ensaio') ||
+    fileName.includes('plateia') ||
+    fileName.includes('palco') ||
+    fileName.includes('festival') ||
+    fileName.includes('carnaval') ||
+    fileName.includes('frevo') ||
+    fileName.includes('recife') ||
+    fileName.includes('olinda') ||
+    fileName.includes('teatro') ||
+    fileName.includes('maracatu') ||
+    domName.includes('dvd') ||
+    domName.includes('vivo') ||
+    domName.includes('live') ||
+    domName.includes('show');
+
+  const hasLiveAcousticSignature =
+    (duration > 240 && crest >= 13.5 && (context?.hasRumbleDetected || Boolean(context?.hasHumDetected))) ||
+    (crest >= 15.0 && (analysis?.metrics?.stereoPhaseDispersion ?? 0) > 35 && (analysis?.metrics?.microTimingRigidity ?? 0) < 30);
+
+  if (hasLiveKeywords || hasLiveAcousticSignature) {
+    const livePreset = all.find((p) => p.id === 'factory_live_dvd_analog') || FACTORY_PRESETS[7] || FACTORY_PRESETS[1];
+    return {
+      ...livePreset,
+      categoryTag: 'DVD & Show Ao Vivo',
+      selectionReason: `Show/DVD ao vivo detectado: dinâmica de palco preservada (Crest Factor ${crest.toFixed(1)} dB), mantendo impacto de bateria e ambiência de platéia sem filtros notch invasivos.`,
+    };
+  }
+
+  // 2. Analog Tape Transfers & Vintage Recordings (Fitas de Rolo 1/4", Cassetes, Vinil)
+  const isAnalogTape =
+    analysis?.dominantPlatform?.platform === 'human_analog' ||
+    Boolean(context?.hasDropouts || context?.hasAzimuthError || context?.isDarkTape || context?.isDualMono || context?.hasHumDetected || hissDb > -68.0);
+
+  if (isAnalogTape) {
+    if (context?.isDarkTape || context?.hasDropouts || hissDb > -58.0) {
+      const vintagePreset = all.find((p) => p.id === 'factory_tape_1_4_vintage') || FACTORY_PRESETS[0];
+      return {
+        ...vintagePreset,
+        categoryTag: 'Fita Vintage 50-70s',
+        selectionReason: `Fita analógica histórica detectada: atenuação de agudos e piso de óxido (${hissDb.toFixed(1)} dBFS), aplicando equalização sedosa Orban e calor analógico.`,
+      };
+    } else {
+      const modernPreset = all.find((p) => p.id === 'factory_tape_1_4_modern') || FACTORY_PRESETS[1];
+      return {
+        ...modernPreset,
+        categoryTag: 'Fita Estúdio 15/30 ips',
+        selectionReason: `Masterização em Fita de Estúdio 15/30 ips (Studer/Ampex): resposta estéreo aberta, corpo harmônico suave (+1.4 dB) e transientes analógicos cristalinos.`,
+      };
+    }
+  }
+
+  // 3. High-Energy Rhythmic & Percussive Punch (Rock, Pop, Funk, Frevo, Bateria)
+  const hasPunchKeywords =
+    fileName.includes('samba') ||
+    fileName.includes('rock') ||
+    fileName.includes('funk') ||
+    fileName.includes('bateria') ||
+    fileName.includes('ritmo') ||
+    fileName.includes('punch') ||
+    fileName.includes('groove') ||
+    fileName.includes('percussao') ||
+    fileName.includes('forro') ||
+    fileName.includes('axe') ||
+    fileName.includes('drum');
+
+  if (hasPunchKeywords || crest >= 15.5) {
+    const punchPreset = all.find((p) => p.id === 'factory_punch_analog') || FACTORY_PRESETS[3];
+    return {
+      ...punchPreset,
+      categoryTag: 'Punch & Ritmo Dinâmico',
+      selectionReason: `Ritmo com alta energia percussiva (Crest Factor ${crest.toFixed(1)} dB): adiciona corpo nos graves (+2.6 dB) e transientes velozes para impacto sonoro firme.`,
+    };
+  }
+
+  // 4. Acoustic Vocal / MPB / Voice & Instrument (Voz e Violão, MPB, Acústico)
+  const hasVocalKeywords =
+    fileName.includes('voz') ||
+    fileName.includes('violao') ||
+    fileName.includes('acustico') ||
+    fileName.includes('acoustic') ||
+    fileName.includes('vocal') ||
+    fileName.includes('mpb') ||
+    fileName.includes('bossa') ||
+    fileName.includes('serenata') ||
+    fileName.includes('canto') ||
+    fileName.includes('cantor') ||
+    fileName.includes('cantora') ||
+    fileName.includes('solo') ||
+    fileName.includes('cancao');
+
+  if (hasVocalKeywords || (crest >= 12.0 && (analysis?.metrics?.vocalResonanceHarshness ?? 0) < 40 && !context?.isDarkTape)) {
+    const vocalPreset = all.find((p) => p.id === 'factory_vocal_shine') || FACTORY_PRESETS[4];
+    return {
+      ...vocalPreset,
+      categoryTag: 'Voz & Acústico MPB',
+      selectionReason: `Gravação acústica e foco vocal detectados: abre ar sedoso em 14 kHz sem sibilância, destacando a respiração vocal e o calor dos instrumentos acústicos.`,
+    };
+  }
+
+  // 5. AI Generative Music (Suno, Udio) — Verified Generative Synthesis
   const isSuno = analysis?.dominantPlatform?.platform === 'suno';
   const isUdio = analysis?.dominantPlatform?.platform === 'udio';
-  const isAi = (analysis?.overallAiProbability ?? 0) >= 55 && (isSuno || isUdio);
+  const isAi = (analysis?.overallAiProbability ?? 0) >= 65 && (isSuno || isUdio) && (analysis?.metrics?.microTimingRigidity ?? 0) > 35;
 
   if (isAi) {
     const aiRescuePreset = all.find((p) => p.id === 'factory_ai_rescue') || FACTORY_PRESETS[6];
-    // Fine-tune notch frequency according to the specific platform identified
     const tailoredNotch = isUdio ? 4200 : 3400;
     const tailoredDeHarsh = isUdio ? 80 : (analysis?.metrics?.nyquistCutoffHz && analysis.metrics.nyquistCutoffHz <= 16500 ? 75 : 65);
     const tailoredAirCutoff = isUdio ? 17000 : 15500;
 
     return {
       ...aiRescuePreset,
+      categoryTag: 'Resgate de IA',
+      selectionReason: `Música sintetizada por IA detectada (${isUdio ? 'Udio AI' : 'Suno AI'}): aplicando notch cirúrgico em ${tailoredNotch} Hz para eliminar formantes metálicos.`,
       settings: {
         ...aiRescuePreset.settings,
         notchFrequencyHz: tailoredNotch,
@@ -413,45 +597,24 @@ export function getPresetForAudioAnalysis(
     };
   }
 
-  // 2. Live DVD & Concert Recordings
-  const domName = analysis?.dominantPlatform?.name?.toLowerCase() || '';
-  const fileName = analysis?.filename?.toLowerCase() || '';
-  const isLiveOrDvd =
-    domName.includes('dvd') ||
-    domName.includes('vivo') ||
-    domName.includes('live') ||
-    domName.includes('show') ||
-    domName.includes('concerto') ||
-    fileName.includes('dvd') ||
-    fileName.includes('live') ||
-    fileName.includes('vivo') ||
-    fileName.includes('show');
-
-  if (isLiveOrDvd) {
-    const livePreset = all.find((p) => p.id === 'factory_live_dvd_analog') || FACTORY_PRESETS[7] || FACTORY_PRESETS[1];
-    return livePreset;
+  // 6. Streaming Ready Compliance (EBU R128 / Spotify / YouTube)
+  const lufs = context?.integratedLufs ?? -18.0;
+  if (lufs >= -15.5 && lufs <= -11.0 && crest <= 12.5) {
+    const streamPreset = all.find((p) => p.id === 'factory_streaming_ready') || FACTORY_PRESETS[5];
+    return {
+      ...streamPreset,
+      categoryTag: 'Padrão Streaming',
+      selectionReason: `Áudio digital moderno comercial: calibrado rigorosamente para conformidade EBU R128 / Streaming (-14.0 LUFS e -1.0 dB True-Peak).`,
+    };
   }
 
-  // 3. Analog Tape Transfers & Vintage Recordings
-  const isAnalog =
-    analysis?.dominantPlatform?.platform === 'human_analog' ||
-    Boolean(context?.hasDropouts || context?.hasAzimuthError || context?.isDarkTape || context?.isDualMono);
-
-  if (isAnalog) {
-    if (context?.isDarkTape || context?.hasDropouts) {
-      // Vintage tape (50s-70s) needing low-mid body and high-frequency opening
-      const vintagePreset = all.find((p) => p.id === 'factory_tape_1_4_vintage') || FACTORY_PRESETS[0];
-      return vintagePreset;
-    } else {
-      // Modern 1/4" tape (80s-2000s)
-      const modernPreset = all.find((p) => p.id === 'factory_tape_1_4_modern') || FACTORY_PRESETS[1];
-      return modernPreset;
-    }
-  }
-
-  // 4. Clean Acoustic / Modern Digital Master
+  // 7. Pure Audiophile / Acoustic Studio Master (Default High-Fidelity Master)
   const audiophilePreset = all.find((p) => p.id === 'factory_mastering_cristalino') || FACTORY_PRESETS[2];
-  return audiophilePreset;
+  return {
+    ...audiophilePreset,
+    categoryTag: 'Mastering Cristalino',
+    selectionReason: `Mastering audiófilo transparente: equilíbrio tonal aberto sem coloração excessiva, preservando a fidelidade original da mixagem.`,
+  };
 }
 
 export function getSavedUserPresets(): UserPreset[] {

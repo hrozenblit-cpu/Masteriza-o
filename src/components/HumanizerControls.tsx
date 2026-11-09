@@ -131,33 +131,41 @@ export function HumanizerControls({
         break;
 
       case 'club_bass':
-        onSelectPresetName?.('Clube & Bass Sub');
+      case 'trap_heavy':
+        onSelectPresetName?.('Trap & Bass (-8 LUFS)');
         onUpdateSettings({
           enabled: true,
-          deHarshIntensity: 50,
-          notchFrequencyHz: 3600,
-          notchBandwidthQ: 2.8,
-          tapeWarmth: 65,
-          tubeHarmonics: 50,
-          lowMidBody: 2.2,
-          transientPunch: 90,
-          attackDeSmear: 70,
-          timingJitterMs: 8,
-          flutterWowRate: 20,
-          airExciterGain: 45,
-          airCutoffHz: 15500,
-          stereoCorrelationFix: 85,
-          monoBassCutoffHz: 160,
-          acousticRoomSpread: 50,
+          deHarshIntensity: 15,          // De-harsh sutil: preserva presença e corpo do vocal lead
+          notchFrequencyHz: 4200,        // Acima do corpo da voz principal
+          notchBandwidthQ: 4.0,
+          tapeWarmth: 48,
+          tubeHarmonics: 38,
+          lowMidBody: 1.8,
+          transientPunch: 95,            // Máximo punch para bumbo (kick) e 808
+          attackDeSmear: 75,
+          timingJitterMs: 0,
+          flutterWowRate: 0,
+          airExciterGain: 40,
+          airCutoffHz: 15000,
+          stereoCorrelationFix: 80,
+          monoBassCutoffHz: 90,          // Subgrave e 808 em mono a 90 Hz para graves limpos e firmes
+          acousticRoomSpread: 35,
           outputGainDb: 0.5,
+          limitlessEnabled: true,
+          targetLufs: -8.0,
+          targetCeilingDb: -0.2,
+          clipperDrive: 78,
+          lowEndWeight: 92,
+          transientSpeed: 'punchy',
+          autoMatchLoudness: true,
           orbanHfEnabled: true,
           orbanHfMode: 'modern_air',
-          orbanHfAmount: 45,
+          orbanHfAmount: 40,
           orbanHfAutoBrillianceDb: 0.5,
           orbanHfHighShelfGainDb: 0.5,
-          orbanHfThresholdDb: -5.0,
-          orbanHfCrossoverHz: 6800,
-          orbanHfSpeed: 'medium',
+          orbanHfThresholdDb: -3.5,
+          orbanHfCrossoverHz: 6500,
+          orbanHfSpeed: 'fast',
         });
         break;
 
@@ -426,21 +434,21 @@ export function HumanizerControls({
             </span>
           </button>
 
-          {/* Preset 3: Clube & Bass */}
+          {/* Preset 3: Trap & Bass */}
           <button
-            onClick={() => applyPreset('club_bass')}
+            onClick={() => applyPreset('trap_heavy')}
             className={`px-3 py-2 text-left rounded-lg transition-all flex flex-col gap-0.5 group cursor-pointer ${
-              currentPresetName === 'Clube & Bass Sub'
+              currentPresetName === 'Trap & Bass (-8 LUFS)' || currentPresetName === 'Clube & Bass Sub'
                 ? 'bg-emerald-950/60 border-2 border-emerald-400 ring-2 ring-emerald-500/30'
                 : 'bg-[#12192c] hover:bg-[#18233f] border border-slate-700/80 hover:border-emerald-400/60'
             }`}
           >
             <span className="text-xs font-bold text-emerald-300 flex items-center gap-1">
-              <Disc className="w-3 h-3" />
-              Clube & Bass
+              <Disc className="w-3 h-3 text-emerald-400" />
+              Trap & Bass (-8 LUFS)
             </span>
             <span className="text-[10px] text-slate-400 group-hover:text-slate-300 leading-tight">
-              Trap, EDM, Funk
+              Punch 808 & Vocal Limpo
             </span>
           </button>
 

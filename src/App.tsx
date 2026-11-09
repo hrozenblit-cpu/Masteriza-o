@@ -29,7 +29,7 @@ import {
   DEFAULT_DROPOUT_SETTINGS
 } from './audio/tapeDropoutEngine';
 import { UserPreset, getAllPresets, getPresetForAudioAnalysis } from './audio/presetManager';
-import { autoSaveManager, SUBFOLDER_RECOVERED, SUBFOLDER_MASTERED } from './audio/autoSaveManager';
+import { autoSaveManager, SUBFOLDER_RECOVERED, SUBFOLDER_PRESETS, formatMasteredSubfolder } from './audio/autoSaveManager';
 import {
   generateTrackRecall,
   recallToBlob,
@@ -74,6 +74,7 @@ export default function App() {
   const [batchQueue, setBatchQueue] = useState<BatchItem[]>([]);
   const [editingBatchIndex, setEditingBatchIndex] = useState<number | null>(null);
   const [currentGlobalPresetName, setCurrentGlobalPresetName] = useState<string>('Digitalização Fita 1/4" (Anos 50-70)');
+  const [currentPresetReason, setCurrentPresetReason] = useState<string>('');
 
   // Track Standard Naming Metadata State ([Faixa]_[Música] - [Cantor] - AT_[Taxa_Bit]_[LUFS])
   const [trackNumber, setTrackNumber] = useState<string>('');
@@ -209,7 +210,7 @@ export default function App() {
     // 1/4" Analog Tape Azimuth & Inter-Channel Balance Analysis
     setAnalysisStatus('Analisando correlação estéreo vs mono e azimute...');
     await new Promise((r) => setTimeout(r, 10));
-    const azimuth = analyzeTapeAzimuth(audioBuffer);
+    const azimuth = analyzeTapeAzimuth(audioBuffer, tapeAzimuthSettings);
     setTapeAzimuthAnalysis(azimuth);
 
     // 1/4" Tape Dropout Analysis (Ampex Full-Track Mono digitized on Studer A80 2-Track)
@@ -219,10 +220,14 @@ export default function App() {
     setTapeDropoutAnalysis(dropouts);
     audioEngine.setTapeDropoutAnalysis(dropouts);
 
-    // Intelligent Material Detection: Real Stereo vs Mono in 2 Channels vs Modern Clean Recording
+    // Intelligent Material Detection: Real Stereo vs Mono in 2 Channels
+    // Stereo SÓ QUANDO os canais são genuinamente diferentes!
     const isDualMono =
       azimuth.channelConfiguration === 'dual_mono' ||
-      (dropouts.isAmpexFullTrackCandidate && azimuth.sideToMidDb <= -26.0);
+      azimuth.channelConfiguration === 'single_mono' ||
+      (dropouts.isAmpexFullTrackCandidate &&
+       azimuth.sideToMidDb <= -24.0 &&
+       (azimuth.phaseCorrelationAfter ?? 0) >= 0.965);
 
     const hasDropouts = dropouts.totalDropouts > 0;
     const hasAzimuthLag = Math.abs(azimuth.azimuthOffsetSamples) >= 0.1 || Math.abs(azimuth.levelDiffDb) >= 0.35;
@@ -233,12 +238,15 @@ export default function App() {
     const denoiseAnalysis = audioEngine.analyzeDenoise(audioBuffer);
     setTapeDenoiseTelemetry(denoiseAnalysis);
 
-    const hasTapeHiss = Boolean(
+    const hasTapeNoise = Boolean(
       denoiseAnalysis?.hasNoiseDetected ||
+      denoiseAnalysis?.hasHumDetected ||
+      denoiseAnalysis?.hasRumbleDetected ||
       (denoiseAnalysis?.hissNoiseFloorDb ?? -90) > -75.0 ||
-      denoiseAnalysis?.hasHumDetected
+      (denoiseAnalysis?.humLevelDb ?? -96) > -72.0 ||
+      (denoiseAnalysis?.rumbleLevelDb ?? -96) > -62.0
     );
-    const isCleanModern = !hasDropouts && !hasTapeHiss && !hasAzimuthLag && dropouts.tapeHealthScore === 100;
+    const isCleanModern = !hasDropouts && !hasTapeNoise && !hasAzimuthLag && dropouts.tapeHealthScore === 100;
 
     const isWanderOrDefect =
       isDualMono &&
@@ -246,14 +254,15 @@ export default function App() {
         dropouts.channelComparison?.isSevereWanderDetected ||
         hasDropouts);
 
-    const safeDropoutMode: TapeDropoutMode = isDualMono && !isCleanModern
+    // Na recuperação, estéreo SÓ quando os canais são diferentes!
+    const safeDropoutMode: TapeDropoutMode = isDualMono
       ? (tapeDropoutSettings.mode === 'mono_wander_graft' || isWanderOrDefect ? 'mono_wander_graft' : 'ampex_fulltrack_cross')
       : 'stereo_independent';
 
     const safeDropoutSettings: TapeDropoutSettings = {
       ...tapeDropoutSettings,
       enabled: hasDropouts || (!isCleanModern && isDualMono && isWanderOrDefect),
-      mode: !isDualMono ? 'stereo_independent' : safeDropoutMode,
+      mode: safeDropoutMode,
     };
     setTapeDropoutSettings(safeDropoutSettings);
     audioEngine.updateTapeDropoutSettings(safeDropoutSettings);
@@ -261,10 +270,11 @@ export default function App() {
     if (denoiseAnalysis) {
       const autoDenoise: SpectralDenoiseSettings = {
         ...tapeDenoiseSettings,
-        enabled: hasTapeHiss && !isCleanModern,
+        enabled: hasTapeNoise,
         noiseProfileType: denoiseAnalysis.recommendedNoiseProfileType,
         humNotchFilter: denoiseAnalysis.recommendedHumNotch,
-        reductionDb: denoiseAnalysis.recommendedReductionDb,
+        rumbleFilter: denoiseAnalysis.recommendedRumbleFilter,
+        reductionDb: Math.max(denoiseAnalysis.recommendedReductionDb, 8.5),
         learnedNoiseBands: denoiseAnalysis.noiseProfileBands,
       };
       setTapeDenoiseSettings(autoDenoise);
@@ -278,14 +288,26 @@ export default function App() {
     const orbanAnalysis = audioEngine.getOrbanTrebleTelemetry(audioBuffer);
     setOrbanTelemetry(orbanAnalysis);
 
-    // 1. Identificação inteligente do Preset correspondente à fonte analisada (IA, Fita Vintage, Fita Moderna, etc.)
+    // 1. Identificação inteligente do Preset correspondente à fonte analisada (IA, Fita Vintage, Fita Moderna, DVD ao Vivo, etc.)
     const recommendedPreset = getPresetForAudioAnalysis(analysis, {
       isDarkTape: orbanAnalysis?.isDarkTape,
       hasDropouts,
       hasAzimuthError: hasAzimuthLag,
       isDualMono,
+      hasHumDetected: denoiseAnalysis?.hasHumDetected,
+      hasRumbleDetected: denoiseAnalysis?.hasRumbleDetected,
+      hissNoiseFloorDb: denoiseAnalysis?.hissNoiseFloorDb,
+      integratedLufs: loudness.integratedLufs,
+      dynamicCrestFactorDb: loudness.crestFactorDb,
+      durationSeconds: audioBuffer.duration,
+      transientSmearIndex: analysis?.metrics?.transientSmearIndex,
+      stereoCorrelationIndex: analysis?.metrics?.phaseCorrelationIndex,
+      nyquistCutoffHz: analysis?.metrics?.nyquistCutoffHz,
+      vocalHarshness: analysis?.metrics?.vocalResonanceHarshness,
+      titleOrFilename: displayName || currentTrackTitle,
     });
     setCurrentGlobalPresetName(recommendedPreset.name);
+    setCurrentPresetReason(recommendedPreset.selectionReason);
 
     // Detecta se o áudio presente necessita do processador de agudos (fita abafada, estridência/sibilância ou ajuste de brilho)
     const audioNeedsTreble = Boolean(
@@ -532,9 +554,26 @@ export default function App() {
       setAnalysisResult(analysis);
 
       // Intelligent Preset Selection: route to factory_live_dvd_analog or appropriate preset
-      const suggestedPreset = getPresetForAudioAnalysis(analysis);
+      const suggestedPreset = getPresetForAudioAnalysis(analysis, {
+        isDarkTape: orbanTelemetry?.isDarkTape,
+        hasDropouts: (tapeDropoutAnalysis?.events.length ?? 0) > 0,
+        hasAzimuthError: Math.abs(tapeAzimuthAnalysis?.azimuthOffsetSamples ?? 0) > 0.5,
+        isDualMono:
+          tapeAzimuthAnalysis?.channelConfiguration === 'dual_mono' ||
+          tapeAzimuthAnalysis?.channelConfiguration === 'single_mono' ||
+          ((tapeAzimuthAnalysis?.sideToMidDb ?? 0) <= -24.0 &&
+           (tapeAzimuthAnalysis?.phaseCorrelationAfter ?? 0) >= 0.965),
+        hasHumDetected: tapeDenoiseTelemetry?.hasHumDetected,
+        hasRumbleDetected: tapeDenoiseTelemetry?.hasRumbleDetected,
+        hissNoiseFloorDb: tapeDenoiseTelemetry?.hissNoiseFloorDb,
+        integratedLufs: trackLoudness?.integratedLufs,
+        dynamicCrestFactorDb: trackLoudness?.crestFactorDb,
+        durationSeconds: activeBuf.duration,
+        titleOrFilename: currentTrackTitle,
+      });
       if (suggestedPreset && !humanizerSettings.orbanHfUserOverrideLock) {
         setCurrentGlobalPresetName(suggestedPreset.name);
+        setCurrentPresetReason(suggestedPreset.selectionReason);
         setHumanizerSettings(suggestedPreset.settings);
         audioEngine.updateSettings(suggestedPreset.settings);
         if (suggestedPreset.azimuthSettings) {
@@ -808,11 +847,15 @@ export default function App() {
       }
 
       // Intelligent Material Detection: Real Stereo vs Mono in 2 Channels (Exact parity with individual mode)
+      // Stereo SÓ QUANDO os canais são genuinamente diferentes!
       const isDualMono =
         item.isDualMono !== undefined
           ? item.isDualMono
           : (azimuth.channelConfiguration === 'dual_mono' ||
-             (item.isAmpexCandidate && azimuth.sideToMidDb <= -26.0));
+             azimuth.channelConfiguration === 'single_mono' ||
+             (item.isAmpexCandidate &&
+              azimuth.sideToMidDb <= -24.0 &&
+              azimuth.phaseCorrelationAfter >= 0.965));
 
       const dropouts = analyzeTapeDropouts(buffer, item.customDropoutSettings || tapeDropoutSettings);
       const hasDropouts = dropouts.totalDropouts > 0;
@@ -824,7 +867,8 @@ export default function App() {
           dropouts.channelComparison?.isSevereWanderDetected ||
           hasDropouts);
 
-      const safeDropoutMode: TapeDropoutMode = isDualMono && !isCleanModern
+      // Na recuperação, estéreo SÓ quando os canais são diferentes!
+      const safeDropoutMode: TapeDropoutMode = isDualMono
         ? (item.customDropoutSettings?.mode || (tapeDropoutSettings.mode === 'mono_wander_graft' || isWanderOrDefect ? 'mono_wander_graft' : 'ampex_fulltrack_cross'))
         : (item.customDropoutSettings?.mode || 'stereo_independent');
 
@@ -1307,9 +1351,13 @@ export default function App() {
       }
 
       // 2. Material Detection & Dropout Mode:
+      // Estéreo SÓ QUANDO os canais são genuinamente diferentes!
       const isDualMonoCandidate =
         tapeAzimuthAnalysis?.channelConfiguration === 'dual_mono' ||
-        ((tapeDropoutAnalysis?.isAmpexFullTrackCandidate ?? false) && (tapeAzimuthAnalysis?.sideToMidDb ?? 0) <= -26.0);
+        tapeAzimuthAnalysis?.channelConfiguration === 'single_mono' ||
+        ((tapeDropoutAnalysis?.isAmpexFullTrackCandidate ?? false) &&
+         (tapeAzimuthAnalysis?.sideToMidDb ?? 0) <= -24.0 &&
+         (tapeAzimuthAnalysis?.phaseCorrelationAfter ?? 0) >= 0.965);
 
       const isWanderOrDefect =
         isDualMonoCandidate &&
@@ -1317,26 +1365,36 @@ export default function App() {
           (tapeDropoutAnalysis?.channelComparison?.isSevereWanderDetected ?? false) ||
           hasDropouts);
 
-      const autoDropoutMode: TapeDropoutMode = isDualMonoCandidate && !isCleanModernRecording
+      // Na recuperação, estéreo SÓ quando os canais são diferentes!
+      const autoDropoutMode: TapeDropoutMode = isDualMonoCandidate
         ? (tapeDropoutSettings.mode === 'mono_wander_graft' || isWanderOrDefect ? 'mono_wander_graft' : 'ampex_fulltrack_cross')
         : 'stereo_independent';
 
       const autoDropout: TapeDropoutSettings = {
         ...tapeDropoutSettings,
-        enabled: hasDropouts || (!isCleanModernRecording && isWanderOrDefect),
-        mode: isCleanModernRecording ? 'stereo_independent' : autoDropoutMode,
+        enabled: hasDropouts || isWanderOrDefect,
+        mode: autoDropoutMode,
       };
       setTapeDropoutSettings(autoDropout);
       audioEngine.updateTapeDropoutSettings(autoDropout);
 
       // 3. Spectral Denoise:
       if (tapeDenoiseTelemetry) {
+        const hasAnyNoise = Boolean(
+          tapeDenoiseTelemetry.hasNoiseDetected ||
+          tapeDenoiseTelemetry.hasHumDetected ||
+          tapeDenoiseTelemetry.hasRumbleDetected ||
+          tapeDenoiseTelemetry.hissNoiseFloorDb > -75.0 ||
+          tapeDenoiseTelemetry.humLevelDb > -72.0 ||
+          tapeDenoiseTelemetry.rumbleLevelDb > -62.0
+        );
         const autoDenoise: SpectralDenoiseSettings = {
           ...tapeDenoiseSettings,
-          enabled: hasTapeHiss && !isCleanModernRecording,
-          reductionDb: tapeDenoiseTelemetry.recommendedReductionDb,
+          enabled: hasAnyNoise,
+          reductionDb: Math.max(tapeDenoiseTelemetry.recommendedReductionDb, 8.5),
           noiseProfileType: tapeDenoiseTelemetry.recommendedNoiseProfileType,
           humNotchFilter: tapeDenoiseTelemetry.recommendedHumNotch,
+          rumbleFilter: tapeDenoiseTelemetry.recommendedRumbleFilter,
           learnedNoiseBands: tapeDenoiseTelemetry.noiseProfileBands,
         };
         setTapeDenoiseSettings(autoDenoise);
@@ -1797,16 +1855,19 @@ export default function App() {
         tapeDenoiseSettings,
         tapeDropoutSettings
       );
+      const targetLufs = humanizerSettings.targetLufs ?? -14;
+      const masteredFolder = formatMasteredSubfolder(targetLufs);
+
       const filename = buildMasterWavFilename({
         trackNumber,
         songTitle: effectiveTitle,
         artist: artistName,
         sampleRate: targetSampleRate,
         bitDepth: targetBitDepth,
-        targetLufs: humanizerSettings.targetLufs ?? -14,
+        targetLufs,
       });
       const saveRes = await autoSaveManager.saveProcessedFile(wavBlob, filename, {
-        subfolder: SUBFOLDER_MASTERED,
+        subfolder: masteredFolder,
       });
 
       // 2. Preset de Recall (.aurapreset) correspondente aos parâmetros exatos desta Master
@@ -1828,14 +1889,14 @@ export default function App() {
         artist: artistName,
         sampleRate: targetSampleRate,
         bitDepth: targetBitDepth,
-        targetLufs: humanizerSettings.targetLufs ?? -14,
+        targetLufs,
       });
 
       // Se salvando diretamente na pasta vinculada no disco do usuário:
       if (saveRes.savedToDiskDirectly) {
-        // Grava o preset de recall na subpasta [-LUFS] junto com a Master
+        // Grava o preset de recall na subpasta [Recuperados]/[Presets]
         await autoSaveManager.saveProcessedFile(recallBlob, recallFilename, {
-          subfolder: SUBFOLDER_MASTERED,
+          subfolder: SUBFOLDER_PRESETS,
         });
 
         // Também grava o Pré-Master na subpasta [Recuperados]
@@ -1860,11 +1921,11 @@ export default function App() {
           });
 
           setExportNotice(
-            `✓ Arquivos organizados automaticamente: Master WAV e Recall em "${SUBFOLDER_MASTERED}" e Pré-Master em "${SUBFOLDER_RECOVERED}"! Destino: ${saveRes.targetPath}`
+            `✓ Arquivos organizados automaticamente: Master WAV em "${masteredFolder}", Pré-Master em "${SUBFOLDER_RECOVERED}" e Preset em "${SUBFOLDER_PRESETS}"! Destino: ${saveRes.targetPath}`
           );
         } catch {
           setExportNotice(
-            `✓ Master WAV e Preset de Recall (.aurapreset) gravados em "${SUBFOLDER_MASTERED}": ${saveRes.targetPath} (${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit)!`
+            `✓ Master WAV gravado em "${masteredFolder}" e Preset em "${SUBFOLDER_PRESETS}": ${saveRes.targetPath} (${targetSampleRate.toLocaleString()} Hz / ${targetBitDepth}-bit)!`
           );
         }
       } else {
@@ -1901,6 +1962,8 @@ export default function App() {
       );
 
       const effectiveTitle = songTitle || stripAudioFileExtension(currentTrackTitle);
+      const targetLufs = humanizerSettings.targetLufs ?? -14;
+      const masteredFolder = formatMasteredSubfolder(targetLufs);
 
       // 1. Master Final WAV
       const wavBlob = await audioEngine.exportProcessedAudioWav(
@@ -1918,7 +1981,7 @@ export default function App() {
         artist: artistName,
         sampleRate: targetSampleRate,
         bitDepth: targetBitDepth,
-        targetLufs: humanizerSettings.targetLufs ?? -14,
+        targetLufs,
       });
 
       // 2. Pré-Master Restaurado WAV
@@ -1957,13 +2020,13 @@ export default function App() {
         artist: artistName,
         sampleRate: targetSampleRate,
         bitDepth: targetBitDepth,
-        targetLufs: humanizerSettings.targetLufs ?? -14,
+        targetLufs,
       });
 
       const zipBlob = await autoSaveManager.createZipPackage([
-        { filename: masterFilename, blob: wavBlob, subfolder: SUBFOLDER_MASTERED },
+        { filename: masterFilename, blob: wavBlob, subfolder: masteredFolder },
         { filename: preMasterFilename, blob: preMasterBlob, subfolder: SUBFOLDER_RECOVERED },
-        { filename: recallFilename, blob: recallBlob, subfolder: SUBFOLDER_MASTERED },
+        { filename: recallFilename, blob: recallBlob, subfolder: SUBFOLDER_PRESETS },
       ]);
 
       const zipNumPrefix = trackNumber?.trim() ? `${trackNumber.trim().padStart(2, '0')}_` : '';
@@ -1971,7 +2034,7 @@ export default function App() {
       const saveRes = await autoSaveManager.saveZipFile(zipBlob, zipName);
 
       setExportNotice(
-        `✓ Pacote ZIP completo gerado com sucesso: ${saveRes.targetPath} (contém Master WAV, Pré-Master e Recall)!`
+        `✓ Pacote ZIP completo gerado com sucesso: ${saveRes.targetPath} (Pastas: "${masteredFolder}", "${SUBFOLDER_RECOVERED}" e "${SUBFOLDER_PRESETS}")!`
       );
       setTimeout(() => setExportNotice(null), 8000);
     } catch (err) {
@@ -2014,6 +2077,26 @@ export default function App() {
           audioEngine.updateTapeDenoiseSettings(recall.denoiseSettings);
         }
 
+        // 4.1 Sincronização e Validação Estéreo vs Mono:
+        // Se o preset carregado é estéreo (activeChannel: 'both' e listenInMono: false)
+        // e a análise visual ainda apontava dual_mono, sincroniza para Estéreo Real!
+        const isStereoPreset =
+          recall.azimuthSettings?.activeChannel === 'both' &&
+          !recall.azimuthSettings?.listenInMono &&
+          recall.azimuthSettings?.channelModeOverride !== 'force_dual_mono';
+
+        if (isStereoPreset) {
+          if (tapeAzimuthAnalysis && tapeAzimuthAnalysis.channelConfiguration === 'dual_mono') {
+            const recheckedStereoAnalysis: TapeAzimuthAnalysis = {
+              ...tapeAzimuthAnalysis,
+              channelConfiguration: 'stereo',
+              channelConfigLabel: 'Estéreo Real (Mixagem L/R)',
+              channelConfigDetail: 'Mixagem estéreo confirmada e sincronizada pelo recall de masterização.',
+            };
+            setTapeAzimuthAnalysis(recheckedStereoAnalysis);
+          }
+        }
+
         const presetDisplayName = `Recall: ${recall.trackTitle || recall.presetName || 'Master Anterior'}`;
         setCurrentGlobalPresetName(presetDisplayName);
 
@@ -2053,8 +2136,9 @@ export default function App() {
 
         const lufsVal = restoredHumanizer.targetLufs ? `${restoredHumanizer.targetLufs.toFixed(1)} LUFS` : '-14.0 LUFS';
         const azVal = recall.azimuthSettings?.azimuthDelaySamples ? `${recall.azimuthSettings.azimuthDelaySamples} smp` : '0 smp';
+        const modeLabel = isStereoPreset ? 'Estéreo Real' : 'Mono';
         setExportNotice(
-          `✓ Recall de Masterização "${recall.trackTitle}" ATIVADO E ATUANDO NO ÁUDIO! [Alvo: ${lufsVal} | De-Harsh: ${restoredHumanizer.deHarshIntensity}% | Warmth: ${restoredHumanizer.tapeWarmth}% | Azimute: ${azVal}]. Todos os controles foram sincronizados.`
+          `✓ Recall "${recall.trackTitle}" CARREGADO! Modo: ${modeLabel} | Alvo: ${lufsVal} | De-Harsh: ${restoredHumanizer.deHarshIntensity}% | Warmth: ${restoredHumanizer.tapeWarmth}% | Azimute: ${azVal}. Todos os módulos sincronizados.`
         );
         setTimeout(() => setExportNotice(null), 7000);
       } else {
@@ -2164,6 +2248,8 @@ export default function App() {
           targetLufs={humanizerSettings.targetLufs}
           analysisStatus={analysisStatus}
           currentPresetName={currentGlobalPresetName}
+          currentPresetReason={currentPresetReason}
+          onOpenPresets={() => setIsPresetModalOpen(true)}
           onReanalyze={handleReanalyzeForensics}
         />
 

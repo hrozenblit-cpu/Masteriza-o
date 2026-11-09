@@ -224,16 +224,14 @@ export function analyzeTapeDropouts(
   const baseCorr = denom > 1e-6 ? sumCross / denom : 1;
   const sideToMidRatio = sumMidSq > 1e-6 ? Math.sqrt(sumSideSq / sumMidSq) : 0;
 
-  // Accurate Mono in 2 Channels detection:
-  // Genuine mono two-track tapes reading on a stereo head have identical audio on L and R,
-  // where Side energy is strictly tape noise / residual bias (S/M <= -26 dB, ratio <= 0.05)
-  // and phase correlation is >= 0.95.
-  // Real stereo mixes have substantial side energy (ratio >= 0.08, S/M >= -22 dB) and must NEVER be forced into cross-mono patching!
+  // Accurate Mono in 2 Channels detection (Mono Two-Track / Ampex Full-Track):
+  // Stereo SÓ QUANDO os canais são genuinamente diferentes (mixagem L/R com instrumentos, reverbs e panners distintos).
+  // Two-Track Mono (Ampex Full-Track em 2 canais) ocorre APENAS se os dois canais forem cópias do mesmo sinal mono:
+  // correlação de fase quase perfeita (>= 0.965) E Side-to-Mid residual (<= -24.0 dB / ratio <= 0.063).
   const isAmpexFullTrackCandidate =
-    (baseCorr >= 0.95 && sideToMidRatio <= 0.05) ||
-    sideToMidRatio <= 0.035;
+    baseCorr >= 0.965 && sideToMidRatio <= 0.063;
   const mode = settings.mode || (isAmpexFullTrackCandidate ? 'ampex_fulltrack_cross' : 'stereo_independent');
-  const isCrossTrack = (mode === 'ampex_fulltrack_cross' || mode === 'mono_wander_graft') && isAmpexFullTrackCandidate;
+  const isCrossTrack = mode === 'ampex_fulltrack_cross' || mode === 'mono_wander_graft';
 
   // Compute broadband RMS envelope and high-frequency envelope (Wallace spacing loss)
   const envL = new Float32Array(numFrames);
@@ -1025,8 +1023,7 @@ export function reconstructTapeDropouts(
   // Cures rapid L/R oscillation and dropouts on mono two-track tapes.
   // Strictly guarded: only applies if tape is confirmed true mono (dual-mono).
   // Authentic stereo tapes are strictly processed in stereo_independent mode!
-  // =========================================================================
-  if (settings.mode === 'mono_wander_graft' && analysis.isAmpexFullTrackCandidate) {
+  if (settings.mode === 'mono_wander_graft') {
     const recPrimary = analysis.channelComparison?.recommendedPrimary || 'L';
     const primaryChIdx = settings.primaryChannel === 'L' ? 0 : settings.primaryChannel === 'R' ? 1 : (recPrimary === 'R' ? 1 : 0);
     const secondaryChIdx = 1 - primaryChIdx;
@@ -1162,7 +1159,7 @@ export function reconstructTapeDropouts(
   // STANDARD MODES: Stereo Independente, Ampex Full-Track Cross, Soma Mono
   // =========================================================================
   const effectiveMode = settings.mode;
-  const isAmpexCross = (effectiveMode === 'ampex_fulltrack_cross' || effectiveMode === 'mono_optimized_sum') && analysis.isAmpexFullTrackCandidate;
+  const isAmpexCross = effectiveMode === 'ampex_fulltrack_cross' || effectiveMode === 'mono_optimized_sum';
   const enforcePhaseLock = settings.monoCompatibilityPhaseLock !== false;
 
   // Anti-Flanger Architecture for Ampex Full-Track Cross & Mono Modes:
@@ -1202,7 +1199,7 @@ export function reconstructTapeDropouts(
 
     // --- CASE 1: Dropout on Channel L ---
     if (event.channel === 'L') {
-      if (effectiveMode === 'ampex_fulltrack_cross' && analysis.isAmpexFullTrackCandidate) {
+      if (effectiveMode === 'ampex_fulltrack_cross') {
         patchChannelWithOpposite(
           dstL,
           donorR,
@@ -1236,7 +1233,7 @@ export function reconstructTapeDropouts(
     }
     // --- CASE 2: Dropout on Channel R ---
     else if (event.channel === 'R') {
-      if (effectiveMode === 'ampex_fulltrack_cross' && analysis.isAmpexFullTrackCandidate) {
+      if (effectiveMode === 'ampex_fulltrack_cross') {
         patchChannelWithOpposite(
           dstR,
           donorL,

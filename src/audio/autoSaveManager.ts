@@ -2,7 +2,22 @@ import JSZip from 'jszip';
 import { sanitizeFilenamePart, sanitizeSafeAsciiFilename, sanitizeFolderName } from './trackNamingHelper';
 
 export const SUBFOLDER_RECOVERED = '[Recuperados]';
-export const SUBFOLDER_MASTERED = '[-LUFS]';
+export const SUBFOLDER_PRESETS_NAME = '[Presets]';
+export const SUBFOLDER_PRESETS = `${SUBFOLDER_RECOVERED}/${SUBFOLDER_PRESETS_NAME}`;
+export const SUBFOLDER_MASTERED = '[-LUFS]'; // Backwards compatibility fallback
+
+/**
+ * Formats dynamic mastered subfolder with the target LUFS value:
+ * e.g. -14 or -14.0 -> "[-14 LUFS]"
+ * -14.5 -> "[-14.5 LUFS]"
+ * -12 -> "[-12 LUFS]"
+ */
+export function formatMasteredSubfolder(targetLufs?: number): string {
+  const lufs = targetLufs ?? -14.0;
+  const abs = Math.abs(lufs);
+  const numStr = Math.abs(abs % 1) < 0.05 ? `${Math.round(abs)}` : abs.toFixed(1);
+  return `[-${numStr} LUFS]`;
+}
 
 export interface SaveFileOptions {
   subfolder?: string;
@@ -471,9 +486,12 @@ export class AutoSaveManager {
       const cleanFilename = sanitizeSafeAsciiFilename(file.filename);
       let targetFolder = rootFolder;
       if (file.subfolder) {
-        const cleanSub = sanitizeFolderName(file.subfolder);
-        if (cleanSub) {
-          targetFolder = rootFolder.folder(cleanSub) || rootFolder;
+        const subSegments = file.subfolder.split(/[/\\]+/).filter(Boolean);
+        for (const seg of subSegments) {
+          const cleanSeg = sanitizeFolderName(seg);
+          if (cleanSeg) {
+            targetFolder = targetFolder.folder(cleanSeg) || targetFolder;
+          }
         }
       }
       targetFolder.file(cleanFilename, file.blob, {
@@ -611,14 +629,18 @@ export class AutoSaveManager {
           pathSegments.push(cleanParent);
         }
 
-        // Navigate or create target category subfolder (e.g., [Recuperados] or [-LUFS])
+        // Navigate or create target category subfolder (supports nested paths like [Recuperados]/[Presets] or [-14 LUFS])
         if (options?.subfolder) {
-          const cleanSub = sanitizeFolderName(options.subfolder);
-          if (cleanSub) {
-            targetDirHandle = await targetDirHandle.getDirectoryHandle(cleanSub, {
-              create: true,
-            });
-            pathSegments.push(cleanSub);
+          const rawSub = options.subfolder;
+          const subSegments = rawSub.split(/[/\\]+/).filter(Boolean);
+          for (const seg of subSegments) {
+            const cleanSeg = sanitizeFolderName(seg);
+            if (cleanSeg) {
+              targetDirHandle = await targetDirHandle.getDirectoryHandle(cleanSeg, {
+                create: true,
+              });
+              pathSegments.push(cleanSeg);
+            }
           }
         }
 

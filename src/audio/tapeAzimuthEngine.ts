@@ -57,7 +57,10 @@ export interface TapeAzimuthSettings {
 /**
  * Analyzes inter-channel azimuth time delay and stereo balance
  */
-export function analyzeTapeAzimuth(audioBuffer: AudioBuffer): TapeAzimuthAnalysis {
+export function analyzeTapeAzimuth(
+  audioBuffer: AudioBuffer,
+  currentSettings?: TapeAzimuthSettings
+): TapeAzimuthAnalysis {
   const numChannels = audioBuffer.numberOfChannels;
   const sampleRate = audioBuffer.sampleRate;
   const totalLength = audioBuffer.length;
@@ -367,26 +370,32 @@ export function analyzeTapeAzimuth(audioBuffer: AudioBuffer): TapeAzimuthAnalysi
   const ghostNoiseLevelDb = isLeftGhost ? rmsDbL : isRightGhost ? rmsDbR : undefined;
 
   // Determine if audio is genuine mono two-track or authentic stereo:
-  // Mono Two-Track (e.g. mono tape digitized on 2-track deck, or Ampex full-track):
-  // On a genuine mono tape reading on a stereo head, Side energy is strictly residual tape noise / azimuth delay (S/M <= -26 dB)
-  // and phase correlation is >= 0.92.
-  // In true stereo mixes (even centered ones with bass/lead vocal), Side energy is substantial (S/M >= -22 dB, typically -8 dB to -18 dB).
-  const isDualMono =
+  // Stereo SÓ QUANDO os canais são genuinamente diferentes (mixagem L/R com instrumentos, reverbs e panners distintos).
+  // Two-Track Mono (Ampex Full-Track transferido em 2 canais de fita) ocorre APENAS se os canais contiverem
+  // o mesmo sinal musical mono: correlação de fase quase perfeita (>= 0.965) E Side-to-Mid residual (<= -24.0 dB).
+  const autoDualMono =
     !isGhostChannelDetected &&
-    (sideToMidDb <= -28.0 ||
-      (sideToMidDb <= -26.0 && (phaseCorrAfter >= 0.92 || phaseCorr >= 0.90)));
+    sideToMidDb <= -24.0 &&
+    (phaseCorrAfter >= 0.965 || phaseCorr >= 0.96);
+
+  const override = currentSettings?.channelModeOverride;
+  const isDualMono = override === 'force_dual_mono'
+    ? true
+    : override === 'force_stereo' || override === 'force_mono_left' || override === 'force_mono_right'
+    ? false
+    : autoDualMono;
 
   const isModernStereoRecording =
     !isDualMono &&
     !isGhostChannelDetected &&
-    Math.abs(roundedSamples) <= 0.08 &&
-    Math.abs(levelDiffDb) <= 0.35 &&
+    Math.abs(roundedSamples) <= 0.15 &&
+    Math.abs(levelDiffDb) <= 0.50 &&
     phaseCorr >= 0.40;
 
   const isModernMonoRecording =
     isDualMono &&
     !isGhostChannelDetected &&
-    Math.abs(roundedSamples) <= 0.08 &&
+    Math.abs(roundedSamples) <= 0.10 &&
     Math.abs(levelDiffDb) <= 0.25;
 
   const isModernRecording = isModernStereoRecording || isModernMonoRecording;
@@ -395,7 +404,23 @@ export function analyzeTapeAzimuth(audioBuffer: AudioBuffer): TapeAzimuthAnalysi
   let channelConfigLabel = '';
   let channelConfigDetail = '';
 
-  if (isGhostChannelDetected) {
+  if (override === 'force_stereo') {
+    channelConfiguration = 'stereo';
+    channelConfigLabel = 'Estéreo Real (Manual / Preset)';
+    channelConfigDetail = `Mixagem estéreo forçada manualmente pelo operador ou preset de recall (S/M ${sideToMidDb} dB, Correlação ${(phaseCorr * 100).toFixed(0)}%).`;
+  } else if (override === 'force_dual_mono') {
+    channelConfiguration = 'dual_mono';
+    channelConfigLabel = 'Mono Two-Track (Manual / Preset)';
+    channelConfigDetail = `Modo Mono Two-Track forçado manualmente pelo operador ou preset de recall.`;
+  } else if (override === 'force_mono_left') {
+    channelConfiguration = 'single_mono';
+    channelConfigLabel = 'Mono Canal E (Manual / Preset)';
+    channelConfigDetail = `Áudio mono extraído exclusivamente do Canal Esquerdo.`;
+  } else if (override === 'force_mono_right') {
+    channelConfiguration = 'single_mono';
+    channelConfigLabel = 'Mono Canal D (Manual / Preset)';
+    channelConfigDetail = `Áudio mono extraído exclusivamente do Canal Direito.`;
+  } else if (isGhostChannelDetected) {
     channelConfiguration = 'single_mono';
     channelConfigLabel = isRightGhost
       ? 'Gravação Originalmente Mono (Canal D Morto / Hiss)'
@@ -409,7 +434,7 @@ export function analyzeTapeAzimuth(audioBuffer: AudioBuffer): TapeAzimuthAnalysi
       ? 'Gravação Atual Mono (Dual-Mono Digital)'
       : 'Mono em 2 Trilhas (Fita 1/4" Two-Track / Ampex)';
     channelConfigDetail = isModernMonoRecording
-      ? `Gravação digital em 2 canais idênticos (Correlação 100%, S/M ${sideToMidDb} dB). Sem danos de fita: pronta para masterização direta.`
+      ? `Gravação digital em 2 canais idênticos (Correlação ${(phaseCorrAfter * 100).toFixed(1)}%, S/M ${sideToMidDb} dB). Sem danos de fita: pronta para masterização direta.`
       : `Material Mono em 2 Trilhas (Two-Track / Ampex) detectado (Correlação ${Math.round(phaseCorrAfter * 100)}%, S/M ${sideToMidDb} dB). Reconstrução cruzada e alinhamento anti-flanger recomendados para reparar falhas de óxido.`;
   } else {
     channelConfiguration = 'stereo';

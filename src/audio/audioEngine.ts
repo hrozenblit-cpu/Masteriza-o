@@ -12,6 +12,7 @@ import {
   SpectralDenoiseSettings,
   DEFAULT_DENOISE_SETTINGS,
   processBufferWithSpectralDenoise,
+  createAudioBufferSafe,
   analyzeTapeNoise,
   NoiseAnalysisTelemetry,
   learnNoiseProfileFromBuffer,
@@ -31,8 +32,7 @@ export class AudioEngine {
   private analyser: AnalyserNode | null = null;
   private sumBusNode: GainNode | null = null;
   private monitorGain: GainNode | null = null; // Independent monitor listening attenuator
-  private dacSafetyLimiter: DynamicsCompressorNode | null = null; // Hardware DAC True-Peak Safety Ceiling (prevents USB audio interface & WASAPI clipping)
-  private userVolume: number = 0.90; // Default 0.90 (-1.0 dB True-Peak Safe Headroom for external USB Audio Interfaces)
+  private userVolume: number = 0.70; // Default 0.70 (-3.1 dB True-Peak Safe Headroom for external USB Audio Interfaces & DACs)
 
   // Multitrack Stems Summing & Acoustic Touch
   private stems: AudioStem[] = [];
@@ -74,6 +74,7 @@ export class AudioEngine {
   private pristineRawBuffer: AudioBuffer | null = null;
   private rawBuffer: AudioBuffer | null = null;
   private masteredBuffer: AudioBuffer | null = null;
+  private deltaNoiseBuffer: AudioBuffer | null = null;
   private isCompareOriginal: boolean = false;
   private renderDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private isRenderingMaster: boolean = false;
@@ -82,6 +83,9 @@ export class AudioEngine {
 
   // Real-time Mastering DSP Chain Nodes (Instant 0ms audio playback on tracks of ANY length)
   private dspInputNode: GainNode | null = null;
+  private dspRumbleNode: BiquadFilterNode | null = null;
+  private dspHumNotchNode1: BiquadFilterNode | null = null;
+  private dspHumNotchNode2: BiquadFilterNode | null = null;
   private dspDeHarshNode: BiquadFilterNode | null = null;
   private dspLowWarmthNode: BiquadFilterNode | null = null;
   private dspTapeSatNode: WaveShaperNode | null = null;
@@ -211,27 +215,36 @@ export class AudioEngine {
     this.splitterNode.connect(this.analyserR, 1); // 1 = Right Channel
 
     // Output chain to Physical DAC / USB Audio Interface:
-    // analyser -> monitorGain -> dacSafetyLimiter -> destination
+    // analyser -> monitorGain -> destination (Direct Bit-for-Bit studio transparency)
+    // The master buffer is already peak-limited with precision lookahead True-Peak protection.
+    // Routing monitorGain directly to destination guarantees 100% distortion-free playback,
+    // exactly identical to opening the exported WAV in iZotope RX or Pro Tools.
     this.monitorGain = ctx.createGain();
     this.monitorGain.gain.setValueAtTime(this.userVolume, ctx.currentTime);
 
-    // Hardware DAC Anti-Clip Brickwall Protection Node:
-    // Pure brickwall safety ceiling at -0.1 dBFS: never compresses nominal playback peaks (-1.0 dBTP),
-    // strictly acting as a transparent safeguard against physical USB DAC clipping.
-    this.dacSafetyLimiter = ctx.createDynamicsCompressor();
-    this.dacSafetyLimiter.threshold.setValueAtTime(-0.1, ctx.currentTime); // -0.1 dBFS safety ceiling
-    this.dacSafetyLimiter.knee.setValueAtTime(0.0, ctx.currentTime);       // Hard knee: completely transparent for all signals below -0.1 dBFS
-    this.dacSafetyLimiter.ratio.setValueAtTime(20, ctx.currentTime);       // Transparent limiting ratio
-    this.dacSafetyLimiter.attack.setValueAtTime(0.001, ctx.currentTime);   // 1ms ultra-fast attack
-    this.dacSafetyLimiter.release.setValueAtTime(0.02, ctx.currentTime);   // 20ms transparent release
-
     this.analyser.connect(this.monitorGain);
-    this.monitorGain.connect(this.dacSafetyLimiter);
-    this.dacSafetyLimiter.connect(ctx.destination);
+    this.monitorGain.connect(ctx.destination);
 
     // Real-Time Mastering DSP Chain (zero latency, instant playback on 65-min files):
-    // (active audio source) -> dspInputNode -> deHarsh -> lowWarmth -> tapeSat -> airExciter -> orbanShelf -> masterGain -> sumBusNode
+    // (active audio source) -> dspInputNode -> dspRumbleNode -> dspHumNotchNode1 -> dspHumNotchNode2 -> deHarsh -> lowWarmth -> tapeSat -> airExciter -> orbanShelf -> masterGain -> sumBusNode
     this.dspInputNode = ctx.createGain();
+
+    this.dspRumbleNode = ctx.createBiquadFilter();
+    this.dspRumbleNode.type = 'highpass';
+    this.dspRumbleNode.frequency.setValueAtTime(18, ctx.currentTime);
+    this.dspRumbleNode.Q.setValueAtTime(0.7071, ctx.currentTime);
+
+    this.dspHumNotchNode1 = ctx.createBiquadFilter();
+    this.dspHumNotchNode1.type = 'peaking';
+    this.dspHumNotchNode1.frequency.setValueAtTime(60, ctx.currentTime);
+    this.dspHumNotchNode1.Q.setValueAtTime(50, ctx.currentTime);
+    this.dspHumNotchNode1.gain.setValueAtTime(0, ctx.currentTime);
+
+    this.dspHumNotchNode2 = ctx.createBiquadFilter();
+    this.dspHumNotchNode2.type = 'peaking';
+    this.dspHumNotchNode2.frequency.setValueAtTime(120, ctx.currentTime);
+    this.dspHumNotchNode2.Q.setValueAtTime(45, ctx.currentTime);
+    this.dspHumNotchNode2.gain.setValueAtTime(0, ctx.currentTime);
 
     this.dspDeHarshNode = ctx.createBiquadFilter();
     this.dspDeHarshNode.type = 'peaking';
@@ -261,7 +274,10 @@ export class AudioEngine {
     this.dspMasterGainNode = ctx.createGain();
     this.dspMasterGainNode.gain.setValueAtTime(1.0, ctx.currentTime);
 
-    this.dspInputNode.connect(this.dspDeHarshNode);
+    this.dspInputNode.connect(this.dspRumbleNode);
+    this.dspRumbleNode.connect(this.dspHumNotchNode1);
+    this.dspHumNotchNode1.connect(this.dspHumNotchNode2);
+    this.dspHumNotchNode2.connect(this.dspDeHarshNode);
     this.dspDeHarshNode.connect(this.dspLowWarmthNode);
     this.dspLowWarmthNode.connect(this.dspTapeSatNode);
     this.dspTapeSatNode.connect(this.dspAirExciterNode);
@@ -284,6 +300,57 @@ export class AudioEngine {
     }
     const ctx = this.ctx;
     const s = this.currentSettings;
+    const denoiseActive = this.tapeDenoiseSettings.enabled;
+    const isDeltaSolo = this.tapeDenoiseSettings.listenNoiseDeltaOnly;
+
+    // 0. Anti-Sopro Grave & Subsonic Rumble Filter (Highpass)
+    // The spectral engine already applies zero-phase dynamic rumble removal before synthesis.
+    // Keeping dspRumbleNode at sub-acoustic 10Hz avoids any time-domain IIR phase rotation or bass leakage!
+    if (this.dspRumbleNode) {
+      this.dspRumbleNode.frequency.setTargetAtTime(10, ctx.currentTime, 0.015);
+      this.dspRumbleNode.Q.setTargetAtTime(0.7071, ctx.currentTime, 0.015);
+    }
+
+    // 0.1 Ground Loop AC Hum Notch Filters (Peaking cuts with controlled -16 dB depth & narrow Q=50)
+    // During Delta Solo, keep hum notches bypassed (0 dB) so the user hears the raw extracted hum without coloration.
+    if (this.dspHumNotchNode1 && this.dspHumNotchNode2) {
+      const humFilter = this.tapeDenoiseSettings.humNotchFilter || 'none';
+      if (!denoiseActive || isDeltaSolo || humFilter === 'none') {
+        this.dspHumNotchNode1.gain.setTargetAtTime(0, ctx.currentTime, 0.015);
+        this.dspHumNotchNode2.gain.setTargetAtTime(0, ctx.currentTime, 0.015);
+      } else if (humFilter === '60hz_us_br') {
+        this.dspHumNotchNode1.type = 'peaking';
+        this.dspHumNotchNode1.frequency.setTargetAtTime(60, ctx.currentTime, 0.015);
+        this.dspHumNotchNode1.Q.setTargetAtTime(50, ctx.currentTime, 0.015);
+        this.dspHumNotchNode1.gain.setTargetAtTime(-16, ctx.currentTime, 0.015);
+
+        this.dspHumNotchNode2.type = 'peaking';
+        this.dspHumNotchNode2.frequency.setTargetAtTime(120, ctx.currentTime, 0.015);
+        this.dspHumNotchNode2.Q.setTargetAtTime(45, ctx.currentTime, 0.015);
+        this.dspHumNotchNode2.gain.setTargetAtTime(-12, ctx.currentTime, 0.015);
+      } else if (humFilter === '50hz_eu') {
+        this.dspHumNotchNode1.type = 'peaking';
+        this.dspHumNotchNode1.frequency.setTargetAtTime(50, ctx.currentTime, 0.015);
+        this.dspHumNotchNode1.Q.setTargetAtTime(50, ctx.currentTime, 0.015);
+        this.dspHumNotchNode1.gain.setTargetAtTime(-16, ctx.currentTime, 0.015);
+
+        this.dspHumNotchNode2.type = 'peaking';
+        this.dspHumNotchNode2.frequency.setTargetAtTime(100, ctx.currentTime, 0.015);
+        this.dspHumNotchNode2.Q.setTargetAtTime(45, ctx.currentTime, 0.015);
+        this.dspHumNotchNode2.gain.setTargetAtTime(-12, ctx.currentTime, 0.015);
+      }
+    }
+
+    // When listening to Delta solo, completely bypass downstream mastering coloration
+    if (isDeltaSolo) {
+      this.dspDeHarshNode.gain.setTargetAtTime(0, ctx.currentTime, 0.015);
+      this.dspLowWarmthNode.gain.setTargetAtTime(0, ctx.currentTime, 0.015);
+      this.dspTapeSatNode.curve = this.createSaturationCurve(0, true) as Float32Array<ArrayBuffer>;
+      this.dspAirExciterNode.gain.setTargetAtTime(0, ctx.currentTime, 0.015);
+      this.dspOrbanShelfNode.gain.setTargetAtTime(0, ctx.currentTime, 0.015);
+      this.dspMasterGainNode.gain.setTargetAtTime(1.0, ctx.currentTime, 0.015);
+      return;
+    }
 
     // 1. De-Harsh Notch
     this.dspDeHarshNode.frequency.setTargetAtTime(s.notchFrequencyHz || 3400, ctx.currentTime, 0.015);
@@ -310,13 +377,19 @@ export class AudioEngine {
     this.dspOrbanShelfNode.frequency.setTargetAtTime(s.orbanHfCrossoverHz || 6000, ctx.currentTime, 0.015);
     this.dspOrbanShelfNode.gain.setTargetAtTime(orbanGain, ctx.currentTime, 0.015);
 
-    // 6. Master Output & Target LUFS Make-up Gain
-    let totalGainDb = s.outputGainDb || 0;
-    if (s.limitlessEnabled !== false && !s.limitlessBypass && s.targetLufs !== undefined && this.trackLoudnessMetrics) {
+    // 6. Master Output & Real-time Live Audition Gain
+    // When playing in real-time preview (e.g. tracks > 5min or while masteredBuffer is computing),
+    // apply the target LUFS make-up gain so the user immediately hears the mastered loudness!
+    let totalPreviewGainDb = s.outputGainDb || 0;
+    const isLimitlessBypassed = !!s.limitlessBypass || s.limitlessEnabled === false;
+
+    if (!isLimitlessBypassed && s.targetLufs !== undefined && this.trackLoudnessMetrics) {
       const deltaDb = s.targetLufs - this.trackLoudnessMetrics.integratedLufs;
-      totalGainDb += Math.max(-12, Math.min(14, deltaDb));
+      // Clamp deltaDb to a sensible mastering range (-12 dB to +14 dB)
+      totalPreviewGainDb += Math.max(-12, Math.min(14, deltaDb));
     }
-    const linearGain = Math.pow(10, totalGainDb / 20);
+
+    const linearGain = Math.pow(10, totalPreviewGainDb / 20);
     this.dspMasterGainNode.gain.setTargetAtTime(linearGain, ctx.currentTime, 0.015);
   }
 
@@ -365,6 +438,7 @@ export class AudioEngine {
     this.rawBuffer = null;
     this.pristineRawBuffer = null;
     this.masteredBuffer = null;
+    this.deltaNoiseBuffer = null;
     this.tapeDropoutAnalysis = null;
     this.trackLoudnessMetrics = null;
     this.tapeDenoiseTelemetry = null;
@@ -394,6 +468,7 @@ export class AudioEngine {
     this.rawBuffer = buffer;
     this.pristineRawBuffer = pristine || buffer;
     this.masteredBuffer = null;
+    this.deltaNoiseBuffer = null;
     this.tapeDropoutAnalysis = analysis || null;
     this.tapeDenoiseTelemetry = null;
     this.stems = [];
@@ -462,7 +537,7 @@ export class AudioEngine {
   public updateSettings(newSettings: Partial<HumanizerSettings>) {
     this.currentSettings = { ...this.currentSettings, ...newSettings };
     this.updateRealtimeDspNodes();
-    if (this.rawBuffer && this.rawBuffer.duration <= 300) {
+    if (this.rawBuffer) {
       this.scheduleMasterRender();
     }
   }
@@ -474,7 +549,7 @@ export class AudioEngine {
   public updateTapeAzimuthSettings(newSettings: Partial<TapeAzimuthSettings>) {
     this.tapeAzimuthSettings = { ...this.tapeAzimuthSettings, ...newSettings };
     this.updateRealtimeDspNodes();
-    if (this.rawBuffer && this.rawBuffer.duration <= 300) {
+    if (this.rawBuffer) {
       this.scheduleMasterRender();
     }
   }
@@ -486,7 +561,7 @@ export class AudioEngine {
   public updateTapeDropoutSettings(newSettings: Partial<TapeDropoutSettings>) {
     this.tapeDropoutSettings = { ...this.tapeDropoutSettings, ...newSettings };
     this.updateRealtimeDspNodes();
-    if (this.rawBuffer && this.rawBuffer.duration <= 300) {
+    if (this.rawBuffer) {
       this.scheduleMasterRender();
     }
   }
@@ -504,10 +579,83 @@ export class AudioEngine {
     return { ...this.tapeDenoiseSettings };
   }
 
+  public getDeltaNoiseBuffer(): AudioBuffer | null {
+    return this.deltaNoiseBuffer;
+  }
+
+  public getOrCreateDeltaNoiseBuffer(): AudioBuffer | null {
+    if (this.deltaNoiseBuffer) return this.deltaNoiseBuffer;
+    const src = this.rawBuffer || this.pristineRawBuffer;
+    if (!src) return null;
+    const cleaned = processBufferWithSpectralDenoise(src, {
+      ...this.tapeDenoiseSettings,
+      listenNoiseDeltaOnly: false,
+      enabled: true,
+    });
+    const numChannels = src.numberOfChannels;
+    const totalLen = src.length;
+    const sampleRate = src.sampleRate;
+    const deltaBuffer = createAudioBufferSafe(numChannels, totalLen, sampleRate);
+    for (let c = 0; c < numChannels; c++) {
+      const srcData = src.getChannelData(c);
+      const clnData = cleaned.getChannelData(c);
+      const dltData = deltaBuffer.getChannelData(c);
+      for (let i = 0; i < totalLen; i++) {
+        const d = (srcData[i] - clnData[i]) * 10.0;
+        dltData[i] = d > 1.0 ? 1.0 : (d < -1.0 ? -1.0 : d);
+      }
+    }
+    this.deltaNoiseBuffer = deltaBuffer;
+    return this.deltaNoiseBuffer;
+  }
+
   public updateTapeDenoiseSettings(newSettings: Partial<SpectralDenoiseSettings>) {
+    const prevDelta = this.tapeDenoiseSettings.listenNoiseDeltaOnly;
+    const nextDelta = newSettings.listenNoiseDeltaOnly !== undefined ? newSettings.listenNoiseDeltaOnly : prevDelta;
+
+    // Check if only the audition mode (listenNoiseDeltaOnly) is being changed
+    const isOnlyDeltaToggle =
+      newSettings.listenNoiseDeltaOnly !== undefined &&
+      newSettings.listenNoiseDeltaOnly !== prevDelta &&
+      Object.keys(newSettings).every(
+        (k) =>
+          k === 'listenNoiseDeltaOnly' ||
+          k === 'enabled' ||
+          (k === 'reductionDb' && (newSettings[k] === this.tapeDenoiseSettings.reductionDb || this.tapeDenoiseSettings.reductionDb > 0))
+      );
+
     this.tapeDenoiseSettings = { ...this.tapeDenoiseSettings, ...newSettings };
     this.updateRealtimeDspNodes();
-    if (this.rawBuffer && this.rawBuffer.duration <= 300) {
+
+    if (isOnlyDeltaToggle) {
+      // INSTANT 0ms AUDITION HOT-SWAP WITHOUT RE-RENDERING!
+      if (nextDelta) {
+        // Entering Máscara Delta Solo: play isolated noise mask with +20 dB boost
+        const deltaBuf = this.getOrCreateDeltaNoiseBuffer();
+        if (this.isPlaying && deltaBuf) {
+          const curTime = this.getCurrentPlaybackTime();
+          this.startSourceWithBuffer(deltaBuf, curTime, true);
+        }
+      } else {
+        // Exiting Máscara Delta back to Treated Master
+        const targetBuf = this.isCompareOriginal
+          ? (this.pristineRawBuffer || this.rawBuffer)
+          : (this.masteredBuffer || this.rawBuffer);
+        if (this.isPlaying && targetBuf) {
+          const curTime = this.getCurrentPlaybackTime();
+          this.startSourceWithBuffer(targetBuf, curTime, true);
+        }
+        // If master buffer was not cached or track is ready, ensure master render is triggered
+        if (!this.masteredBuffer && this.rawBuffer && this.rawBuffer.duration <= 300) {
+          this.scheduleMasterRender();
+        }
+      }
+      return;
+    }
+
+    // Actual DSP algorithm parameters changed (e.g. reductionDb, noise profile, hum filter, rumble filter)
+    this.deltaNoiseBuffer = null;
+    if (this.rawBuffer) {
       this.scheduleMasterRender();
     }
   }
@@ -537,10 +685,10 @@ export class AudioEngine {
       this.tapeDenoiseTelemetry.quietestSegmentDurationSec = res.durationSec;
       this.tapeDenoiseTelemetry.hissNoiseFloorDb = res.hissNoiseFloorDb;
     }
+    this.deltaNoiseBuffer = null;
     this.scheduleMasterRender();
     return res.profileBands;
   }
-
 
   public getOrbanTrebleTelemetry(buffer?: AudioBuffer): OrbanTrebleTelemetry | null {
     const target = buffer || this.rawBuffer;
@@ -552,8 +700,6 @@ export class AudioEngine {
     if (!this.rawBuffer) {
       return;
     }
-    // For long tracks (> 5 min), never schedule background offline renders during live editing.
-    // The real-time WebAudio DSP nodes handle live listening with 0ms latency and 0 RAM overhead.
     if (this.rawBuffer.duration > 300) {
       this.updateRealtimeDspNodes();
       return;
@@ -563,7 +709,7 @@ export class AudioEngine {
     }
     this.renderDebounceTimer = setTimeout(() => {
       this.triggerMasterRender().catch(() => {});
-    }, 45);
+    }, 60);
   }
 
   public onMasterRendered(cb: (buf: AudioBuffer) => void): () => void {
@@ -591,8 +737,6 @@ export class AudioEngine {
     if (!sourceToRender) {
       return null;
     }
-    // For long tracks (> 5 min), never run heavy offline rendering in background during playback/preset tweaks.
-    // Real-time WebAudio DSP handles live playback with 0ms latency and 0 RAM overhead.
     if (sourceToRender.duration > 300) {
       this.updateRealtimeDspNodes();
       return sourceToRender;
@@ -624,9 +768,23 @@ export class AudioEngine {
       this.masteredBuffer = rendered;
 
       // If currently playing in Mastered mode, seamlessly crossfade to the updated master
-      if (this.isPlaying && !this.isCompareOriginal && this.sourceNode) {
+      if (
+        this.isPlaying &&
+        !this.isCompareOriginal &&
+        !this.tapeDenoiseSettings.listenNoiseDeltaOnly &&
+        this.sourceNode
+      ) {
         const curTime = this.getCurrentPlaybackTime();
         this.startSourceWithBuffer(rendered, curTime, true);
+      } else if (
+        this.isPlaying &&
+        !this.isCompareOriginal &&
+        this.tapeDenoiseSettings.listenNoiseDeltaOnly &&
+        this.deltaNoiseBuffer &&
+        this.sourceNode
+      ) {
+        const curTime = this.getCurrentPlaybackTime();
+        this.startSourceWithBuffer(this.deltaNoiseBuffer, curTime, true);
       }
 
       for (const listener of this.masterRenderListeners) {
@@ -659,9 +817,18 @@ export class AudioEngine {
     this.isCompareOriginal = compareOriginal;
 
     if (this.isPlaying && this.rawBuffer) {
-      const targetBuffer = compareOriginal ? (this.pristineRawBuffer || this.rawBuffer) : (this.masteredBuffer || this.rawBuffer);
-      const curTime = this.getCurrentPlaybackTime();
-      this.startSourceWithBuffer(targetBuffer, curTime, true);
+      let targetBuffer: AudioBuffer | null = null;
+      if (this.isCompareOriginal) {
+        targetBuffer = this.pristineRawBuffer || this.rawBuffer;
+      } else if (this.tapeDenoiseSettings.listenNoiseDeltaOnly) {
+        targetBuffer = this.getOrCreateDeltaNoiseBuffer() || this.masteredBuffer || this.rawBuffer;
+      } else {
+        targetBuffer = this.masteredBuffer || this.rawBuffer;
+      }
+      if (targetBuffer) {
+        const curTime = this.getCurrentPlaybackTime();
+        this.startSourceWithBuffer(targetBuffer, curTime, true);
+      }
     }
   }
 
@@ -682,20 +849,31 @@ export class AudioEngine {
     }
 
     const isLongTrack = (this.rawBuffer?.duration || 0) > 300;
-    const activeBuf = this.isCompareOriginal
-      ? (this.pristineRawBuffer || this.rawBuffer!)
-      : (!isLongTrack && this.masteredBuffer ? this.masteredBuffer : (this.rawBuffer!));
+    let activeBuf: AudioBuffer | null = null;
+
+    if (this.tapeDenoiseSettings.listenNoiseDeltaOnly) {
+      activeBuf = this.getOrCreateDeltaNoiseBuffer() || this.masteredBuffer || this.rawBuffer;
+    } else if (this.isCompareOriginal) {
+      activeBuf = this.pristineRawBuffer || this.rawBuffer;
+    } else {
+      activeBuf = this.masteredBuffer || this.rawBuffer;
+    }
 
     if (activeBuf) {
       this.startSourceWithBuffer(activeBuf, offsetSeconds, false);
       this.isPlaying = true;
     }
 
-    // For short tracks only (<= 300s): if master buffer is not ready yet, render it in background and hot-swap
     if (!this.masteredBuffer && this.rawBuffer && !isLongTrack) {
       const playTrackId = this.currentTrackId;
       this.triggerMasterRender().then((mastered) => {
-        if (mastered && this.currentTrackId === playTrackId && this.isPlaying && !this.isCompareOriginal) {
+        if (
+          mastered &&
+          this.currentTrackId === playTrackId &&
+          this.isPlaying &&
+          !this.isCompareOriginal &&
+          !this.tapeDenoiseSettings.listenNoiseDeltaOnly
+        ) {
           const curTime = this.getCurrentPlaybackTime();
           this.startSourceWithBuffer(mastered, curTime, true);
         }
@@ -711,20 +889,31 @@ export class AudioEngine {
     }
 
     const isLongTrack = ((buffer || this.rawBuffer)?.duration || 0) > 300;
-    const activeBuf = this.isCompareOriginal
-      ? (this.pristineRawBuffer || this.rawBuffer || buffer)
-      : (!isLongTrack && this.masteredBuffer ? this.masteredBuffer : (this.rawBuffer || buffer));
+    let activeBuf: AudioBuffer | null = null;
+
+    if (this.tapeDenoiseSettings.listenNoiseDeltaOnly) {
+      activeBuf = this.getOrCreateDeltaNoiseBuffer() || this.masteredBuffer || this.rawBuffer || (buffer ?? null);
+    } else if (this.isCompareOriginal) {
+      activeBuf = this.pristineRawBuffer || this.rawBuffer || (buffer ?? null);
+    } else {
+      activeBuf = this.masteredBuffer || this.rawBuffer || (buffer ?? null);
+    }
 
     if (activeBuf) {
       this.startSourceWithBuffer(activeBuf, offsetSeconds, false);
       this.isPlaying = true;
     }
 
-    // For short tracks only (<= 300s): if master buffer is not ready yet, render it in background and hot-swap
     if (!this.masteredBuffer && (this.rawBuffer || buffer) && !isLongTrack) {
       const playTrackId = this.currentTrackId;
       this.triggerMasterRender().then((mastered) => {
-        if (mastered && this.currentTrackId === playTrackId && this.isPlaying && !this.isCompareOriginal) {
+        if (
+          mastered &&
+          this.currentTrackId === playTrackId &&
+          this.isPlaying &&
+          !this.isCompareOriginal &&
+          !this.tapeDenoiseSettings.listenNoiseDeltaOnly
+        ) {
           const curTime = this.getCurrentPlaybackTime();
           this.startSourceWithBuffer(mastered, curTime, true);
         }
@@ -792,10 +981,12 @@ export class AudioEngine {
 
     if (crossfade && oldGain && oldSrc) {
       // 20ms linear crossfade: eliminates any clicks or pops without non-linear volume burst
+      newGain.gain.cancelScheduledValues(ctx.currentTime);
       newGain.gain.setValueAtTime(0, ctx.currentTime);
       newGain.gain.linearRampToValueAtTime(1.0, ctx.currentTime + 0.02);
 
       const curVal = oldGain.gain.value;
+      oldGain.gain.cancelScheduledValues(ctx.currentTime);
       oldGain.gain.setValueAtTime(curVal, ctx.currentTime);
       oldGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.02);
 
@@ -838,6 +1029,7 @@ export class AudioEngine {
         this.allActiveGains.delete(oldGain);
       }
       // Micro-ramp (6ms) eliminates abrupt waveform step clicks on start/seek
+      newGain.gain.cancelScheduledValues(ctx.currentTime);
       newGain.gain.setValueAtTime(0, ctx.currentTime);
       newGain.gain.linearRampToValueAtTime(1.0, ctx.currentTime + 0.006);
     }
@@ -845,12 +1037,13 @@ export class AudioEngine {
     newSrc.connect(newGain);
 
     // Dynamic Real-time Audio Routing:
-    // 1. If comparing original (Dry): bypass real-time DSP and connect directly to sumBusNode.
+    // 1. If comparing original (Dry) or listening to Delta mask: bypass real-time DSP and connect directly to sumBusNode.
     // 2. If buffer is an offline pre-rendered master: connect directly to sumBusNode (no double-processing).
     // 3. If playing rawBuffer in Master mode (e.g. long files > 5min or instant preview):
     //    route through real-time WebAudio DSP chain (de-harsh, warmth, tape sat, air, orban, master gain).
     const isPlayingRawInMaster =
       !this.isCompareOriginal &&
+      !this.tapeDenoiseSettings.listenNoiseDeltaOnly &&
       (!this.masteredBuffer || buffer === this.rawBuffer || buffer === this.pristineRawBuffer);
 
     if (isPlayingRawInMaster && this.dspInputNode) {
@@ -1209,6 +1402,108 @@ export class AudioEngine {
     };
   }
 
+/**
+ * Elliptical Mono-Bass Processor
+ * Collapses stereo Side information to pure mono below cutoff frequency (e.g. 90 Hz for Trap/Bass).
+ * Eliminates out-of-phase low-end cancellation, giving solid, punchy, centered sub-bass and 808s.
+ */
+  private applyMonoBassEllipticalFilter(buffer: AudioBuffer, cutoffHz: number): AudioBuffer {
+    if (buffer.numberOfChannels < 2 || cutoffHz <= 20) return buffer;
+    const sampleRate = buffer.sampleRate;
+    const length = buffer.length;
+    const numChannels = buffer.numberOfChannels;
+
+    const outBuf = createAudioBufferSafe(numChannels, length, sampleRate);
+    const fc = Math.max(30, Math.min(250, cutoffHz));
+    // Unconditionally stable 1st-order highpass on Side channel
+    const alpha = 1.0 / (1.0 + (2.0 * Math.PI * fc) / sampleRate);
+
+    const leftSrc = buffer.getChannelData(0);
+    const rightSrc = buffer.getChannelData(1);
+    const leftDst = outBuf.getChannelData(0);
+    const rightDst = outBuf.getChannelData(1);
+
+    let prevS = 0;
+    let prevOut = 0;
+
+    for (let i = 0; i < length; i++) {
+      const l = leftSrc[i];
+      const r = rightSrc[i];
+      const m = 0.5 * (l + r);
+      const s = 0.5 * (l - r);
+
+      const sFilt = alpha * (prevOut + s - prevS);
+      prevS = s;
+      prevOut = sFilt;
+
+      leftDst[i] = m + sFilt;
+      rightDst[i] = m - sFilt;
+    }
+
+    for (let c = 2; c < numChannels; c++) {
+      outBuf.getChannelData(c).set(buffer.getChannelData(c));
+    }
+
+    return outBuf;
+  }
+
+  /**
+   * Dynamic Transient Punch Processor
+   * Sharpens percussive attacks (kick drum, 808 transient smack, snare snap)
+   * using dual envelope differential detection without digital clipping.
+   */
+  private applyTransientPunchProcessing(buffer: AudioBuffer, punchAmount: number): AudioBuffer {
+    if (punchAmount <= 0) return buffer;
+    const sampleRate = buffer.sampleRate;
+    const length = buffer.length;
+    const numChannels = buffer.numberOfChannels;
+
+    const outBuf = createAudioBufferSafe(numChannels, length, sampleRate);
+    const amountNorm = Math.min(100, Math.max(0, punchAmount)) / 100;
+
+    // Fast detector: 2ms attack, 20ms release
+    const fastAtkCoeff = Math.exp(-1.0 / (0.002 * sampleRate));
+    const fastRelCoeff = Math.exp(-1.0 / (0.020 * sampleRate));
+
+    // Slow detector: 25ms attack, 80ms release
+    const slowAtkCoeff = Math.exp(-1.0 / (0.025 * sampleRate));
+    const slowRelCoeff = Math.exp(-1.0 / (0.080 * sampleRate));
+
+    let envFast = 0;
+    let envSlow = 0;
+
+    const channels: Float32Array[] = [];
+    const dstChannels: Float32Array[] = [];
+    for (let c = 0; c < numChannels; c++) {
+      channels.push(buffer.getChannelData(c));
+      dstChannels.push(outBuf.getChannelData(c));
+    }
+
+    for (let i = 0; i < length; i++) {
+      let peak = 0;
+      for (let c = 0; c < numChannels; c++) {
+        const a = Math.abs(channels[c][i]);
+        if (a > peak) peak = a;
+      }
+
+      if (peak > envFast) envFast = fastAtkCoeff * envFast + (1 - fastAtkCoeff) * peak;
+      else envFast = fastRelCoeff * envFast + (1 - fastRelCoeff) * peak;
+
+      if (peak > envSlow) envSlow = slowAtkCoeff * envSlow + (1 - slowAtkCoeff) * peak;
+      else envSlow = slowRelCoeff * envSlow + (1 - slowRelCoeff) * peak;
+
+      const diff = Math.max(0, envFast - envSlow);
+      // Gentle punch accentuation: maximum +1.0 dB (1.12x) on sharp attacks without clipping
+      const punchGain = 1.0 + amountNorm * 0.12 * Math.min(1.0, diff / Math.max(0.02, envSlow));
+
+      for (let c = 0; c < numChannels; c++) {
+        dstChannels[c][i] = channels[c][i] * punchGain;
+      }
+    }
+
+    return outBuf;
+  }
+
   /**
    * Master Rendering Engine (Used for both real-time player and offline WAV export)
    * Guarantees 100% Bit-for-Bit parity between app playback and exported WAV file.
@@ -1265,11 +1560,31 @@ export class AudioEngine {
 
     // 0.2 Pre-Mastering Stage: Sonic Solutions NoNoise / iZotope RX Spectral De-noise
     const denoiseToUse = customDenoiseSettings || this.tapeDenoiseSettings;
-    if (denoiseToUse.enabled || denoiseToUse.listenNoiseDeltaOnly) {
-      sourceBuffer = processBufferWithSpectralDenoise(sourceBuffer, denoiseToUse);
-    }
-    if (denoiseToUse.listenNoiseDeltaOnly) {
-      return sourceBuffer;
+    if (denoiseToUse.enabled) {
+      // 1. Generate clean audio once for downstream mastering
+      const cleanedBuffer = processBufferWithSpectralDenoise(sourceBuffer, {
+        ...denoiseToUse,
+        listenNoiseDeltaOnly: false,
+      });
+
+      // 2. Compute and cache isolated noise mask with +20 dB boost for instantaneous 0ms audition
+      const numChannels = sourceBuffer.numberOfChannels;
+      const totalLen = sourceBuffer.length;
+      const sampleRate = sourceBuffer.sampleRate;
+      const deltaBuffer = createAudioBufferSafe(numChannels, totalLen, sampleRate);
+      for (let c = 0; c < numChannels; c++) {
+        const srcData = sourceBuffer.getChannelData(c);
+        const clnData = cleanedBuffer.getChannelData(c);
+        const dltData = deltaBuffer.getChannelData(c);
+        for (let i = 0; i < totalLen; i++) {
+          const d = (srcData[i] - clnData[i]) * 10.0;
+          dltData[i] = d > 1.0 ? 1.0 : (d < -1.0 ? -1.0 : d);
+        }
+      }
+      this.deltaNoiseBuffer = deltaBuffer;
+      sourceBuffer = cleanedBuffer;
+    } else {
+      this.deltaNoiseBuffer = null;
     }
 
     const sampleRate = targetSampleRate || sourceBuffer.sampleRate;
@@ -1327,6 +1642,18 @@ export class AudioEngine {
 
     source.start(0);
     let renderedBuffer = await offlineCtx.startRendering();
+
+    // 5.0a Elliptical Mono-Bass Sub Control (Sub/808 tightening below cutoffHz)
+    const monoCutoff = settings.monoBassCutoffHz || 0;
+    if (monoCutoff > 20 && renderedBuffer.numberOfChannels >= 2) {
+      renderedBuffer = this.applyMonoBassEllipticalFilter(renderedBuffer, monoCutoff);
+    }
+
+    // 5.0b Dynamic Transient Punch Shaper (Kick & 808 transient smack)
+    const punchAmt = settings.transientPunch || 0;
+    if (punchAmt > 0 && !settings.transientBypass) {
+      renderedBuffer = this.applyTransientPunchProcessing(renderedBuffer, punchAmt);
+    }
 
     // 5.1 Processador Inteligente de Agudos (Flat Input Response & HF Limiter)
     const isOrbanEnabled = settings.orbanHfEnabled !== false;

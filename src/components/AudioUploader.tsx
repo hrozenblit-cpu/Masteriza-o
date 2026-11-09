@@ -34,6 +34,8 @@ interface AudioUploaderProps {
   onUpdateArtistName?: (artist: string) => void;
   targetLufs?: number;
   currentPresetName?: string;
+  currentPresetReason?: string;
+  onOpenPresets?: () => void;
   onReanalyze?: () => void;
 }
 
@@ -60,6 +62,8 @@ export function AudioUploader({
   onUpdateArtistName,
   targetLufs = -14,
   currentPresetName,
+  currentPresetReason,
+  onOpenPresets,
   onReanalyze,
 }: AudioUploaderProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -444,15 +448,25 @@ export function AudioUploader({
                       </span>
                     )}
                     {currentPresetName && (
-                      <span
-                        className="text-[10px] font-mono px-2 py-0.5 rounded border text-cyan-300 bg-cyan-950/60 border-cyan-500/40 flex items-center gap-1 font-semibold whitespace-nowrap"
-                        title="Preset de masterização selecionado e atuando"
+                      <button
+                        type="button"
+                        onClick={onOpenPresets}
+                        className="text-[10px] font-mono px-2 py-0.5 rounded border text-cyan-300 bg-cyan-950/60 hover:bg-cyan-900/60 border-cyan-500/40 flex items-center gap-1 font-semibold whitespace-nowrap transition-colors cursor-pointer shadow-xs"
+                        title={currentPresetReason ? `${currentPresetReason} (Clique para trocar o preset)` : 'Clique para ver ou trocar preset de masterização'}
                       >
                         <Bookmark className="w-2.5 h-2.5 text-cyan-400" />
                         <span>Preset: {currentPresetName}</span>
-                      </span>
+                      </button>
                     )}
                   </div>
+                  {currentPresetReason && (
+                    <div className="mt-1.5 text-[11px] text-slate-300 flex items-center gap-1.5 leading-tight">
+                      <Sparkles className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                      <span className="text-slate-300 line-clamp-1" title={currentPresetReason}>
+                        <strong className="text-cyan-300 font-semibold">Escolha Inteligente:</strong> {currentPresetReason}
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
 

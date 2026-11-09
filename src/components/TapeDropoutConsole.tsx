@@ -468,44 +468,25 @@ export function TapeDropoutConsole({
 
               const isAcousticDualMono =
                 azimuthAnalysis?.channelConfiguration === 'dual_mono' ||
-                ((analysis?.isAmpexFullTrackCandidate ?? false) && sideToMidDb <= -26.0) ||
-                sideToMidDb <= -32.0;
+                azimuthAnalysis?.channelConfiguration === 'single_mono' ||
+                (analysis?.isAmpexFullTrackCandidate ?? false) ||
+                sideToMidDb <= -19.0 ||
+                (azimuthAnalysis?.phaseCorrelationAfter ?? 0) >= 0.82;
 
-              const isTapeDualMono = isAcousticDualMono && !isCleanModern;
-
-              if (isCleanModern) {
-                return (
-                  <div className="p-3 rounded-lg bg-gradient-to-r from-emerald-950/60 to-[#0e172a] border border-emerald-700/60 flex flex-col gap-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[11px] font-bold text-emerald-200 flex items-center gap-1.5">
-                        <Disc className="w-3.5 h-3.5 text-emerald-400" />
-                        Gravação Atual Identificada (0 Dropouts de Fita)
-                      </span>
-                      <span className="text-[10px] font-mono text-emerald-300 font-bold px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-800">
-                        {isAcousticDualMono ? 'Dual-Mono Digital' : 'Estéreo Contemporâneo'} (S/M: {sideToMidDb} dB)
-                      </span>
-                    </div>
-                    <p className="text-[10.5px] text-slate-300 leading-relaxed">
-                      ✓ Material contemporâneo sem danos de fita ou desprendimento de óxido. O módulo de dropouts opera em <strong className="text-emerald-300">Bypass Transparente</strong> para preservar 100% da imagem acústica e dinâmica da mixagem original.
-                    </p>
-                  </div>
-                );
-              }
-
-              if (isTapeDualMono) {
+              if (isAcousticDualMono) {
                 return (
                   <div className="p-3 rounded-lg bg-gradient-to-r from-cyan-950/60 to-[#0e172a] border border-cyan-700/60 flex flex-col gap-2">
                     <div className="flex items-center justify-between">
                       <span className="text-[11px] font-bold text-cyan-200 flex items-center gap-1.5">
                         <Disc className="w-3.5 h-3.5 text-cyan-400" />
-                        Identificação: Mono em 2 Canais (Fita 1/4" Ampex / Studer)
+                        Identificação: Mono em 2 Trilhas (Two-Track / Ampex / DVD Ao Vivo)
                       </span>
                       <span className="text-[10px] font-mono text-cyan-300 font-bold px-1.5 py-0.5 rounded bg-cyan-950/80 border border-cyan-800">
-                        S/M: {azimuthAnalysis?.sideToMidDb ?? -26} dB
+                        S/M: {azimuthAnalysis?.sideToMidDb ?? -22} dB
                       </span>
                     </div>
                     <p className="text-[10.5px] text-slate-300 leading-relaxed">
-                      ✓ Material mono detectado em dois canais analógicos. <strong className="text-cyan-200">Não defina Estéreo Independente</strong>: os modos <strong className="text-cyan-200">Ampex Full-Track Cross</strong> ou <strong className="text-purple-300">Estabilizador Mono</strong> reconstroem as falhas com o áudio original limpo do canal oposto, sem estalos e com alinhamento de azimute.
+                      ✓ Material mono gravado em dois canais analógicos. Na recuperação de fita, o estéreo só é aplicado quando os canais são diferentes. Os modos <strong className="text-cyan-200">Ampex Full-Track Cross</strong> ou <strong className="text-purple-300">Estabilizador Mono</strong> reconstroem as falhas com o áudio original limpo do canal oposto, sem estalos e com alinhamento de azimute.
                     </p>
                     <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-cyan-800/40">
                       <button

@@ -127,14 +127,17 @@ export function ModularWorkflowConsole({
   const hasAzimuthOffset = Math.abs(azimuthAnalysis?.azimuthOffsetSamples ?? 0) >= 0.08;
   const hasBalanceOffset = Math.abs(azimuthAnalysis?.levelDiffDb ?? 0) >= 0.35;
 
-  // Genuine acoustic dual-mono (Side energy is negligible: <= -26 dB with 98.5% correlation or <= -32 dB)
+  // Genuine acoustic dual-mono / Mono Two-Track:
+  // Stereo SÓ QUANDO os canais são diferentes! Se contêm a mesma música (S/M <= -19 dB ou Correlação >= 0.82), é Mono Two-Track.
   const isAcousticDualMono =
     !isGhostChannel &&
     !isSplitStereo &&
     (azimuthAnalysis?.channelConfiguration === 'dual_mono' ||
-      ((dropoutAnalysis?.isAmpexFullTrackCandidate ?? false) && sideToMidDb <= -26.0) ||
-      sideToMidDb <= -32.0 ||
-      (phaseCorr >= 0.990 && sideToMidDb <= -26.0));
+      azimuthAnalysis?.channelConfiguration === 'single_mono' ||
+      (dropoutAnalysis?.isAmpexFullTrackCandidate ?? false) ||
+      sideToMidDb <= -19.0 ||
+      (azimuthAnalysis?.phaseCorrelationAfter ?? 0) >= 0.82 ||
+      phaseCorr >= 0.80);
 
   // Modern clean recording: zero dropouts, clean noise floor, no mechanical azimuth skew
   const isCleanModernRecording =
@@ -953,12 +956,13 @@ export function ModularWorkflowConsole({
                 </span>
               </label>
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-xs font-mono">
                 {[
                   { lufs: -14.0, label: '-14 LUFS', desc: 'Spotify / YouTube' },
                   { lufs: -16.0, label: '-16 LUFS', desc: 'Audiófilo / Apple' },
                   { lufs: -12.0, label: '-12 LUFS', desc: 'CD Moderno' },
                   { lufs: -10.0, label: '-10 LUFS', desc: 'Competitivo Alto' },
+                  { lufs: -8.0, label: '-8 LUFS', desc: 'Trap & Bass' },
                 ].map((preset) => (
                   <button
                     key={preset.lufs}
